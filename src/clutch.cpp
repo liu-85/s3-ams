@@ -298,3 +298,178 @@ bool clutch_assert_single(bool force_release)
     }
     return true;
 }
+
+/* ==========================================================================
+ * 异步离合引擎
+ *
+ * 设计动机（修 "网页超级慢"）：
+ *   原 clutch_engage() 里 vTaskDelay(80ms/60ms) 是**阻塞主任务**的。
+ *   Arduino 框架下 setup/loop 就是主任务，而 web_server_handle()
+ *   （HTTP 请求处理）也在主循环里跑。每切换一次离合主循环卡 80ms，
+ *   叠加"每个循环都重新 engage" → Web 请求处理被饿死，页面卡死。
+ *
+ * 解法：
+ *   - 主循环只调 clutch_request_*()：入队 + 立即返回句柄（微秒级，不阻塞）
+ *   - 独立 FreeRTOS 任务 clutch_task 在后台串行执行离合动作，
+ *     时序延迟（vTaskDelay）发生在它身上，不占主任务
+ *   - 主循环用 clutch_result_poll() 非阻塞查询是否完成
+ *
+ * 一致性：同一时刻仍只允许 1 路吸合（后台任务串行 + 4 层保障不变）。
+ * ========================================================================== */
+
+/* 单个挂起请求（clutch_task 串行消费） */
+struct clutch_pending {
+    int kind;   /* 1=engage, 2=release, 3=release_all */
+    int channel;/* engage/release 用，1~8 */
+    uint32_t epoch; /* 对应的主循环请求 epoch（clutch_task 完成后精确标记该槽） */
+};
+
+static SemaphoreHandle_t s_req_lock = NULL;
+static clutch_pending s_pending[8];
+static int s_pending_head = 0, s_pending_tail = 0;  /* 环形 */
+static SemaphoreHandle_t s_req_notify = NULL;        /* 任务等待/唤醒 */
+static TaskHandle_t s_clutch_task = NULL;
+
+/* 给请求句柄用的池子（主循环侧，避免栈上指针失效） */
+#define CLUTCH_REQ_SLOTS 4
+static clutch_req_t s_req_slots[CLUTCH_REQ_SLOTS];
+static uint32_t s_req_epoch = 0;   /* 单调递增序号：每次请求 ++ */
+
+/* 取一个新序号槽位：用单调 epoch 保证每个请求 token 唯一，
+ * 后台任务只会把"恰好等于该 epoch"的槽标记完成，避免误标别人的请求。 */
+static clutch_req_t *req_slot_alloc(void)
+{
+    s_req_epoch++;
+    int idx = (int)(s_req_epoch % CLUTCH_REQ_SLOTS);
+    s_req_slots[idx].request = 0;
+    s_req_slots[idx].seq = s_req_epoch;
+    s_req_slots[idx].status = 1;  /* 进行中 */
+    return &s_req_slots[idx];
+}
+
+/* 推一个请求进环形队列（非阻塞；满则直接后台执行，兜底） */
+static bool clutch_queue_push(int kind, int channel)
+{
+    if (s_req_lock != NULL) {
+        if (xSemaphoreTake(s_req_lock, pdMS_TO_TICKS(50)) != pdTRUE) {
+            /* 极端竞争：直接后台执行（可能阻塞一次，仅在锁竞争时） */
+            if (kind == 1) clutch_engage(channel);
+            else if (kind == 2) clutch_release(channel);
+            else clutch_release_all();
+            return false;
+        }
+    }
+    int next = (s_pending_head + 1) % 8;
+    if (next == s_pending_tail) {
+        if (s_req_lock != NULL) xSemaphoreGive(s_req_lock);
+        /* 队列满：兜底直接执行（会阻塞，仅发生在高负载时） */
+        if (kind == 1) clutch_engage(channel);
+        else if (kind == 2) clutch_release(channel);
+        else clutch_release_all();
+        return false;
+    }
+    s_pending[s_pending_head].kind = kind;
+    s_pending[s_pending_head].channel = channel;
+    s_pending[s_pending_head].epoch = s_req_epoch;  /* 当前最新请求 */
+    s_pending_head = next;
+    if (s_req_lock != NULL) xSemaphoreGive(s_req_lock);
+
+    if (s_clutch_task != NULL && s_req_notify != NULL) {
+        xSemaphoreGive(s_req_notify);
+    }
+    return true;
+}
+
+/* 请求入口（立即返回句柄） */
+clutch_req_t *clutch_request_engage(int channel)
+{
+    clutch_req_t *r = req_slot_alloc();
+    r->request = (channel >= 1 && channel <= BOARD_CHANNEL_COUNT) ? channel : 0;
+    clutch_queue_push(1, channel);
+    return r;
+}
+
+clutch_req_t *clutch_request_release(int channel)
+{
+    clutch_req_t *r = req_slot_alloc();
+    r->request = (channel >= 1 && channel <= BOARD_CHANNEL_COUNT) ? channel : 0;
+    clutch_queue_push(2, channel);
+    return r;
+}
+
+clutch_req_t *clutch_request_release_all(void)
+{
+    clutch_req_t *r = req_slot_alloc();
+    r->request = 0;
+    clutch_queue_push(3, 0);
+    return r;
+}
+
+/* 非阻塞查询：看本请求(epoch)是否已被后台任务处理完成 */
+bool clutch_result_poll(const clutch_req_t *req)
+{
+    if (!req) return false;
+    /* 任务完成会把 status 置 2/3（且仅对该 epoch 的槽） */
+    return (req->status == 2 || req->status == 3);
+}
+
+/* 后台离合任务：串行消费队列，时序延迟发生在这里（不影响主任务） */
+static void clutch_task_fn(void *arg)
+{
+    (void)arg;
+    /* 低优先级 + 独立任务，吸收所有 vTaskDelay */
+    for (;;) {
+        if (s_req_notify != NULL) {
+            xSemaphoreTake(s_req_notify, portMAX_DELAY);
+        }
+
+        /* 取一个待处理请求（注意：可能为 0 个，空转唤醒时） */
+        for (;;) {
+            int kind, channel;
+            uint32_t epoch;
+            if (s_req_lock != NULL &&
+                xSemaphoreTake(s_req_lock, 0) != pdTRUE) break;
+
+            if (s_pending_head == s_pending_tail) {
+                if (s_req_lock != NULL) xSemaphoreGive(s_req_lock);
+                break;  /* 队列空，回到阻塞等待 */
+            }
+            kind = s_pending[s_pending_tail].kind;
+            channel = s_pending[s_pending_tail].channel;
+            epoch = s_pending[s_pending_tail].epoch;
+            s_pending_tail = (s_pending_tail + 1) % 8;
+            if (s_req_lock != NULL) xSemaphoreGive(s_req_lock);
+
+            /* 执行（内部 vTaskDelay 在本任务上，不卡主循环） */
+            bool ok = true;
+            switch (kind) {
+            case 1: ok = clutch_engage(channel); break;
+            case 2: ok = clutch_release(channel); break;
+            case 3: clutch_release_all(); ok = true; break;
+            default: ok = true; break;
+            }
+
+            /* 精确标记该 epoch 对应的槽完成（避免误标别人的请求） */
+            for (int i = 0; i < CLUTCH_REQ_SLOTS; i++) {
+                if (s_req_slots[i].seq == epoch && s_req_slots[i].status == 1) {
+                    s_req_slots[i].status = ok ? 2 : 3;
+                }
+            }
+        }
+    }
+}
+
+void clutch_task_start(void)
+{
+    if (s_clutch_task != NULL) return;  /* 幂等 */
+
+    if (s_req_lock == NULL) s_req_lock = xSemaphoreCreateMutex();
+    if (s_req_notify == NULL) s_req_notify = xSemaphoreCreateBinary();
+
+    xTaskCreate(
+        clutch_task_fn, "clutch_task", 2048, NULL,
+        2,  /* 略低于主任务(通常5)：主任务/Web 优先，离合后台执行时序 */
+        &s_clutch_task);
+
+    log_i("离合后台任务已启动（优先级 2，非阻塞主循环）");
+}

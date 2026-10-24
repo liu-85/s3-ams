@@ -40,6 +40,31 @@ bool is_need_pull_back = false;
 int now_filament_num_need_pull_back = 255;
 unsigned long last_pullback_time = 0;
 
+/* 送料距离跟踪（兼容 Tianshu 的 last_pullback_meters 语义）
+ * 进入进料时记 last_pullback_meters[f] = get_filament_meters(f)；
+ * 每次驱动周期把本周期推进的米数累加到 filament_meters；
+ * 停止条件：last_pullback_meters[f] - get_filament_meters(f) > target */
+float last_pullback_meters[MAX_FILAMENT_NUM] = {0};
+float target_meters = 0.0f;        /* 目标送料距离（米）；0 = 不限，由 BambuBus 切到 waiting 结束 */
+
+/* 本周期推进的米数（由主循环按时间积分；轮径 4.5mm，速度 90% 占空比） */
+#define FILAMENT_WHEEL_CMM_PER_SEC  3.0f  /* 进料时耗材轮前进速度（米/秒），近似 3mm/s*... 实为 3 米/分≈0.05m/s，这里保守用 0.05 */
+#define FILAMENT_PUSH_M_PER_SEC     0.05f
+static uint32_t s_last_drive_ms = 0;
+static bool     s_driving_now   = false;
+
+/* 累计到 filament_meters 的推进（虚拟计米；本硬件无 AS5600，用时间法） */
+static void accumulate_feed_meters(int f)
+{
+    if (!s_driving_now) return;
+    uint32_t now = millis();
+    uint32_t dt = now - s_last_drive_ms;
+    s_last_drive_ms = now;
+    if (dt == 0) return;
+    float meters = (float)dt * FILAMENT_PUSH_M_PER_SEC;
+    add_filament_meters(f, meters);
+}
+
 // LED 状态
 static led_state_t s_led_state = LED_STATE_BLUE;
 
@@ -89,11 +114,18 @@ static void last_action_set(int f, _filament_motion_state_set m);
 //  核心硬件动作：电机 + 离合
 // ============================
 
+/* 当前挂起的离合请求（非阻塞；后台任务执行完前主循环不卡） */
+static clutch_req_t *s_pending_clutch = NULL;
+
 /**
- * 吸合指定通道离合 + 设定电机方向
+ * 吸合指定通道离合 + 设定电机方向（异步，不阻塞主循环/Web）
  * @param channel 通道号 1~8（对应料盘位）
  * @param dir 方向：MOTOR_DIR_FEED=进料, MOTOR_DIR_RETRACT=退料
- * @return true=成功
+ * @return true=已发起且本周期可驱动电机
+ *
+ * 要点：
+ *   - 若目标离合已吸合 → 立即启动电机（不重复请求、不卡 80ms）
+ *   - 若尚未吸合 → 异步请求（后台任务吸收时序），本周期不驱动电机
  */
 bool AMCU_drive_channel(int channel, motor_dir_t dir, int speed_pct)
 {
@@ -102,34 +134,72 @@ bool AMCU_drive_channel(int channel, motor_dir_t dir, int speed_pct)
         return false;
     }
 
-    /* 1) 吸合离合（内部保证互斥：先全断再吸合目标） */
-    if (!clutch_engage(channel)) {
-        log_e("AMCU_drive_channel: 通道 %d 离合吸合失败", channel);
-        motor_stop();
-        return false;
+    /* 1) 离合（互斥由后台任务保证：吸合前全断） */
+    if (dir == MOTOR_DIR_STOP) {
+        /* 停止：不必吸合，直接全断 */
+        AMCU_drive_stop();
+        return true;
     }
 
-    s_current_channel = channel;
-
-    /* 2) 启动电机 */
-    if (dir == MOTOR_DIR_STOP) {
-        motor_stop();
-    } else {
+    if (clutch_is_engaged(channel)) {
+        /* 已吸合目标通道：直接给电机，不重复请求 */
         motor_set_dir_speed(dir, speed_pct);
+        s_current_channel = channel;
+        s_pending_clutch = NULL;
+        s_driving_now = true;
+        s_last_drive_ms = millis();
+    } else {
+        /* 未吸合：异步发起，等后台任务完成（下一循环 poll 成功再驱动电机） */
+        s_pending_clutch = clutch_request_engage(channel);
+        s_current_channel = channel;
+        /* 本周期不启动电机：要等离合机械咬合后才给电，避免打滑 */
+        s_driving_now = false;
+        RGB_GREEN;
+        return false;
     }
 
     RGB_GREEN;
     return true;
 }
 
+/* 在每循环"驱动电机"前调用：把上一笔离合请求结算掉。
+ * 若已吸合则立刻启动电机；否则本周期不驱动（等吸合完成）。 */
+void AMCU_clutch_pump()
+{
+    if (s_pending_clutch == NULL) return;
+    int want = s_current_channel;
+    if (want < 1 || want > BOARD_CHANNEL_COUNT) {
+        s_pending_clutch = NULL;
+        s_driving_now = false;
+        return;
+    }
+    if (clutch_is_engaged(want)) {
+        /* 离合已咬合 → 启动电机（方向/速度沿用最近一次设定） */
+        motor_set_dir(motor_get_dir());
+        s_pending_clutch = NULL;
+        s_driving_now = true;
+        s_last_drive_ms = millis();
+    } else if (clutch_result_poll(s_pending_clutch)) {
+        /* 后台已处理完；再确认吸合电平 */
+        s_pending_clutch = NULL;
+        if (clutch_is_engaged(want)) {
+            motor_set_dir(motor_get_dir());
+            s_driving_now = true;
+            s_last_drive_ms = millis();
+        }
+    }
+    /* 未完成：什么都不做，等下一循环（非阻塞，Web 不受影响） */
+}
+
 /**
- * 停止电机 + 释放所有离合
+ * 停止电机 + 异步释放所有离合
  */
 void AMCU_drive_stop()
 {
     motor_stop();
-    clutch_release_all();
+    s_pending_clutch = clutch_request_release_all();  /* 非阻塞，后台吸收时序 */
     s_current_channel = 0;
+    s_driving_now = false;
     RGB_BLUE;
 }
 
@@ -233,6 +303,7 @@ void AMCU_init() {
     sensor_init();
     motor_init();
     clutch_init();
+    clutch_task_start();  /* 启动非阻塞离合后台任务（修 Web 卡顿） */
     AMCU_drive_stop();
     RGB_BLUE;
 
@@ -287,11 +358,19 @@ void AMCU_run() {
 }
 
 // ============================
-//  电机运动逻辑（带离合/缓冲）
+//  电机运动逻辑（带离合/缓冲 + Tianshu 到位检测）
 // ============================
 void AMCU_motion() {
     int cur = get_now_filament_num();
     if (cur < 0 || cur >= MAX_FILAMENT_NUM) cur = 0;  // 防止 0xFF 越界
+
+    /* ★ 关键：结算上一笔挂起的离合请求（非阻塞，Web 不卡） */
+    AMCU_clutch_pump();
+
+    /* 累计虚拟计米（时间法，本硬件无 AS5600） */
+    if (s_driving_now && cur >= 0 && cur < MAX_FILAMENT_NUM) {
+        accumulate_feed_meters(cur);
+    }
 
     // 退料超时处理
     if (is_need_pull_back) {
@@ -322,7 +401,6 @@ void AMCU_motion() {
 
     // 打印中：由缓冲微动驱动，AMCU_motion 不覆盖（check_buffer_status 已处理）
     if (is_channel_printing(cur)) {
-        // 保持绿灯（动作中），不调用 AMCU_drive_stop
         RGB_GREEN;
         clutch_assert_single(true);
         return;
@@ -332,8 +410,22 @@ void AMCU_motion() {
     case need_pull_back:
         RGB_GREEN;
         break;
+
     case need_send_out: {
+        /* 进入送料前，记录"当前基准"（Tianshu 语义） */
+        if (s_last_action[cur] != (uint8_t)need_send_out) {
+            last_pullback_meters[cur] = get_filament_meters(cur);
+            s_last_action[cur] = (uint8_t)need_send_out;
+        }
         int ch = cur + 1;
+        /* Tianshu 到位检测：若 target_meters > 0，检查是否已送到位 */
+        if (target_meters > 0.0f &&
+            (get_filament_meters(cur) - last_pullback_meters[cur]) > target_meters) {
+            AMCU_drive_stop();
+            RGB_BLUE;
+            act = waiting;
+            break;
+        }
         if (is_filament_online(cur)) {
             AMCU_drive_channel(ch, MOTOR_DIR_FEED, MOTOR_SPEED_485_FEED);
             RGB_GREEN;
@@ -343,28 +435,66 @@ void AMCU_motion() {
         }
         break;
     }
+
     case waiting:
         AMCU_drive_stop();
         RGB_BLUE;
         break;
-    case act_send_mm:
+
+    case act_send_mm: {
+        /* 进入前记录基准 */
+        if (s_last_action[cur] != (uint8_t)act_send_mm) {
+            last_pullback_meters[cur] = get_filament_meters(cur);
+            s_last_action[cur] = (uint8_t)act_send_mm;
+        }
+        /* Tianshu 到位检测 */
+        if (target_meters > 0.0f &&
+            (get_filament_meters(cur) - last_pullback_meters[cur]) > target_meters) {
+            AMCU_drive_stop();
+            RGB_BLUE;
+            act = waiting;
+            break;
+        }
         AMCU_drive_channel(cur + 1, MOTOR_DIR_FEED, MOTOR_SPEED_485_FEED);
         RGB_GREEN;
         break;
-    case act_pull_mm:
+    }
+
+    case act_pull_mm: {
+        /* 进入前记录基准 */
+        if (s_last_action[cur] != (uint8_t)act_pull_mm) {
+            last_pullback_meters[cur] = get_filament_meters(cur);
+            s_last_action[cur] = (uint8_t)act_pull_mm;
+        }
+        /* Tianshu 到位检测（退料方向） */
+        if (target_meters > 0.0f &&
+            (last_pullback_meters[cur] - get_filament_meters(cur)) > target_meters) {
+            AMCU_drive_stop();
+            RGB_BLUE;
+            act = waiting;
+            break;
+        }
         AMCU_drive_channel(cur + 1, MOTOR_DIR_RETRACT, MOTOR_SPEED_FULL);
         RGB_GREEN;
         break;
+    }
+
     case cancel:
     case release_all:
         AMCU_drive_stop();
         RGB_RED;
         act = waiting;
         break;
+
     default:
         AMCU_drive_stop();
         RGB_BLUE;
         break;
+    }
+
+    /* 离开当前动作时清除 last_action 标记 */
+    if (act == waiting) {
+        s_last_action[cur] = 0;
     }
 
     // 运行期离合体检

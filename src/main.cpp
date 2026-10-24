@@ -53,7 +53,7 @@ void loop() {
 
     watchdog_feed();
 
-    // 核心业务逻辑
+    // 核心业务逻辑（含 BambuBus / 缓冲器微动 / AMCU_motion）
     AMCU_run();
 
     // Web 服务器请求处理

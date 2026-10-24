@@ -43,10 +43,26 @@ void AMCU_run();
 void AMCU_motion();
 
 // 电机+离合复合动作（核心硬件控制）
-// 吸合指定通道离合 + 设定电机方向，返回是否成功
+// 吸合指定通道离合 + 设定电机方向（异步，不阻塞主循环/Web），返回是否本周期可驱动
 bool AMCU_drive_channel(int channel, motor_dir_t dir, int speed_pct);
-// 停止电机 + 释放所有离合
+// 停止电机 + 异步释放所有离合
 void AMCU_drive_stop();
+// 结算上一笔挂起的离合请求（每循环在驱动电机前调；吸合完成后才给电机）
+void AMCU_clutch_pump();
+
+// 送料距离跟踪（兼容 Tianshu 的 last_pullback_meters + target 语义）
+// 进入进料前：last_pullback_meters[f] = get_filament_meters(f)；
+// 每次驱动周期：add_filament_meters(f, ±Δ)
+// 停止条件：last_pullback_meters[f] - get_filament_meters(f) > target_meters
+extern float last_pullback_meters[MAX_FILAMENT_NUM];
+extern float target_meters;
+
+// 送料距离跟踪（Tianshu 的 last_pullback_meters + target 语义）
+// 进入进料前：last_pullback_meters[f] = get_filament_meters(f)；
+// 每次驱动周期：add_filament_meters(f, ±Δ)
+// 停止条件：last_pullback_meters[f] - get_filament_meters(f) > target
+extern float last_pullback_meters[MAX_FILAMENT_NUM];
+extern float target_meters;
 
 // 缓冲器辅助送料（打印时由微动驱动）
 void AMCU_buffer_assist_feed(int channel);

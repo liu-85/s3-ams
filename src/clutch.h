@@ -21,11 +21,9 @@
 #define CLUTCH_RELEASE_MS  60   /* 断开后机械稳定等待 */
 #define CLUTCH_SETTLE_MS   20   /* 切换通道额外静默时间 */
 
-/* 错误码 */
+/* 错误码（避免与 ESP-IDF 的 ESP_ERR_* 宏冲突） */
 #define ESP_ERR_CLUTCH_CHANNEL  0x7001
 #define ESP_ERR_CLUTCH_CONFLICT 0x7002
-#define ESP_ERR_TIMEOUT         0x7003
-#define ESP_ERR_INVALID_STATE   0x7004
 
 /* 初始化 8 路离合 */
 bool clutch_init(void);
@@ -67,5 +65,37 @@ const char *clutch_get_owner(void);
 /* 设置/获取忙状态 */
 void clutch_set_busy(bool busy);
 bool clutch_is_busy(void);
+
+/* ==========================================================================
+ * 异步离合引擎（非阻塞，避免 vTaskDelay 卡死主任务 / Web 服务器）
+ *
+ * 背景：原 clutch_engage() 内的 vTaskDelay(80ms) 会阻塞 Arduino 主任务，
+ *       而 Web 的 web_server_handle() 也在主循环里跑 → 每换一次离合卡 80ms，
+ *       表现为 "网页超级慢"。
+ * 解法：请求入队 → 独立任务 (clutch_task) 后台执行并吸收时序延迟；
+ *       主循环只调 clutch_request_* 拿一个立即返回的句柄，稍后用
+ *       clutch_result_poll() 非阻塞查询结果。
+ * ========================================================================== */
+
+typedef struct {
+    volatile int request;   /* 目标通道(1~8)；0=断开全部；-1=无待执行 */
+    volatile int seq;       /* 当前执行序号（clutch_task 完成后 ++） */
+    volatile int status;    /* 0=空闲/无任务, 1=进行中, 2=完成, 3=失败 */
+} clutch_req_t;
+
+/* 请求吸合指定通道（非阻塞，立即返回句柄） */
+clutch_req_t *clutch_request_engage(int channel);
+
+/* 请求断开指定通道（非阻塞） */
+clutch_req_t *clutch_request_release(int channel);
+
+/* 请求断开全部离合（非阻塞） */
+clutch_req_t *clutch_request_release_all(void);
+
+/* 非阻塞轮询结果：true=本次请求完成，false=未完成/失败 */
+bool clutch_result_poll(const clutch_req_t *req);
+
+/* 启动后台离合任务（在 AMCU_init 里调一次即可，内部带幂等保护） */
+void clutch_task_start(void);
 
 #endif /* CLUTCH_H */
