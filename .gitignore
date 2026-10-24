@@ -1,0 +1,17 @@
+# PlatformIO build artifacts
+.pio/
+
+# Local build / output
+build/
+*.bin
+*.elf
+*.hex
+
+# Web static files stay in web/ (source of truth), web_files.h is generated & committed
+# (keep web_files.h so the firmware builds without running the generator)
+
+# Editor / OS noise
+.vscode/
+*.code-workspace
+Thumbs.db
+.DS_Store
