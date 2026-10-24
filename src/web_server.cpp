@@ -378,10 +378,14 @@ static void handle_wifi_connect(void)
     }
     String body = server.arg("plain");
     String name = "", password = "";
+    /* "name": 共 7 字符（" n a m e " :），值前引号在 nidx+8
+       （旧代码 +7 取到的是前引号本身 → name 解析成空 → 误判"连接失败"） */
     int nidx = body.indexOf("\"name\"");
     int pidx = body.indexOf("\"password\"");
-    if (nidx >= 0) name = body.substring(nidx + 7, body.indexOf("\"", nidx + 7));
-    if (pidx >= 0) password = body.substring(pidx + 11, body.indexOf("\"", pidx + 11));
+    if (nidx >= 0) name = body.substring(nidx + 8, body.indexOf("\"", nidx + 8));
+    /* "password": 共 11 字符（" p a s s w o r d " :），值前引号在 pidx+12
+       （旧代码 +11 取到的是前引号本身 → password 解析成空） */
+    if (pidx >= 0) password = body.substring(pidx + 12, body.indexOf("\"", pidx + 12));
 
     if (name.length() == 0 || name.length() > 32) {
         server.send(400, "application/json", "{\"ok\":false,\"err\":\"SSID 长度必须在 1~32\"}");
