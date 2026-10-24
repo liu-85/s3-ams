@@ -1,0 +1,18 @@
+# Partition Table for ESP32-S3 / 16MB Flash (对齐 esp-ams-s3 布局)
+# 不带 BOM；与 esp-ams-s3/partitions.csv 一致的 16MB N16R8 布局
+# 双 OTA 分区 + NVS + storage，方便整机 OTA 升级（Web 上传）
+#
+# 尺寸账（16MB）：
+#   nvs        0x9000    24KB
+#   otadata    0xF000    8KB
+#   phy_init   0x11000   4KB
+#   ota_0      0x20000   3MB
+#   ota_1      0x300000  3MB
+#   storage    0x600000  1MB
+# Name,Type,SubType,Offset,Size,Flags
+nvs,data,nvs,0x9000,0x6000
+otadata,data,ota,0xF000,0x2000
+phy_init,data,phy,0x11000,0x1000
+ota_0,app,ota_0,0x20000,0x2E0000
+ota_1,app,ota_1,0x300000,0x2E0000
+storage,data,spiffs,0x600000,0x100000
