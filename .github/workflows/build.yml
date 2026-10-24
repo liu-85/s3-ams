@@ -1,0 +1,85 @@
+# s3-ams —— GitHub Actions 在线编译
+#
+# 触发：push / pull_request / 手动 (Actions tab → Run workflow)
+# 产物：firmware.bin / firmware.elf 自动上传为 Artifacts，浏览器可直接下载；
+#       日志可在 Actions tab 查看。
+#
+# 用法（在线编译 + 烧录）：
+#   1. 代码推到 main
+#   2. GitHub → Actions → "s3-ams build" → 等 [SUCCESS]
+#   3. 点进 run → "Artifacts" → 下载 s3-ams-firmware (含 firmware.bin / firmware.elf)
+#   4. 本地烧录:  pio run -t upload / esptool 刷 firmware.bin
+#
+# 分区说明：platformio.ini 用 default_8MB.csv，固件实际落在 ~8MB flash 的 0xe1000，
+#           因此烧录板子请用 8MB (或更大) flash 的模组；用 4MB 板的会超出分区。
+
+name: s3-ams build
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "platformio.ini"
+      - "src/**"
+      - "lib/**"
+      - "tools/**"
+      - ".github/workflows/build.yml"
+  pull_request:
+    branches: [ main ]
+  # 手动触发：Actions → s3-ams build → Run workflow
+  workflow_dispatch:
+
+# 同一分支新提交会取消旧的 in-progress run，避免堆积
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build firmware (esp32-s3)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install PlatformIO Core
+        # 与本地 (6.1.x) 保持同一小版本，避免 "本地过 / CI 挂" 的版本漂移
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "platformio>=6.1,<6.2"
+
+      - name: Build firmware
+        # 首次会下载 toolchain / framework (约 1-2 分钟)；pio 自带缓存
+        run: pio run -e s3ams
+
+      - name: Report size
+        # 把 Flash / RAM 占用打进日志，便于一眼判断是否要调分区
+        run: |
+          echo "=========== FIRMWARE SIZE ==========="
+          python - <<'PY'
+          import os, glob
+          env = ".pio/build/s3ams"
+          # PlatformIO 写出的 size 行一般在 build log 里，这里直接读 bin 体积
+          for f in ["firmware.bin", "firmware.elf"]:
+              p = os.path.join(env, f)
+              if os.path.exists(p):
+                  sz = os.path.getsize(p)
+                  print(f"{f}: {sz:,} bytes ({sz/1024:.0f} KB)")
+          # 从最新 build log grep RAM/Flash 行 (若存在)
+          logs = glob.glob(os.path.join(env, "..", "logs", "*.log"))
+          for lg in logs:
+              with open(lg, errors="ignore") as fh:
+                  for line in fh:
+                      if line.startswith(("RAM:", "Flash:")):
+                          print(line.rstrip())
+          PY
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: s3-ams-firmware
+          path: |
+            .pio/build/s3ams/firmware.bin
+            .pio/build/s3ams/firmware.elf
+          if-no-files-found: error
