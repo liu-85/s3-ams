@@ -21,6 +21,7 @@
 #include <esp_system.h>
 #include <esp_chip_info.h>
 #include <esp_ota_ops.h>
+#include <esp_wifi.h>
 
 /* ==========================================================================
  * 常量
@@ -29,7 +30,7 @@
 #define LOG_RING_SIZE 4096
 #define AP_SSID_PREFIX "ESP-AMS-"
 #define AP_PASSWORD "12345678"
-#define WIFI_TIMEOUT_MS 15000
+#define WIFI_TIMEOUT_MS 25000
 
 /* ==========================================================================
  * 全局
@@ -78,8 +79,22 @@ void web_log(const char *msg)
  * ========================================================================== */
 static bool wifi_try_connect(const char *ssid, const char *pass)
 {
+    if (ssid == NULL || strlen(ssid) == 0) {
+        log_w("wifi_try_connect: SSID 为空，跳过");
+        return false;
+    }
+
+    /* 关键：关 STA 省电 + 调 WPA 握手超时，绕开 ESP32-S3 在 WPA2-CCMP
+       下常见的 "CCMP replay detected" 导致 STA 被反复踢掉、配网失败。
+       （esp_wifi_set_ps 在 esp_wifi.h 中，确定可用） */
+    esp_wifi_set_ps(WIFI_PS_NONE);        /* 关 STA 省电，避免唤醒延迟丢包 */
+
     WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(false);         /* 失败后由我们自己控制重试 */
+    WiFi.disconnect();                    /* 清掉之前残留的 CCMP 加密状态 */
+    delay(200);
     WiFi.begin(ssid, pass);
+
     uint32_t start = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_TIMEOUT_MS) {
         delay(200);
@@ -88,8 +103,11 @@ static bool wifi_try_connect(const char *ssid, const char *pass)
         s_wifi_connected = true;
         s_ap_mode = false;
         s_net_mode = 0;
+        log_i("WiFi 已连接: %s / IP %s (TKIP, PS=NONE)",
+              ssid, WiFi.localIP().toString().c_str());
         return true;
     }
+    log_w("WiFi 连接失败（SSID=%s, status=%d）", ssid, (int)WiFi.status());
     return false;
 }
 
@@ -296,14 +314,29 @@ static void handle_sensor_set(void)
 
 static void handle_wifi_scan(void)
 {
-    int n = WiFi.scanNetworks();
+    /* 关键：AP 模式下 scanNetworks() 直接返回 0。必须临时切到
+       WIFI_APSTA / STA 才能扫到 2.4G 网络。扫完保持 STA 模式，
+       方便后续配网（配网失败可继续扫，不必重启）。*/
+    bool was_ap = s_ap_mode;
+    int prev_mode = WiFi.getMode();
+    if (prev_mode == WIFI_AP) {
+        WiFi.mode(WIFI_AP_STA);
+        delay(300);  /* 等 STA 栈起来 */
+    }
+    int n = WiFi.scanNetworks(true, true, 0, 36, 120);  /* sort=true, show_hidden=true, 36ch */
     String json = "{\"aps\":[";
     for (int i = 0; i < n; i++) {
         if (i) json += ",";
-        json += "{\"ssid\":\"" + WiFi.SSID(i) + "\",\"rssi\":" + String(WiFi.RSSI(i)) + "}";
+        json += "{\"ssid\":\"" + WiFi.SSID(i) + "\",\"rssi\":" + String(WiFi.RSSI(i)) +
+                ",\"channel\":" + String(WiFi.channel(i)) +
+                ",\"encrypted\":" + String(WiFi.encryptionType(i) == WIFI_AUTH_WPA_PSK || WiFi.encryptionType(i) == WIFI_AUTH_WPA2_PSK ? "true" : "false") + "}";
     }
-    json += "]}";
+    json += "],\"count\":" + String(n) + "}";
     server.send(200, "application/json; charset=utf-8", json);
+    /* 如果配网成功切到 STA 后，扫描结果已经没用了，恢复 AP 保持配网入口 */
+    if (was_ap && !s_wifi_connected) {
+        WiFi.mode(WIFI_AP);
+    }
 }
 
 static void handle_wifi_connect(void)
@@ -319,13 +352,30 @@ static void handle_wifi_connect(void)
     if (nidx >= 0) name = body.substring(nidx + 7, body.indexOf("\"", nidx + 7));
     if (pidx >= 0) password = body.substring(pidx + 11, body.indexOf("\"", pidx + 11));
 
+    if (name.length() == 0 || name.length() > 32) {
+        server.send(400, "application/json", "{\"ok\":false,\"err\":\"SSID 长度必须在 1~32\"}");
+        return;
+    }
+
+    /* 清掉旧的 SSID/密码 与 残留的 CCMP 状态，避免加密状态机串味 */
     s_wifi_prefs.begin("s3ams-wifi", false);
+    s_wifi_prefs.remove("ssid");
+    s_wifi_prefs.remove("pass");
     s_wifi_prefs.putString("ssid", name);
     s_wifi_prefs.putString("pass", password);
     s_wifi_prefs.end();
 
+    log_i("配网: 连接 %s（TKIP + 关PS）", name.c_str());
     bool ok = wifi_try_connect(name.c_str(), password.c_str());
-    server.send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
+    if (ok) {
+        log_i("配网成功，重启让 AP 关闭、走 STA");
+        server.send(200, "application/json", "{\"ok\":true}");
+        delay(500);
+        ESP.restart();
+    } else {
+        server.send(500, "application/json",
+            "{\"ok\":false,\"err\":\"WiFi 连接失败，已保留配置热点；请确认 SSID/密码并检查路由器是否 5GHz\"}");
+    }
 }
 
 static void handle_wifi_set(void)
