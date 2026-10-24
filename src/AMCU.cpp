@@ -43,12 +43,19 @@ unsigned long last_pullback_time = 0;
 /* 送料距离跟踪（兼容 Tianshu 的 last_pullback_meters 语义）
  * 进入进料时记 last_pullback_meters[f] = get_filament_meters(f)；
  * 每次驱动周期把本周期推进的米数累加到 filament_meters；
- * 停止条件：last_pullback_meters[f] - get_filament_meters(f) > target */
+ *
+ * ★ 重要：本硬件无 AS5600，送料结束不靠本地测距，而靠
+ *   BambuBus 协议帧把状态切到 waiting。target_meters 默认 0，
+ *   此时"按距离停料"的逻辑被完全跳过（见 AMCU_motion 判断），
+ *   电机由 BambuBus 状态机驱动到结束。
+ *   若以后想"送固定 N 米就停"，把 target_meters 设为 N（单位米）即可。 */
 float last_pullback_meters[MAX_FILAMENT_NUM] = {0};
-float target_meters = 0.0f;        /* 目标送料距离（米）；0 = 不限，由 BambuBus 切到 waiting 结束 */
+float target_meters = 0.0f;        /* 目标送料距离（米）；0 = 不限距离，由 BambuBus 切到 waiting 结束 */
 
-/* 本周期推进的米数（由主循环按时间积分；轮径 4.5mm，速度 90% 占空比） */
-#define FILAMENT_WHEEL_CMM_PER_SEC  3.0f  /* 进料时耗材轮前进速度（米/秒），近似 3mm/s*... 实为 3 米/分≈0.05m/s，这里保守用 0.05 */
+/* 虚拟计米速率（时间法，无 AS5600）：
+ * AMS 送料实际速度约 30~60 mm/s，取 50 mm/s = 0.05 m/s。
+ * 仅用于 get_filament_meters() 数值累加（显示/记录），
+ * 当 target_meters == 0 时不参与停料判断。 */
 #define FILAMENT_PUSH_M_PER_SEC     0.05f
 static uint32_t s_last_drive_ms = 0;
 static bool     s_driving_now   = false;
