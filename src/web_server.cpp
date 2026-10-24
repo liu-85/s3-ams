@@ -90,10 +90,13 @@ void web_log(const char *msg)
  * ========================================================================== */
 static void wifi_stop_ap(void)
 {
+    /* ★ 对标 esp-ams-s3 stop_sta_reconnect：真把射频切走让给 STA，
+       不能只 softAPdisconnect —— 单射频下 AP 还占着 STA 就 NO_AP_FOUND */
     if (s_ap_mode) {
-        WiFi.softAPdisconnect();   /* 断开已连入热点的客户端 */
-        WiFi.mode(WIFI_OFF);
-        delay(300);
+        WiFi.softAPdisconnect();
+        delay(200);
+        WiFi.mode(WIFI_OFF);   /* 让射频完全下线，再切 STA */
+        delay(200);
         s_ap_mode = false;
     }
 }
@@ -116,18 +119,15 @@ static bool wifi_try_connect(const char *ssid, const char *pass, bool provision)
         return false;
     }
 
-    /* ★ 配网时必须先关热点，把单射频让给 STA（esp-ams-s3 实测：
-       热点开着时 STA 永远 NO_AP_FOUND；关掉后 1 秒就连上） */
     if (provision) {
         wifi_stop_ap();
+        delay(300);
     }
 
-    /* 关 STA 省电，避免唤醒延迟丢包 / CCMP replay */
     esp_wifi_set_ps(WIFI_PS_NONE);
-
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(false);
-    WiFi.disconnect();                /* 清掉之前残留的 CCMP 加密状态 */
+    WiFi.disconnect();
     delay(200);
     WiFi.begin(ssid, pass);
 
@@ -137,7 +137,7 @@ static bool wifi_try_connect(const char *ssid, const char *pass, bool provision)
     }
     if (WiFi.status() == WL_CONNECTED) {
         s_wifi_connected = true;
-        s_ap_mode = false;            /* 配网成功：热点保持关闭 */
+        s_ap_mode = false;
         s_net_mode = 0;
         log_i("WiFi 已连接: %s / IP %s (PS=NONE, AP 已关)",
               ssid, WiFi.localIP().toString().c_str());
@@ -145,9 +145,9 @@ static bool wifi_try_connect(const char *ssid, const char *pass, bool provision)
     }
 
     log_w("WiFi 连接失败（SSID=%s, status=%d）", ssid, (int)WiFi.status());
-    /* ★ 配网失败：无条件把热点开回来，否则手机连不回来没法重试 */
     if (provision) {
         log_i("配网失败，重新打开配置热点");
+        delay(300);
         wifi_start_ap();
     }
     return false;
@@ -396,17 +396,26 @@ static void handle_wifi_connect(void)
     s_wifi_prefs.putString("pass", password);
     s_wifi_prefs.end();
 
-    log_i("配网: 连接 %s（先关热点，射频让给 STA）", name.c_str());
+    /* ★ 对齐 esp-ams-s3 provision_task 的完整模型：
+       1. 先 server.send 把 HTTP 响应发到手机 —— 射频一关手机立刻掉线，
+          响应没发完用户就永远看不到结果（"点连接没反应"的真正来源）
+       2. 优雅期：等响应真正写出 TCP 缓冲（esp-ams-s3 是 700ms，留足 1s）
+       3. 再动射频（关 AP / 切 STA / 连路由器）—— 这时手机已拿到"配置已保存"，
+          掉线也不会误以为"连接失败"
+       4. 成功 → 保持 AP 关；失败 → wifi_try_connect 自动把 AP 开回来 */
+    log_i("配网: 收到 %s，先回响应再切射频", name.c_str());
+    server.send(200, "application/json",
+        "{\"ok\":true,\"info\":\"配置已保存，正在连接\"}");
+    delay(1000);   /* 优雅期：让 HTTP 响应发出 */
+
     bool ok = wifi_try_connect(name.c_str(), password.c_str(), true);
     if (ok) {
-        log_i("配网成功，重启让 AP 关闭、走 STA");
-        server.send(200, "application/json", "{\"ok\":true}");
+        log_i("配网成功: 已连 %s / IP %s，稍后重启固化 STA 模式",
+              name.c_str(), WiFi.localIP().toString().c_str());
         delay(500);
         ESP.restart();
-    } else {
-        server.send(500, "application/json",
-            "{\"ok\":false,\"err\":\"WiFi 连接失败，已保留配置热点；请确认 SSID/密码并检查路由器是否 5GHz\"}");
     }
+    /* 失败：wifi_try_connect 已把热点开回来，手机重连热点再试 */
 }
 
 static void handle_wifi_set(void)
