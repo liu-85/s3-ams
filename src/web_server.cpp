@@ -77,38 +77,25 @@ void web_log(const char *msg)
 /* ==========================================================================
  * WiFi
  * ========================================================================== */
-static bool wifi_try_connect(const char *ssid, const char *pass)
+/* ==========================================================================
+ * WiFi 配网（对齐 esp-ams-s3 的「先关热点、射频让给 STA」模型）
+ *
+ * 关键：ESP32 只有一个射频，AP 和 STA 共用。配网时若 SoftAP 还开着，
+ * STA 连接永远停在 WIFI_REASON_NO_AP_FOUND，密码对错都一样（esp-ams-s3
+ * 2026-09-17 实测结论）。所以流程必须是：
+ *   1. 先停 SoftAP（把射频让给 STA）
+ *   2. 关 STA 省电 esp_wifi_set_ps(WIFI_PS_NONE)
+ *   3. WiFi.begin(ssid, pass) 连路由器
+ *   4. 成功 → 保持 AP 关闭；失败 → 重新打开 AP（否则手机连不回来）
+ * ========================================================================== */
+static void wifi_stop_ap(void)
 {
-    if (ssid == NULL || strlen(ssid) == 0) {
-        log_w("wifi_try_connect: SSID 为空，跳过");
-        return false;
-    }
-
-    /* 关键：关 STA 省电 + 调 WPA 握手超时，绕开 ESP32-S3 在 WPA2-CCMP
-       下常见的 "CCMP replay detected" 导致 STA 被反复踢掉、配网失败。
-       （esp_wifi_set_ps 在 esp_wifi.h 中，确定可用） */
-    esp_wifi_set_ps(WIFI_PS_NONE);        /* 关 STA 省电，避免唤醒延迟丢包 */
-
-    WiFi.mode(WIFI_STA);
-    WiFi.setAutoReconnect(false);         /* 失败后由我们自己控制重试 */
-    WiFi.disconnect();                    /* 清掉之前残留的 CCMP 加密状态 */
-    delay(200);
-    WiFi.begin(ssid, pass);
-
-    uint32_t start = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_TIMEOUT_MS) {
-        delay(200);
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-        s_wifi_connected = true;
+    if (s_ap_mode) {
+        WiFi.softAPdisconnect();   /* 断开已连入热点的客户端 */
+        WiFi.mode(WIFI_OFF);
+        delay(300);
         s_ap_mode = false;
-        s_net_mode = 0;
-        log_i("WiFi 已连接: %s / IP %s (TKIP, PS=NONE)",
-              ssid, WiFi.localIP().toString().c_str());
-        return true;
     }
-    log_w("WiFi 连接失败（SSID=%s, status=%d）", ssid, (int)WiFi.status());
-    return false;
 }
 
 static void wifi_start_ap(void)
@@ -122,6 +109,50 @@ static void wifi_start_ap(void)
     log_i("配置热点已启动: %s / %s", ap_ssid.c_str(), AP_PASSWORD);
 }
 
+static bool wifi_try_connect(const char *ssid, const char *pass, bool provision)
+{
+    if (ssid == NULL || strlen(ssid) == 0) {
+        log_w("wifi_try_connect: SSID 为空，跳过");
+        return false;
+    }
+
+    /* ★ 配网时必须先关热点，把单射频让给 STA（esp-ams-s3 实测：
+       热点开着时 STA 永远 NO_AP_FOUND；关掉后 1 秒就连上） */
+    if (provision) {
+        wifi_stop_ap();
+    }
+
+    /* 关 STA 省电，避免唤醒延迟丢包 / CCMP replay */
+    esp_wifi_set_ps(WIFI_PS_NONE);
+
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(false);
+    WiFi.disconnect();                /* 清掉之前残留的 CCMP 加密状态 */
+    delay(200);
+    WiFi.begin(ssid, pass);
+
+    uint32_t start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_TIMEOUT_MS) {
+        delay(200);
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+        s_wifi_connected = true;
+        s_ap_mode = false;            /* 配网成功：热点保持关闭 */
+        s_net_mode = 0;
+        log_i("WiFi 已连接: %s / IP %s (PS=NONE, AP 已关)",
+              ssid, WiFi.localIP().toString().c_str());
+        return true;
+    }
+
+    log_w("WiFi 连接失败（SSID=%s, status=%d）", ssid, (int)WiFi.status());
+    /* ★ 配网失败：无条件把热点开回来，否则手机连不回来没法重试 */
+    if (provision) {
+        log_i("配网失败，重新打开配置热点");
+        wifi_start_ap();
+    }
+    return false;
+}
+
 static void wifi_init(void)
 {
     s_wifi_prefs.begin("s3ams-wifi", true);
@@ -131,7 +162,7 @@ static void wifi_init(void)
 
     if (ssid.length() > 0) {
         log_i("尝试连接已保存 WiFi: %s", ssid.c_str());
-        if (wifi_try_connect(ssid.c_str(), pass.c_str())) {
+        if (wifi_try_connect(ssid.c_str(), pass.c_str(), false)) {
             log_i("WiFi 已连接，IP: %s", WiFi.localIP().toString().c_str());
             return;
         }
@@ -365,8 +396,8 @@ static void handle_wifi_connect(void)
     s_wifi_prefs.putString("pass", password);
     s_wifi_prefs.end();
 
-    log_i("配网: 连接 %s（TKIP + 关PS）", name.c_str());
-    bool ok = wifi_try_connect(name.c_str(), password.c_str());
+    log_i("配网: 连接 %s（先关热点，射频让给 STA）", name.c_str());
+    bool ok = wifi_try_connect(name.c_str(), password.c_str(), true);
     if (ok) {
         log_i("配网成功，重启让 AP 关闭、走 STA");
         server.send(200, "application/json", "{\"ok\":true}");
