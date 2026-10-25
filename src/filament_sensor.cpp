@@ -61,6 +61,11 @@ static uint32_t s_last_release_ms[BOARD_CHANNEL_COUNT][SENSOR_KIND_COUNT];
 /* 稳定状态（去抖后） */
 static bool s_triggered[BOARD_CHANNEL_COUNT][SENSOR_KIND_COUNT];
 
+/* 临时直连模式的独立去抖（每通道每种微动各一套）。
+   正式模式用的是"每通道一个 combo"的去抖，两套互不干扰。 */
+static int s_dbg_counts[BOARD_CHANNEL_COUNT][SENSOR_KIND_COUNT];
+static int s_dbg_last[BOARD_CHANNEL_COUNT][SENSOR_KIND_COUNT];   /* -1 = 还没采过 */
+
 /* 通道启用掩码 */
 static uint8_t s_enabled_mask = 0xFF;  /* 默认全启用 */
 
@@ -212,8 +217,86 @@ static int sensor_classify(int mv)
  * 轮询回调
  * ========================================================================== */
 
+/* ==========================================================================
+ * 临时直连微动模式（SENSOR_TEMP_DIGITAL）
+ *
+ * 8 个微动 IO 各接一只普通微动，两两配对成 4 个通道的"开始位 / 停止位"。
+ * 上层（AMCU / 缓冲补料 / 网页）看到的仍是 sensor_triggered(ch, START|STOP)，
+ * 一行没改。
+ * ========================================================================== */
+#if SENSOR_TEMP_DIGITAL
+
+/* 单个微动的去抖 + 边沿计数。raw=true 表示"压下"。 */
+static void sensor_dbg_apply(int ch, sensor_kind_t kind, bool raw)
+{
+    int r = raw ? 1 : 0;
+    if (r == s_dbg_last[ch][kind]) {
+        if (s_dbg_counts[ch][kind] < SENSOR_DEBOUNCE_N) s_dbg_counts[ch][kind]++;
+    } else {
+        s_dbg_counts[ch][kind] = 0;
+        s_dbg_last[ch][kind] = r;
+    }
+
+    /* 连续 N 次一致才认 */
+    if (s_dbg_counts[ch][kind] < SENSOR_DEBOUNCE_N) return;
+    if (raw == s_triggered[ch][kind]) return;
+
+    s_triggered[ch][kind] = raw;
+    if (raw) {
+        s_trigger_seq[ch][kind]++;
+        s_last_trigger_ms[ch][kind] = millis();
+    } else {
+        s_release_seq[ch][kind]++;
+        s_last_release_ms[ch][kind] = millis();
+    }
+}
+
+static void sensor_poll_digital(void)
+{
+    const int half = BOARD_CHANNEL_COUNT / 2;   /* 4：前一半是开始位，后一半是停止位 */
+    bool pressed[BOARD_CHANNEL_COUNT];
+
+    for (int i = 0; i < BOARD_CHANNEL_COUNT; i++) {
+        int lv = digitalRead(s_pins[i]);
+#if SENSOR_TEMP_ACTIVE_LOW
+        pressed[i] = (lv == LOW);
+#else
+        pressed[i] = (lv == HIGH);
+#endif
+        /* 给网页 /status 一个能看的数：压下 0mV，松开 3.3V。
+           这不是真实 ADC 读数，只是让「微动」那一栏有意义。 */
+        s_mv[i] = pressed[i] ? 0 : BOARD_SENSOR_VDD_MV;
+        s_degraded[i] = false;   /* digitalRead 不受 ADC2/WiFi 影响 */
+    }
+
+    /* 通道 c：开始位 = 微动 c，停止位 = 微动 c + half */
+    for (int c = 0; c < half; c++) {
+        bool st = pressed[c];
+        bool sp = pressed[c + half];
+        sensor_dbg_apply(c, SENSOR_START, st);
+        sensor_dbg_apply(c, SENSOR_STOP,  sp);
+        /* combo 只用于网页显示 */
+        s_combo[c] = st ? COMBO_START : (sp ? COMBO_STOP : COMBO_MID);
+    }
+
+    /* 后一半通道没有独立微动（它们的 IO 已被当成上面通道的停止位用了），
+       固定清成"不触发"，避免误补料。 */
+    for (int c = half; c < BOARD_CHANNEL_COUNT; c++) {
+        sensor_dbg_apply(c, SENSOR_START, false);
+        sensor_dbg_apply(c, SENSOR_STOP,  false);
+        s_combo[c] = COMBO_MID;
+    }
+}
+
+#endif /* SENSOR_TEMP_DIGITAL */
+
 static void sensor_poll_cb(void *arg)
 {
+#if SENSOR_TEMP_DIGITAL
+    (void)arg;
+    sensor_poll_digital();
+    return;
+#else
     for (int i = 0; i < BOARD_CHANNEL_COUNT; i++) {
         if (s_adc_unit[i] == 0) continue;
 
@@ -269,6 +352,7 @@ static void sensor_poll_cb(void *arg)
             s_degraded[i] = false;
         }
     }
+#endif /* SENSOR_TEMP_DIGITAL */
 }
 
 /* ==========================================================================
@@ -277,7 +361,19 @@ static void sensor_poll_cb(void *arg)
 
 bool sensor_init(void)
 {
+#if SENSOR_TEMP_DIGITAL
+    /* 临时直连模式：8 个脚都当普通数字输入，开内部上拉。
+       不碰 ADC —— GPIO11/12/13 是 ADC2，WiFi 开着时 ADC 读不到。 */
+    for (int i = 0; i < BOARD_CHANNEL_COUNT; i++) {
+        pinMode(s_pins[i], INPUT_PULLUP);
+        s_adc_unit[i] = 1;      /* 标记"可读"，让降级判断不挡 */
+    }
+    /* 后 4 个 IO 已经被当成前 4 通道的停止位用掉了，它们不是独立料盘位。
+       关掉这 4 个"通道"的缓冲补料，免得真去驱动不存在的通道。 */
+    s_enabled_mask &= (uint8_t)((1u << (BOARD_CHANNEL_COUNT / 2)) - 1u);
+#else
     sensor_adc_init();
+#endif
 
     /* 清零状态 */
     for (int i = 0; i < BOARD_CHANNEL_COUNT; i++) {
@@ -295,6 +391,8 @@ bool sensor_init(void)
             s_release_seq[i][k] = 0;
             s_last_trigger_ms[i][k] = UINT32_MAX;
             s_last_release_ms[i][k] = UINT32_MAX;
+            s_dbg_counts[i][k] = 0;
+            s_dbg_last[i][k] = -1;
         }
     }
 
@@ -317,7 +415,17 @@ bool sensor_init(void)
         return false;
     }
 
+#if SENSOR_TEMP_DIGITAL
+    log_w("微动: ★临时直连模式★ 8 只独立微动 → 4 通道（后 4 通道已禁用）");
+    log_w("  极性=%s", SENSOR_TEMP_ACTIVE_LOW ? "低电平触发(微动接 GND)" : "高电平触发(微动接 3.3V)");
+    for (int c = 0; c < BOARD_CHANNEL_COUNT / 2; c++) {
+        log_w("  通道%d: 开始=微动%d(GPIO%d)  停止=微动%d(GPIO%d)",
+              c + 1, c + 1, s_pins[c], c + 5, s_pins[c + BOARD_CHANNEL_COUNT / 2]);
+    }
+    log_w("  电阻编码微动到货后把 SENSOR_TEMP_DIGITAL 改回 0 重新编译");
+#else
     log_i("%d 路微动已初始化（单IO双微动电阻编码 + ADC）", BOARD_CHANNEL_COUNT);
+#endif
     return true;
 }
 

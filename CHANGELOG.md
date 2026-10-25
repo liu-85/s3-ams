@@ -6,6 +6,43 @@ RELEASE.md 在 `release/vX.Y.Z/`。
 
 ---
 
+## v1.1.14 —— 临时直连微动模式（电阻编码微动未到货的过渡版）
+
+**2026-10-25**
+
+**背景**：4.7K/10K 电阻编码微动还没到货，先用 8 只普通微动直接接原传感器 IO，
+能测 4 通道换色。
+
+**约束**：只改「微动怎么读」，其他一行不动 —— AMCU / 缓冲补料 / 485 状态机 /
+网页 / 计米 / 离合全部保持原样，上层 `sensor_triggered()` API 没变。
+
+**改动**：
+- `filament_sensor.h` 新增两个宏：`SENSOR_TEMP_DIGITAL`（默认 1）、
+  `SENSOR_TEMP_ACTIVE_LOW`（默认 1，压下为低）
+- `filament_sensor.cpp` 新增 `sensor_dbg_apply()` / `sensor_poll_digital()`，
+  用 `digitalRead` 读 8 脚，通道 c 的开始位 = 微动 c、停止位 = 微动 c+4
+- 后 4 个"通道"的 `s_enabled_mask` 位被清掉（它们的 IO 已被当成停止位用掉）
+- `/status` 的 `sensors` 段新增 `"mode":"digital"`
+- 启动日志逐通道打印 GPIO 配对表，一眼能核对接线
+
+**为什么用 digitalRead**：`GPIO11/12/13` 属 ADC2，WiFi 开着时 ADC 读不到
+（正式模式 6/7/8 路"降级"就是这个）。`digitalRead` 不受限，测试全程不用关 WiFi。
+
+**接线**（GPIO 不是连续的 0..7）：
+
+| 通道 | 开始位 | GPIO | 停止位 | GPIO |
+|:---:|:---:|:---:|:---:|:---:|
+| 1 | 微动 1 | GPIO1 | 微动 5 | GPIO10 |
+| 2 | 微动 2 | GPIO2 | 微动 6 | GPIO11 |
+| 3 | 微动 3 | GPIO9 | 微动 7 | GPIO12 |
+| 4 | 微动 4 | GPIO8 | 微动 8 | GPIO13 |
+
+切回正式模式：`SENSOR_TEMP_DIGITAL` 改回 0，重编译即可。
+
+详见 [release/v1.1.14/RELEASE.md](release/v1.1.14/RELEASE.md)
+
+---
+
 ## v1.1.13 —— 修「当前固件仅支持 AMS / AMS 2 Pro / AMS HT」弹窗
 
 **2026-10-25**

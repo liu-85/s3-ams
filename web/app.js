@@ -889,6 +889,10 @@
          *   （电阻编码）。此时 mv[i] 里有该路微动脚的实测电压，
          *   接错电阻/没接地一眼就看出来 */
         var dual = !!sg.dual;
+        /* v1.1.14：微动读取模式。digital = 临时直连 8 只独立微动两两配对
+         *   （电阻编码微动没到货时的过渡），encoded = 正式电阻编码。
+         *   两种模式下 mv[] 的含义完全不同，显示文案必须分开。 */
+        var isDigital = (sg.mode === 'digital');
         var mvs  = sg.mv || [];
         /* ★ 2026-10-22 新增：adc[i] = 这一路挂在哪个 ADC（1/2/0），
          *   deg[i] = 1 表示"在 ADC2 上且当前读不到"。PCB 已定型，8 路里
@@ -902,6 +906,12 @@
             : '<span class="dim">未到位</span>';
         $('sg_src').textContent = d.extruder_pin_used
             ? 'GPIO1（硬件到位信号）' : '打印机 MQTT 事件';
+        /* v1.1.14：卡片标题随模式变，避免在临时模式下还写着"合占 1 个 ADC 口" */
+        if ($('sg_sub')) {
+            $('sg_sub').textContent = isDigital
+                ? '★ 临时直连：8 只独立微动两两配对（digitalRead，仅前 4 通道）'
+                : '每路 2 只：开始位 / 停止位（合占 1 个 ADC 口）';
+        }
 
         /* pins[i] = [停止, 开始] 各自接的 GPIO 号（-1 = 没分到脚） */
         var pins = sg.pins || [];
@@ -915,14 +925,31 @@
         var sig = enabled + '|' + JSON.stringify(chans) + '|' +
                   JSON.stringify(pins) + '|' + JSON.stringify(bufs) + '|' +
                   jobOn + '|' + stageOn + '|' + curIdx + '|' + (dual ? 1 : 0) +
+                  '|' + (isDigital ? 1 : 0) +
                   '|' + JSON.stringify(adcs) + '|' + JSON.stringify(degs);
         if (sig !== sensorSig) {
             sensorSig = sig;
 
             var names = dual ? ['停止位(满)', '开始位(空)']
                              : ['停止送料', '开始送料'];
-            var html = '<div class="dim" style="margin-top:8px;font-size:13px">' +
-                       '各路微动状态（灰色 = 「缓冲送料」开关关着，这时触发也不会有动作）</div>';
+            var html = '';
+            /* ★ v1.1.14 临时直连模式：顶部先说清楚，否则用户会照
+             *   "电阻编码"的说明去接线，怎么接都不对。 */
+            if (isDigital) {
+                html += '<div class="tip warn" style="margin-top:8px;font-size:13px">' +
+                        '<b>★ 临时直连微动模式（v1.1.14）</b>：电阻编码微动未到货，' +
+                        '本版用 <b>8 只普通微动</b>直连 8 个传感器 IO，' +
+                        '用 <b>digitalRead</b> 读（不用 ADC，所以 WiFi 开着也正常）。' +
+                        '<div class="hr"></div>' +
+                        '配对规则：<b>通道 c 的开始位 = 微动 c，停止位 = 微动 c+4</b>。' +
+                        '微动 COM 接 GPIO、NO 接 GND，<b>不用外接电阻</b>，' +
+                        '<b>压下 = 触发</b>。' +
+                        '<div class="hr"></div>' +
+                        '<b>通道 5~8 本版不可用</b> —— 它们的 IO 已被当成通道 1~4 的停止位用掉。' +
+                        '</div>';
+            }
+            html += '<div class="dim" style="margin-top:8px;font-size:13px">' +
+                    '各路微动状态（灰色 = 「缓冲送料」开关关着，这时触发也不会有动作）</div>';
 
             /* ★ 门禁状态（2026-10-14）：微动触发现在要过两道门才动作。
              *   把门的原始状态摊出来，省得"按了没反应"时只能猜。 */
@@ -966,18 +993,29 @@
                 }
                 var isAdc2 = (adcs[i] === 2);
                 var isDeg  = !!degs[i];
+                /* 接线说明：三种模式文案完全不同，混用会让现场接错线 */
+                var pinLine;
+                if (dual && !isDigital) {
+                    pinLine = '接线：' + pinLabel(pn[1]) +
+                        '（开始位串 4.7K、停止位串 10K，两只并在同一脚，ADC 读）' +
+                        (isAdc2 ? ' · <span class="warn sensor-adc2">ADC2</span>' : '') +
+                        ' · 实测 ' +
+                        (isDeg
+                            ? '<b class="err sensor-deg">读不到（WiFi 占用 ADC2）</b>'
+                            : '<b id="sg_mv_' + i + '">-</b> mV');
+                } else if (isDigital) {
+                    pinLine = (pn[1] >= 0 && pn[0] >= 0)
+                        ? ('接线：开始位 ' + pinLabel(pn[1]) + ' · 停止位 ' + pinLabel(pn[0]) +
+                           ' · 内部上拉，微动另一端接 <b>GND</b>，<b>压下 = 触发</b>')
+                        : ('本通道无独立微动 —— 它的 IO 已被当成通道 ' +
+                           (i - nch / 2 + 1) + ' 的停止位用掉（v1.1.14 只支持前 4 通道）');
+                } else {
+                    pinLine = '接线：' + names[0] + ' ' + pinLabel(pn[0]) + ' · ' +
+                              names[1] + ' ' + pinLabel(pn[1]);
+                }
                 html += '</span></div>' +
                     '<div class="dim" style="font-size:12px;margin:2px 0 0 72px">' +
-                    (dual
-                        ? ('接线：' + pinLabel(pn[1]) +
-                           '（开始位串 4.7K、停止位串 10K，两只并在同一脚，ADC 读）' +
-                           (isAdc2 ? ' · <span class="warn sensor-adc2">ADC2</span>' : '') +
-                           ' · 实测 ' +
-                           (isDeg
-                                ? '<b class="err sensor-deg">读不到（WiFi 占用 ADC2）</b>'
-                                : '<b id="sg_mv_' + i + '">-</b> mV'))
-                        : ('接线：' + names[0] + ' ' + pinLabel(pn[0]) + ' · ' +
-                           names[1] + ' ' + pinLabel(pn[1]))) +
+                    pinLine +
                     '</div>' +
                     bufStatus(i, bufOn, pn, bufs) +
                     '<div class="row" style="margin-top:6px;align-items:center">' +
@@ -994,7 +1032,24 @@
              * 只有固件真的报了 pins 才显示（拿不到状态时别乱下结论）。 */
             if (sg.pins && sg.pins.length) {
                 var bname = (d.board && d.board.name) || '本板型';
-                if (dual) {
+                if (isDigital) {
+                    /* 临时直连模式：不复述电阻编码那套，直接给配对表 */
+                    html += '<div class="tip" style="margin-top:12px;font-size:13px">' +
+                        '<b>临时直连接线表</b>（GPIO 不是连续的 0..7，沿用正式引脚表）：' +
+                        '<div class="hr"></div>' +
+                        '通道1：开始 <b>GPIO' + (pins[0] ? pins[0][1] : '-') + '</b> · ' +
+                        '停止 <b>GPIO' + (pins[0] ? pins[0][0] : '-') + '</b><br>' +
+                        '通道2：开始 <b>GPIO' + (pins[1] ? pins[1][1] : '-') + '</b> · ' +
+                        '停止 <b>GPIO' + (pins[1] ? pins[1][0] : '-') + '</b><br>' +
+                        '通道3：开始 <b>GPIO' + (pins[2] ? pins[2][1] : '-') + '</b> · ' +
+                        '停止 <b>GPIO' + (pins[2] ? pins[2][0] : '-') + '</b><br>' +
+                        '通道4：开始 <b>GPIO' + (pins[3] ? pins[3][1] : '-') + '</b> · ' +
+                        '停止 <b>GPIO' + (pins[3] ? pins[3][0] : '-') + '</b>' +
+                        '<div class="hr"></div>' +
+                        '电阻编码微动到货后，把 <b>src/filament_sensor.h</b> 里的 ' +
+                        '<b>SENSOR_TEMP_DIGITAL</b> 改回 <b>0</b> 重新编译即可，其他不用动。' +
+                        '</div>';
+                } else if (dual) {
                     html += '<div class="tip" style="margin-top:12px;font-size:13px">' +
                         '本板型 <b>' + esc(bname) + '</b>：每路<b>只用 1 个 ADC 口</b>' +
                         '同时读两只微动 —— 开始位串 <b>4.7K</b>、停止位串 <b>10K</b>，' +

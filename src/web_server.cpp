@@ -165,7 +165,7 @@ void web_log_install_hook(void)
 }
 
 /* App 版本 */
-static const char *APP_VERSION = "1.1.13-s3ams";
+static const char *APP_VERSION = "1.1.14-s3ams";
 
 /* 单 IO 双微动：每路一个 ADC 脚（开始位/停止位共用同一脚，电阻编码） */
 static const int BOARD_SENSOR_PINS[BOARD_CHANNEL_COUNT] = BOARD_PIN_SENSOR_ARRAY;
@@ -496,6 +496,9 @@ static void handle_status(void)
     json += "\"sensors\":{";
     json += "\"enabled\":" + String(sensor_enabled_mask()) + ",";
     json += "\"dual\":true,";
+    /* v1.1.14：微动读取模式。digital = 临时直连（8 只独立微动两两配对），
+       encoded = 正式电阻编码（1 个 ADC 脚带 2 只）。 */
+    json += "\"mode\":\"" + String(SENSOR_TEMP_DIGITAL ? "digital" : "encoded") + "\",";
     json += "\"extruder\":false,";
     json += "\"ch\":[";
     for (int i = 0; i < BOARD_CHANNEL_COUNT; i++) {
@@ -508,7 +511,19 @@ static void handle_status(void)
     json += "\"pins\":[";
     for (int i = 0; i < BOARD_CHANNEL_COUNT; i++) {
         if (i) json += ",";
+#if SENSOR_TEMP_DIGITAL
+        /* 临时直连：通道 i(0..3) 的开始位 = 引脚 i，停止位 = 引脚 i+4。
+           通道 4..7 没有独立引脚（它们的脚被当成停止位了）→ [-1,-1]，
+           网页据此显示「无」，不会被误当成接线问题。 */
+        if (i < BOARD_CHANNEL_COUNT / 2) {
+            json += "[" + String(BOARD_SENSOR_PINS[i + BOARD_CHANNEL_COUNT / 2]) +
+                    "," + String(BOARD_SENSOR_PINS[i]) + "]";
+        } else {
+            json += "[-1,-1]";
+        }
+#else
         json += "[" + String(BOARD_SENSOR_PINS[i]) + "," + String(BOARD_SENSOR_PINS[i]) + "]";
+#endif
     }
     json += "],";
     json += "\"buf\":[";
