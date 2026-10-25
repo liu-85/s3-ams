@@ -154,6 +154,45 @@ static int sensor_read_mv(int i)
  * 三档分类
  * ========================================================================== */
 
+/* ==========================================================================
+ * 三档分类 + 稳定性滤波
+ * ==========================================================================
+ * 为什么要稳定性滤波（2026-10-25）：
+ *   单 IO 双微动是电阻编码，微动没接/悬空时 ADC 读的是噪声。之前只加了
+ *   "350mV 以下算无信号"的门限，但那只是通道 1 实测的 ~371mV —— 其他
+ *   通道悬空电压各不相同（走线/漏电流/内部分压），有的落在 START 区
+ *   (<433mV) 就乱跳，用户看到"只修了通道 1"。
+ *   现在的判据是"稳不稳"而不是"多少 mV"：悬空引脚的读数会在窗口内大幅
+ *   跳动，真实分压（开始位 ~300mV / 停止位 ~600mV+）是稳的。
+ *   窗口内 (max-min) > SENSOR_STABLE_SPREAD_MV → 判中间态（无动作），
+ *   全通道一视同仁，不依赖任何魔法电压。
+ * ========================================================================== */
+#define SENSOR_STABLE_WIN     8     /* 稳定性窗口：最近 8 次采样（8×5ms=40ms） */
+#define SENSOR_STABLE_SPREAD_MV 100 /* 窗口内最大最小差超过此值 = 读数不稳 */
+
+static int s_mv_win[BOARD_CHANNEL_COUNT][SENSOR_STABLE_WIN];
+static int s_mv_win_idx[BOARD_CHANNEL_COUNT];
+static int s_mv_win_cnt[BOARD_CHANNEL_COUNT];
+
+/* 窗口推入一个新值，返回本次是否稳定（填满且极差足够小） */
+static bool sensor_stable_push(int i, int mv)
+{
+    if (mv < 0) return false;  /* 读不到（ADC2 被 WiFi 占用等）→ 不稳 */
+    int *w = s_mv_win[i];
+    w[s_mv_win_idx[i]] = mv;
+    s_mv_win_idx[i] = (s_mv_win_idx[i] + 1) % SENSOR_STABLE_WIN;
+    if (s_mv_win_cnt[i] < SENSOR_STABLE_WIN) s_mv_win_cnt[i]++;
+
+    if (s_mv_win_cnt[i] < SENSOR_STABLE_WIN) return false;  /* 没填满先不判 */
+
+    int mn = w[0], mx = w[0];
+    for (int k = 1; k < SENSOR_STABLE_WIN; k++) {
+        if (w[k] < mn) mn = w[k];
+        if (w[k] > mx) mx = w[k];
+    }
+    return (mx - mn) <= SENSOR_STABLE_SPREAD_MV;
+}
+
 static int sensor_classify(int mv)
 {
     if (mv < 0) return COMBO_MID;  /* 读不到时保持中间 */
@@ -178,7 +217,10 @@ static void sensor_poll_cb(void *arg)
         int mv = sensor_read_mv(i);
         s_mv[i] = mv;
 
-        int combo = sensor_classify(mv);
+        /* 稳定性滤波：读数在窗口内跳变过大（悬空/接触不良）→ 判中间态。
+           全通道生效，不依赖具体噪声电压（其他通道悬空值跟通道 1 不同）。 */
+        bool stable = sensor_stable_push(i, mv);
+        int combo = stable ? sensor_classify(mv) : COMBO_MID;
         s_combo[i] = combo;
 
         /* 去抖 */
@@ -241,6 +283,9 @@ bool sensor_init(void)
         s_counts[i] = 0;
         s_last_raw_combo[i] = COMBO_MID;
         s_degraded[i] = false;
+        s_mv_win_idx[i] = 0;
+        s_mv_win_cnt[i] = 0;
+        for (int k = 0; k < SENSOR_STABLE_WIN; k++) s_mv_win[i][k] = 0;
         for (int k = 0; k < SENSOR_KIND_COUNT; k++) {
             s_triggered[i][k] = false;
             s_trigger_seq[i][k] = 0;

@@ -124,7 +124,7 @@ void web_log_install_hook(void)
 }
 
 /* App 版本 */
-static const char *APP_VERSION = "1.1.3-s3ams";
+static const char *APP_VERSION = "1.1.4-s3ams";
 
 /* 单 IO 双微动：每路一个 ADC 脚（开始位/停止位共用同一脚，电阻编码） */
 static const int BOARD_SENSOR_PINS[BOARD_CHANNEL_COUNT] = BOARD_PIN_SENSOR_ARRAY;
@@ -602,6 +602,19 @@ static void handle_wifi_set(void)
  *   multipart 走 _parseForm 流式路径：每 1436 字节触发一次
  *   server.upload() 回调，我们边收边写 flash，内存占用恒定。
  *   前端用 FormData 即可（勿手动设 Content-Type，边界要浏览器生成）。
+ *
+ * ★ 为什么必须用 4 参数 on() 注册（2026-10-25 血的教训）：
+ *   server.on(uri, HTTP_POST, fn) 这 3 参数重载把上传回调注册成
+ *   _fileUploadHandler，而它是 nullptr → FunctionRequestHandler::
+ *   canUpload() 返回 false → _parseForm 里 START/WRITE/END 三个
+ *   upload 事件**一个都不会送来**，1.18MB 被逐字节解析后全部丢弃，
+ *   最后 POST 完成回调里 Update.end() 发现从未 begin → 返回 500
+ *   "上传失败"。上传回调必须作为 on() 的第 4 个参数（或 onFileUpload）。
+ *
+ * ★ 为什么用 UPDATE_SIZE_UNKNOWN：
+ *   multipart 的 Content-Length 含 boundary 头尾（比镜像大几百字节），
+ *   拿它当 Update.begin 的 size 会让 _size 大于实际镜像；虽然
+ *   end(true) 能兜住，但没必要赌，UNKNOWN 走"边写边擦"的成熟路径。
  * ========================================================================== */
 static bool     s_ota_error = false;
 static size_t   s_ota_written = 0;
@@ -614,19 +627,13 @@ static void handle_ota_upload(void)
         s_ota_error = false;
         s_ota_written = 0;
         s_ota_start_ms = millis();
-        /* 优先按 Content-Length 开分区（multipart 时它含 boundary 头，
-           略大于镜像，Update 只按实际写入量收尾，安全） */
-        int clen = server.clientContentLength();
-        size_t begin_size = (clen > 0) ? (size_t)clen : UPDATE_SIZE_UNKNOWN;
-        if (!Update.begin(begin_size, U_FLASH)) {
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
             Update.printError(Serial);
-            log_e("OTA begin 失败（Content-Length=%d）", clen);
+            log_e("OTA begin 失败");
             s_ota_error = true;
             return;
         }
-        log_i("OTA 开始: %s（%u 字节，按 %s 开分区）",
-              upload.filename.c_str(), (unsigned)clen,
-              begin_size == UPDATE_SIZE_UNKNOWN ? "未知大小" : "声明大小");
+        log_i("OTA 开始: %s（流式 multipart，UNKNOWN 尺寸）", upload.filename.c_str());
     } else if (upload.status == UPLOAD_FILE_WRITE) {
         if (s_ota_error) return;  /* begin 就失败了，丢弃后续数据 */
         size_t n = Update.write(upload.buf, upload.currentSize);
@@ -657,6 +664,13 @@ static void handle_ota_upload(void)
             server.send(500, "text/plain", "OTA 失败（Update.end 校验未过）");
         }
     }
+}
+
+/* POST 完成回调：响应已在 upload 回调的 END 分支发过，这里必须空手，
+   再 send 一次会 "double response" 把连接搞坏 */
+static void handle_ota_upload_done(void)
+{
+    /* 保留给将来要做"上传完成后统一回执"的场景；现在什么都不做 */
 }
 
 /* ==========================================================================
@@ -891,7 +905,7 @@ void web_server_start(void)
     server.on("/wifi_scan", HTTP_POST, handle_wifi_scan);
     server.on("/wifi_connect", HTTP_POST, handle_wifi_connect);
     server.on("/wifi_set", HTTP_POST, handle_wifi_set);
-    server.on("/ota_upload", HTTP_POST, handle_ota_upload);
+    server.on("/ota_upload", HTTP_POST, handle_ota_upload_done, handle_ota_upload);
     server.on("/diag_reset", HTTP_POST, handle_diag_reset);
     server.on("/current_set", HTTP_POST, handle_current_set);
     server.on("/current_clear", HTTP_POST, handle_current_clear);
