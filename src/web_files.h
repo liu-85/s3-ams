@@ -2,7 +2,7 @@
 #pragma once
 #include <Arduino.h>
 
-// 来源: web/index.html  (32907 字节)
+// 来源: web/index.html  (32992 字节)
 static const char *WEB_INDEX_HTML =
   "<!DOCTYPE html>\n"
 "<html lang=\"zh-CN\">\n"
@@ -81,6 +81,7 @@ static const char *WEB_INDEX_HTML =
 "          <div class=\"kv\"><span>最近错误</span><b id=\"a_lasterr\">-</b></div>\n"
 "          <div class=\"row\">\n"
 "            <button class=\"ghost\" id=\"btn_diag_reset\" style=\"flex:1\">重置统计</button>\n"
+"            <button class=\"ghost\" id=\"btn_meters_reset\" style=\"flex:1\">清零计米</button>\n"
 "          </div>\n"
 "        </div>\n"
 "\n"
@@ -1323,7 +1324,7 @@ static const char *WEB_STYLE_CSS =
 "}\n"
 "";
 
-// 来源: web/app.js  (86470 字节)
+// 来源: web/app.js  (86967 字节)
 static const char *WEB_APP_JS =
   "/* ===========================================================================\n"
 "   ESP-AMS-S3 配置界面前端\n"
@@ -3148,6 +3149,18 @@ static const char *WEB_APP_JS =
 "        });\n"
 "    }\n"
 "\n"
+"    /* 清零计米：v1.1.10 及更早版本计米单位错 1000 倍（3 秒送料报 141 米），\n"
+"       错误值已写进 flash，打印机按 meters 折算料盘余量会当成\"已用光\"。\n"
+"       刷入 v1.1.11 后点一次这里恢复。 */\n"
+"    function resetMeters() {\n"
+"        if (!confirm('确定把 16 个料位的计米全部清零？\\n\\n' +\n"
+"                     '料盘余量统计会从 0 重新计算，已打印的耗材量会丢失。')) return;\n"
+"        post('/meters_reset', {}, function (d) {\n"
+"            toast((d && d.info) || '计米已清零', (d && d.ok === false) ? 'bad' : 'ok');\n"
+"            refresh();\n"
+"        });\n"
+"    }\n"
+"\n"
 "    function toggleExtruderSrc() {\n"
 "        var cur = $('btn_src_toggle').textContent.indexOf('MQTT') >= 0 ? 1 : 0;\n"
 "        post('/extruder_src_set', { src: cur ? 0 : 1 }, function (d) {\n"
@@ -3459,6 +3472,7 @@ static const char *WEB_APP_JS =
 "        $('btn_ap').onclick = toggleAp;\n"
 "        $('btn_stop').onclick = emergencyStop;\n"
 "        $('btn_diag_reset').onclick = resetDiag;\n"
+"        $('btn_meters_reset').onclick = resetMeters;\n"
 "        $('btn_wifi_conn').onclick = connectWifi;\n"
 "        $('btn_wifi_scan').onclick = rescanWifi;\n"
 "        $('btn_mqtt_save').onclick = saveMqtt;\n"

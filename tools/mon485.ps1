@@ -108,10 +108,13 @@ try {
             # v1.1.9：送料链诊断（feed 段）。没升级到 1.1.9 时该段为空，自动降级
             if ($null -ne $s.feed) {
                 $eng = [int]$s.feed.clutch_mask
-                $line = "状态: 电机={0}/{1}% 离合=0x{2:X2} 电流={3}mA 峰值={4}mA act485={5}{6} | 料位{7} 动作={8} 在线={9} 打印={10} 堵转={11} 点动={12} 回读={13} cmd={14}" -f
+                # v1.1.11：计米。正常送料约 0.05 米/秒，看到几十上百米就是单位又跑飞了
+                $mt = "-"
+                if ($null -ne $s.feed.meters) { $mt = "{0:N3}m" -f [double]$s.feed.meters }
+                $line = "状态: 电机={0}/{1}% 离合=0x{2:X2} 电流={3}mA 峰值={4}mA act485={5}{6} | 料位{7} 动作={8} 在线={9} 打印={10} 堵转={11} 点动={12} 回读={13} cmd={14} 计米={15}" -f
                     $dirTxt, $s.feed.motor_pct, $eng, $ma, $pk, $s.act485, $trip,
                     $s.feed.cur, $s.feed.motion_text, $s.feed.online, $s.feed.printing,
-                    $s.feed.tripped, $s.feed.jog, $s.feed.clutch_rb, $s.feed.cmd
+                    $s.feed.tripped, $s.feed.jog, $s.feed.clutch_rb, $s.feed.cmd, $mt
             } else {
                 $eng = (@($s.hardware.engaged) -join ",")
                 $line = "状态: 电机={0} 离合={1} 电流={2}mA 峰值={3}mA act485={4}{5}" -f

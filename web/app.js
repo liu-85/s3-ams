@@ -1821,6 +1821,18 @@
         });
     }
 
+    /* 清零计米：v1.1.10 及更早版本计米单位错 1000 倍（3 秒送料报 141 米），
+       错误值已写进 flash，打印机按 meters 折算料盘余量会当成"已用光"。
+       刷入 v1.1.11 后点一次这里恢复。 */
+    function resetMeters() {
+        if (!confirm('确定把 16 个料位的计米全部清零？\n\n' +
+                     '料盘余量统计会从 0 重新计算，已打印的耗材量会丢失。')) return;
+        post('/meters_reset', {}, function (d) {
+            toast((d && d.info) || '计米已清零', (d && d.ok === false) ? 'bad' : 'ok');
+            refresh();
+        });
+    }
+
     function toggleExtruderSrc() {
         var cur = $('btn_src_toggle').textContent.indexOf('MQTT') >= 0 ? 1 : 0;
         post('/extruder_src_set', { src: cur ? 0 : 1 }, function (d) {
@@ -2132,6 +2144,7 @@
         $('btn_ap').onclick = toggleAp;
         $('btn_stop').onclick = emergencyStop;
         $('btn_diag_reset').onclick = resetDiag;
+        $('btn_meters_reset').onclick = resetMeters;
         $('btn_wifi_conn').onclick = connectWifi;
         $('btn_wifi_scan').onclick = rescanWifi;
         $('btn_mqtt_save').onclick = saveMqtt;

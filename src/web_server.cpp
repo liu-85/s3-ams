@@ -165,7 +165,7 @@ void web_log_install_hook(void)
 }
 
 /* App 版本 */
-static const char *APP_VERSION = "1.1.10-s3ams";
+static const char *APP_VERSION = "1.1.11-s3ams";
 
 /* 单 IO 双微动：每路一个 ADC 脚（开始位/停止位共用同一脚，电阻编码） */
 static const int BOARD_SENSOR_PINS[BOARD_CHANNEL_COUNT] = BOARD_PIN_SENSOR_ARRAY;
@@ -432,7 +432,10 @@ static void handle_status(void)
         json += "\"clutch_rb\":" + String(clutch_readback_ok() ? 1 : 0) + ",";
         json += "\"motor_dir\":" + String((int)motor_get_dir()) + ",";
         json += "\"motor_pct\":" + String(motor_get_speed_pct()) + ",";
-        json += "\"cmd\":" + String(get_cmd_type());
+        json += "\"cmd\":" + String(get_cmd_type()) + ",";
+        /* 计米（米）：v1.1.10 及更早版本单位错 1000 倍，这里暴露出来方便核对。
+           送料 1 秒应约 0.05 米（50mm），若看到几十上百米就是又跑飞了。 */
+        json += "\"meters\":" + String(get_filament_meters(dn), 4);
         json += "},";
     }
 
@@ -892,6 +895,23 @@ static void handle_diag_reset(void)
     server.send(200, "application/json", "{\"ok\":true,\"info\":\"已清除离合冲突计数\"}");
 }
 
+/* 清零全部料位的计米。
+ *
+ * 为什么需要：v1.1.10 及更早版本 accumulate_feed_meters() 把「毫秒」当「秒」
+ * 用，计米放大 1000 倍 —— 送料 3 秒就报 141 米、第二次 818 米。这些值已经
+ * 写进 flash，而打印机按 meters 折算料盘余量，会把料当成「已用光」。
+ * 刷入 v1.1.11 后调一次本接口即可恢复。 */
+static void handle_meters_reset(void)
+{
+    for (int i = 0; i < 4 * MAX_AMS_NUM; i++) {
+        reset_filament_meters(i);
+    }
+    Bambubus_set_need_to_save();
+    log_i("计米已清零: 16 个料位 meters 全部归零");
+    server.send(200, "application/json",
+                "{\"ok\":true,\"info\":\"16 个料位计米已清零\"}");
+}
+
 /* 485 运动执行开关（Web 驱动 ams_enable）
    前端 post('/act485_set', {on:0|1})，on=1 打开、on=0 关闭。
    之前走 handle_ok 占位 → 根本没碰 ams_enable，勾选不生效。 */
@@ -1079,6 +1099,7 @@ void web_server_start(void)
     server.on("/wifi_set", HTTP_POST, handle_wifi_set);
     server.on("/ota_upload", HTTP_POST, handle_ota_upload_done, handle_ota_upload);
     server.on("/diag_reset", HTTP_POST, handle_diag_reset);
+    server.on("/meters_reset", HTTP_POST, handle_meters_reset);
     server.on("/current_set", HTTP_POST, handle_current_set);
     server.on("/current_clear", HTTP_POST, handle_current_clear);
     server.on("/current_channel_set", HTTP_POST, handle_current_channel_set);

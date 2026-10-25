@@ -189,7 +189,26 @@ static void accumulate_feed_meters(int f)
     uint32_t dt = now - s_last_drive_ms;
     s_last_drive_ms = now;
     if (dt == 0) return;
-    float meters = (float)dt * FILAMENT_PUSH_M_PER_SEC;
+
+    /* ★★ v1.1.11 关键修复：单位错了 1000 倍 ★★
+     *
+     * 现场症状（2026-10-25 第二次实测）：
+     *   送料 3 秒后打印机就发 before_on_use（09/A5）让挤出机拉料，
+     *   拉一点就停 → 报「挤出失败」→ 立刻退料重试。
+     *   抓包看我方 Dxx 应答里的 meters：3 秒就报 141.1 米，
+     *   第二次更是 818.6 米（真实应约 0.15 米）。
+     *
+     * 根因：dt 是毫秒，FILAMENT_PUSH_M_PER_SEC 是「米/秒」，
+     *   原写法 (float)dt * 0.05f 等于把 50ms 算成 2.5 米。
+     *   打印机靠 meters 判断「AMS 送了多少料」，看到 141 米
+     *   自然认为早就到位了 → 提前发 before_on_use → 挤出机拉空。
+     *   （用户直觉「485 的消息给早了」完全正确。）
+     *
+     * 修正：先把毫秒换成秒，再乘米/秒。
+     *   50ms → 0.0025 米 = 2.5mm，3 秒 → 0.15 米，符合 AMS lite 实际送料速度。 */
+    if (dt > 500) return;  /* 主循环卡顿/暂停后不要一次补一大段 */
+
+    float meters = ((float)dt / 1000.0f) * FILAMENT_PUSH_M_PER_SEC;
     add_filament_meters(f, meters);
 }
 
