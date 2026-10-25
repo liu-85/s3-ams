@@ -284,6 +284,20 @@ static int         s_pending_speed = MOTOR_SPEED_FULL;
 static int         s_pending_kind = 0;   /* 0=无, 1=吸合, 3=全断 */
 static int         s_pending_ch   = 0;
 
+/* v1.1.15 诊断计数器（暴露到 /status 的 clutch.diag）：
+ *   s_clutch_switch —— 挂起的吸合目标通道被改成别的通道的次数
+ *   s_clutch_abort  —— 挂起的吸合请求被"停机"打断的次数
+ *
+ * 正常打印时这两个数应该很慢地涨（只在真正换料时各加 1）。
+ * 如果"咔咔响"时每秒涨几十，就是两个模块在互抢同一个离合槽位 ——
+ * 详见 find_motion_channel() 上方的注释。 */
+static uint32_t    s_clutch_switch = 0;
+static uint32_t    s_clutch_abort  = 0;
+
+uint32_t amcu_clutch_switch_count(void) { return s_clutch_switch; }
+uint32_t amcu_clutch_abort_count(void)  { return s_clutch_abort;  }
+void     amcu_clutch_reset_diag(void)   { s_clutch_switch = 0; s_clutch_abort = 0; }
+
 /**
  * 吸合指定通道离合 + 设定电机方向（异步，不阻塞主循环/Web）
  * @param channel 通道号 1~8（对应料盘位）
@@ -321,6 +335,10 @@ bool AMCU_drive_channel(int channel, motor_dir_t dir, int speed_pct)
            ★ 同一通道已有挂起请求时不重复入队（否则队列被塞满 → 主循环被同步
              clutch_engage() 卡住 80ms+，WEB 卡顿、485 收包延迟） */
         if (s_pending_clutch == NULL || s_pending_kind != 1 || s_pending_ch != channel) {
+            /* v1.1.15 诊断：本来在等另一个通道吸合，现在被改成这个通道 */
+            if (s_pending_kind == 1 && s_pending_ch != 0 && s_pending_ch != channel) {
+                s_clutch_switch++;
+            }
             s_pending_clutch = clutch_request_engage(channel);
             s_pending_kind = 1;
             s_pending_ch = channel;
@@ -403,6 +421,8 @@ void AMCU_drive_stop()
     const bool already_off = (s_pending_clutch == NULL && clutch_engaged_mask() == 0);
 
     if (!already_releasing && !already_off) {
+        /* v1.1.15 诊断：吸合请求还没完成就被停机打断 */
+        if (s_pending_kind == 1) s_clutch_abort++;
         s_pending_clutch = clutch_request_release_all();
         s_pending_kind = 3;
         s_pending_ch = 0;
@@ -572,6 +592,54 @@ void motorCmd(int motorNum, int cmd) {
 }
 
 // ============================
+//  通道仲裁（v1.1.15）
+// ============================
+/* 本机是「1 台电机 + 8 路电磁离合」，同一时刻只能服务 1 个通道。
+ *
+ * ★ 现场症状（2026-10-25 用户实测）：
+ *   打印中换料，电磁离合"咔咔响"，料既退不出来也送不进去；
+ *   停止打印后再点动该通道，离合也吸不上。
+ *
+ * ★ 根因：打印中换料时，两个模块同时抢同一个离合槽位 ——
+ *   ① check_buffer_status() 看到旧通道还是 on_use，按缓冲微动
+ *      AMCU_drive_channel(旧, FEED) → clutch_request_engage(旧)
+ *   ② AMCU_motion() 看到新通道 need_send_out，
+ *      switch 里又 AMCU_drive_channel(新, FEED) → clutch_request_engage(新)
+ *   两者每循环交替，而 s_pending_clutch 只有**一个槽**（s_pending_ch 单值），
+ *   于是目标通道每循环被改一次 → 后台任务反复"全断 60ms + 吸合 80ms"，
+ *   听到的就是"咔咔响"；电机永远等不到稳定吸合，两个方向都不转。
+ *
+ * 另外 is_channel_printing(cur) 分支在 switch 之前就 return，
+ * 若 cur 还指着旧通道，新通道的 need_send_out **永远执行不到**。
+ *
+ * ★ 解法：统一仲裁，优先级
+ *      退料(need_pull_back / act_pull_mm)
+ *    > 进料(need_send_out / act_send_mm)
+ *    > 打印中缓冲补料
+ *    > before_on_use 跟随泵
+ *   两个调用点都先问一次 find_motion_channel()，有进/退料就整体让出。 */
+
+/* 找出正在请求「进料 / 退料」的通道（0 起）。没有则 -1。
+ * 退料优先于进料 —— 打印机换料一定是先退旧料再送新料，
+ * 退料没走完就送新料会把耗材扯断。 */
+static int find_motion_channel(void)
+{
+    int send = -1, pull = -1, send_mm = -1, pull_mm = -1;
+    for (int i = 0; i < MAX_FILAMENT_NUM; i++) {
+        _filament_motion_state_set m = get_filament_motion(i);
+        if (m == need_pull_back)      { if (pull    < 0) pull    = i; }
+        else if (m == need_send_out)  { if (send    < 0) send    = i; }
+        else if (m == act_pull_mm)    { if (pull_mm < 0) pull_mm = i; }
+        else if (m == act_send_mm)    { if (send_mm < 0) send_mm = i; }
+    }
+    if (pull    >= 0) return pull;
+    if (send    >= 0) return send;
+    if (pull_mm >= 0) return pull_mm;
+    if (send_mm >= 0) return send_mm;
+    return -1;
+}
+
+// ============================
 //  微动状态检查（兼容 Tianshu 的 check_microswitch_status）
 // ============================
 void check_buffer_status() {
@@ -586,6 +654,14 @@ void check_buffer_status() {
      *
      * 退料优先级高于一切缓冲动作，这里直接整段跳过。 */
     if (is_need_pull_back) return;
+
+    /* ★★ v1.1.15：只要有通道在「进料 / 退料」，缓冲补料整体让出 ★★
+     *
+     * 单电机 + 单离合槽位，缓冲补料和 485 进/退料**不能同时要电机**。
+     * 之前只挡了 is_need_pull_back（全局退料标志），没挡 need_send_out，
+     * 于是打印中换料时这里和 AMCU_motion() 的 switch 互抢离合槽位，
+     * 离合反复吸放"咔咔响"，料退不出也送不进。 */
+    if (find_motion_channel() >= 0) return;
 
     for (int i = 0; i < BOARD_CHANNEL_COUNT; i++) {
         int filament_num = i;
@@ -736,6 +812,23 @@ void AMCU_motion() {
         accumulate_feed_meters(cur);
     }
 
+    /* ★★★ v1.1.15：服务通道仲裁 ★★★
+     *
+     * 不能盲目用 cur（打印机上报的"当前料位"）：
+     *   打印中换料时 cur 往往还指着**旧通道**（它还是 on_use），
+     *   而真正要动的电机是**新通道**的 need_send_out。
+     *   原代码在 is_channel_printing(cur) 分支直接 return，
+     *   新通道的进料永远执行不到 → "料送不进去"。
+     *
+     * 所以先问一次 find_motion_channel()：只要有通道在进/退料，
+     * 本循环就服务它，打印态/缓冲补料全部让位。
+     * 详见 find_motion_channel() 上方的长注释。 */
+    int svc = cur;                                   /* 本循环真正服务的通道 */
+    {
+        int mc = find_motion_channel();
+        if (mc >= 0) svc = mc;
+    }
+
     // 退料超时处理
     if (is_need_pull_back) {
         int timeout_seconds = 7;
@@ -770,7 +863,7 @@ void AMCU_motion() {
         }
     }
 
-    if (ams_enable) act = get_filament_motion(cur);
+    if (ams_enable) act = get_filament_motion(svc);
 
     /* ★★★ v1.1.12：退料优先级最高，跟随泵必须完全让出 ★★★
      *
@@ -779,10 +872,14 @@ void AMCU_motion() {
      *   走进下面的"打印中"分支 → 跟随泵 reset 里 motor_stop() 把
      *   正在反转的退料电机掐掉；或者 check_buffer_status 的 drive_stop()
      *   把挂起的退料吸合请求覆盖掉。
-     * 所以这里先判 is_need_pull_back，退料期间只清跟随泵状态、绝不动电机。 */
+     * 所以这里先判 is_need_pull_back，退料期间只清跟随泵状态、绝不动电机。
+     *
+     * ★ v1.1.15：判断对象从 cur 改成 svc（仲裁后的服务通道）。
+     *   否则打印中换料时 cur 还指着旧通道（on_use），
+     *   会走 "打印中" 分支 return，新通道的 need_send_out 永远执行不到。 */
     if (is_need_pull_back) {
         follow_feed_reset_ex(false);   /* 只清状态，不停电机 */
-    } else if (is_channel_printing(cur)) {
+    } else if (is_channel_printing(svc)) {
         RGB_GREEN;
         clutch_assert_single(true);
 
@@ -796,8 +893,8 @@ void AMCU_motion() {
          *
          * 所以这里按固定节奏脉冲送料，让耗材保持松弛。
          * 详见 follow_feed_pump() 的注释。 */
-        if (is_channel_before_on_use(cur)) {
-            follow_feed_pump(cur + 1);
+        if (is_channel_before_on_use(svc)) {
+            follow_feed_pump(svc + 1);
         } else {
             /* on_use / stop_on_use：交回 check_buffer_status 的微动逻辑 */
             follow_feed_reset_ex(true);
@@ -816,31 +913,31 @@ void AMCU_motion() {
         /* 进入送料前，记录"当前基准"（Tianshu 语义）。
            entered 只在"刚进入送料"这一个周期为真 → 下面的日志只打一次，
            不会刷屏，但能在网页「设备日志」里直接看到这一轮送料是启动还是被挡。 */
-        const bool entered = (s_last_action[cur] != (uint8_t)need_send_out);
+        const bool entered = (s_last_action[svc] != (uint8_t)need_send_out);
         if (entered) {
-            last_pullback_meters[cur] = get_filament_meters(cur);
-            s_last_action[cur] = (uint8_t)need_send_out;
+            last_pullback_meters[svc] = get_filament_meters(svc);
+            s_last_action[svc] = (uint8_t)need_send_out;
         }
-        int ch = cur + 1;
+        int ch = svc + 1;
         /* Tianshu 到位检测：若 target_meters > 0，检查是否已送到位 */
         if (target_meters > 0.0f &&
-            (get_filament_meters(cur) - last_pullback_meters[cur]) > target_meters) {
+            (get_filament_meters(svc) - last_pullback_meters[svc]) > target_meters) {
             AMCU_drive_stop();
             RGB_BLUE;
             act = waiting;
             break;
         }
-        if (is_filament_online(cur)) {
+        if (is_filament_online(svc)) {
             bool driving = AMCU_drive_channel(ch, MOTOR_DIR_FEED, MOTOR_SPEED_485_FEED);
             if (entered) {
                 log_i("送料开始: 料位%d→通道%d PWM=%d%% 电机%s",
-                      cur, ch, MOTOR_SPEED_485_FEED,
+                      svc, ch, MOTOR_SPEED_485_FEED,
                       driving ? "已启动" : "等离合吸合后启动");
             }
             RGB_GREEN;
         } else {
             if (entered) {
-                log_w("送料被挡: 料位%d 被判为离线(online=0)，不驱动电机", cur);
+                log_w("送料被挡: 料位%d 被判为离线(online=0)，不驱动电机", svc);
             }
             AMCU_drive_stop();
             RGB_BLUE;
@@ -862,38 +959,38 @@ void AMCU_motion() {
 
     case act_send_mm: {
         /* 进入前记录基准 */
-        if (s_last_action[cur] != (uint8_t)act_send_mm) {
-            last_pullback_meters[cur] = get_filament_meters(cur);
-            s_last_action[cur] = (uint8_t)act_send_mm;
+        if (s_last_action[svc] != (uint8_t)act_send_mm) {
+            last_pullback_meters[svc] = get_filament_meters(svc);
+            s_last_action[svc] = (uint8_t)act_send_mm;
         }
         /* Tianshu 到位检测 */
         if (target_meters > 0.0f &&
-            (get_filament_meters(cur) - last_pullback_meters[cur]) > target_meters) {
+            (get_filament_meters(svc) - last_pullback_meters[svc]) > target_meters) {
             AMCU_drive_stop();
             RGB_BLUE;
             act = waiting;
             break;
         }
-        AMCU_drive_channel(cur + 1, MOTOR_DIR_FEED, MOTOR_SPEED_485_FEED);
+        AMCU_drive_channel(svc + 1, MOTOR_DIR_FEED, MOTOR_SPEED_485_FEED);
         RGB_GREEN;
         break;
     }
 
     case act_pull_mm: {
         /* 进入前记录基准 */
-        if (s_last_action[cur] != (uint8_t)act_pull_mm) {
-            last_pullback_meters[cur] = get_filament_meters(cur);
-            s_last_action[cur] = (uint8_t)act_pull_mm;
+        if (s_last_action[svc] != (uint8_t)act_pull_mm) {
+            last_pullback_meters[svc] = get_filament_meters(svc);
+            s_last_action[svc] = (uint8_t)act_pull_mm;
         }
         /* Tianshu 到位检测（退料方向） */
         if (target_meters > 0.0f &&
-            (last_pullback_meters[cur] - get_filament_meters(cur)) > target_meters) {
+            (last_pullback_meters[svc] - get_filament_meters(svc)) > target_meters) {
             AMCU_drive_stop();
             RGB_BLUE;
             act = waiting;
             break;
         }
-        AMCU_drive_channel(cur + 1, MOTOR_DIR_RETRACT, MOTOR_SPEED_FULL);
+        AMCU_drive_channel(svc + 1, MOTOR_DIR_RETRACT, MOTOR_SPEED_FULL);
         RGB_GREEN;
         break;
     }
@@ -915,7 +1012,7 @@ void AMCU_motion() {
 
     /* 离开当前动作时清除 last_action 标记 */
     if (act == waiting) {
-        s_last_action[cur] = 0;
+        s_last_action[svc] = 0;
     }
 
     // 运行期离合体检

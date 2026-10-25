@@ -6,6 +6,73 @@ RELEASE.md 在 `release/vX.Y.Z/`。
 
 ---
 
+## v1.1.15 —— 打印中换料：离合咔咔响、料退不出也送不进
+
+**2026-10-25**
+
+**现象**（用户实测）：网页手动把料送入料管正常；**打印中换料**时离合"咔咔响"，
+料既退不出来也送不进去；停止打印后再点动该通道，离合也吸不上。
+
+**根因：两个模块互抢同一个离合槽位。**
+
+本机是「1 台电机 + 8 路离合」，同一时刻只能服务 1 个通道。但打印中换料时：
+
+| 模块 | 看到什么 | 做什么 |
+|---|---|---|
+| `check_buffer_status()` | 旧通道还是 `on_use` | 按缓冲微动 `engage(旧)` |
+| `AMCU_motion()` 的 switch | 新通道 `need_send_out` | `engage(新)` |
+
+两者每循环交替，而 `s_pending_clutch` 只有**一个槽**（`s_pending_ch` 单值）→
+目标通道每循环被改一次 → 后台任务反复"全断 60ms + 吸合 80ms" → **咔咔响**，
+电机永远等不到稳定吸合 → 两个方向都不转。
+
+**第二个 bug**：`is_channel_printing(cur)` 分支在 `switch(act)` 之前就 `return`。
+打印中 `cur` 往往还指着**旧通道**（它还是 `on_use`），于是新通道的
+`need_send_out` **永远执行不到** → 料送不进去。
+
+**修复**：引入统一通道仲裁。
+
+```c
+/* 优先级：退料 > 进料 > 打印中缓冲补料 > before_on_use 跟随泵 */
+static int find_motion_channel(void);   /* 找出在 need_pull_back/need_send_out/act_*_mm 的通道 */
+
+// check_buffer_status()：有进/退料就整体让出
+if (find_motion_channel() >= 0) return;
+
+// AMCU_motion()：服务通道从 cur 改成 svc（仲裁结果）
+int svc = cur;
+int mc = find_motion_channel();
+if (mc >= 0) svc = mc;
+if (ams_enable) act = get_filament_motion(svc);
+...
+else if (is_channel_printing(svc)) { ... }
+```
+
+`switch` 里所有 `cur` 一并换成 `svc`（`s_last_action` / `last_pullback_meters` /
+`get_filament_meters` / `is_filament_online` / `drive_channel(svc+1, ...)`）。
+
+**新增诊断**（网页「AMS」卡片 → 离合仲裁）：
+
+| 字段 | 含义 |
+|---|---|
+| `target_switch` | 挂起的吸合目标被改成别的通道的次数 |
+| `target_abort` | 挂起的吸合请求被"停机"打断的次数 |
+
+正常打印这两个数很慢地涨（只在真正换料时各 +1）。若"咔咔响"时每秒涨几十，
+就是又在互抢。超过 50 次网页会标红提示。`/diag_reset` 一并清零。
+
+**已排除的疑点**（都查过，不是原因）：
+- 离合层 `clutch_engage()` 的"残留吸合复核" —— `clutch_apply_all_off()` 会先清
+  `s_active`，软件记账兜底不会误判
+- `clutch_assert_single(true)` —— 只在 >1 路同时吸合时才动作
+- `follow_feed_reset_ex(true)` —— 只 `motor_stop()`，不动离合
+- 堵转保护 —— `stall_ma` 默认 0（不保护）
+- `AMCU_drive_stop()` 每循环刷队列 —— 有 `already_releasing` / `already_off` 幂等保护
+
+详见 [release/v1.1.15/RELEASE.md](release/v1.1.15/RELEASE.md)
+
+---
+
 ## v1.1.14 —— 临时直连微动模式（电阻编码微动未到货的过渡版）
 
 **2026-10-25**

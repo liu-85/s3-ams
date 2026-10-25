@@ -2,7 +2,7 @@
 #pragma once
 #include <Arduino.h>
 
-// 来源: web/index.html  (33869 字节)
+// 来源: web/index.html  (33938 字节)
 static const char *WEB_INDEX_HTML =
   "<!DOCTYPE html>\n"
 "<html lang=\"zh-CN\">\n"
@@ -78,6 +78,7 @@ static const char *WEB_INDEX_HTML =
 "          <div class=\"kv\"><span>当前状态</span><b id=\"a_state\">-</b></div>\n"
 "          <div class=\"kv\"><span>正在操作</span><b id=\"a_material\">-</b></div>\n"
 "          <div class=\"kv\"><span>换料统计</span><b id=\"a_exchange\">-</b></div>\n"
+"          <div class=\"kv\"><span>离合仲裁</span><b id=\"a_arb\">-</b></div>\n"
 "          <div class=\"kv\"><span>最近错误</span><b id=\"a_lasterr\">-</b></div>\n"
 "          <div class=\"row\">\n"
 "            <button class=\"ghost\" id=\"btn_diag_reset\" style=\"flex:1\">重置统计</button>\n"
@@ -1339,7 +1340,7 @@ static const char *WEB_STYLE_CSS =
 "}\n"
 "";
 
-// 来源: web/app.js  (92134 字节)
+// 来源: web/app.js  (92550 字节)
 static const char *WEB_APP_JS =
   "/* ===========================================================================\n"
 "   ESP-AMS-S3 配置界面前端\n"
@@ -1680,6 +1681,17 @@ static const char *WEB_APP_JS =
 "        $('a_exchange').innerHTML = '成功 ' + (dg.exchange_ok || 0) +\n"
 "            ' 次' + ((dg.exchange_fail || 0) > 0\n"
 "                ? ' / <span class=\"err\">失败 ' + dg.exchange_fail + ' 次</span>' : '');\n"
+"\n"
+"        /* v1.1.15：离合槽位仲裁计数。\n"
+"         * 正常打印时这两个数应该很慢地涨（只在真正换料时各 +1）。\n"
+"         * 如果打印中\"咔咔响\"时它每秒涨几十，说明两个模块在互抢离合。 */\n"
+"        if ($('a_arb')) {\n"
+"            var sw = dg.target_switch || 0;\n"
+"            var ab = dg.target_abort || 0;\n"
+"            $('a_arb').innerHTML = '切目标 ' + sw + ' 次 · 被打断 ' + ab + ' 次' +\n"
+"                ((sw + ab > 50)\n"
+"                    ? ' <span class=\"err\">（偏高：离合在被反复抢）</span>' : '');\n"
+"        }\n"
 "\n"
 "        if (dg.last_error && dg.last_error_ms >= 0) {\n"
 "            $('a_lasterr').innerHTML = '<span class=\"err\">' + esc(dg.last_error) +\n"

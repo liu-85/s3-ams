@@ -146,17 +146,36 @@ allow_stop = (loaded == 本通道);                        // 必须是自己
 
 ### 5.3 内部状态 → 执行（`AMCU_motion()`）
 
+**⚠️ v1.1.15 起，服务通道不是 `cur`，而是仲裁结果 `svc`。**
+
 ```cpp
+// ★ 先仲裁：只要有通道在 need_pull_back / need_send_out / act_*_mm，
+//   本循环就服务它，打印态 / 缓冲补料全部让位。
+//   详见 find_motion_channel() 上方的长注释。
+int svc = cur;
+int mc  = find_motion_channel();
+if (mc >= 0) svc = mc;
+
 if (is_need_pull_back) {            // 退料优先级最高，整段独占
     反转 + 保持离合，超时 PULLBACK_TIMEOUT 后放弃
-} else if (is_channel_printing(cur)) {
+} else if (is_channel_printing(svc)) {
     吸合离合 + 绿灯
-    if (is_channel_before_on_use(cur)) follow_feed_pump(cur+1);   // 脉冲跟随
+    if (is_channel_before_on_use(svc)) follow_feed_pump(svc+1);   // 脉冲跟随
     else                                follow_feed_reset_ex(true);
 } else {
     按 need_send_out / waiting 走送料或停
 }
 ```
+
+`switch(act)` 里所有 `cur` 也一并换成 `svc`（`s_last_action` /
+`last_pullback_meters` / `get_filament_meters` / `is_filament_online` /
+`AMCU_drive_channel(svc+1, ...)`）。
+
+**为什么必须仲裁**：打印中换料时 `cur` 往往还指着旧通道（它还是 `on_use`），
+而真正要动的电机是新通道的 `need_send_out`。直接用 `cur` 会
+① 走进"打印中"分支直接 `return`，新通道进料永远执行不到；
+② 和 `check_buffer_status()` 互抢 `s_pending_clutch` 单槽，
+离合反复吸放"咔咔响"。详见第六节。
 
 ---
 
@@ -169,6 +188,34 @@ if (is_need_pull_back) {            // 退料优先级最高，整段独占
 | 电机 | 每通道 1 个，共 4 个 | **1 个共享**，8 路离合选通 |
 | 停料时耗材状态 | 电机不通电 = **完全自由** | 压轮常压，**被齿轮组拽住** |
 | 打印时张力控制 | 不需要 | **必须主动跟随送料** |
+
+### 6.1 单电机的硬约束：同一时刻只能服务 1 个通道
+
+离合器选通 + 单电机，意味着**任何两个"要动电机"的需求都不能同时成立**。
+所以代码里所有会驱动电机的地方都必须先过一道仲裁：
+
+```cpp
+/* 优先级：退料 > 进料 > 打印中缓冲补料 > before_on_use 跟随泵 */
+static int find_motion_channel(void);
+```
+
+两个调用点：
+
+| 位置 | 作用 |
+|---|---|
+| `check_buffer_status()` 开头 | 有进/退料 → 缓冲补料整体 `return`，不去吸合 |
+| `AMCU_motion()` 开头 | 有进/退料 → `svc` 指向它，不走"打印中"分支 |
+
+**违反这个约束的后果**（v1.1.15 修的现场故障）：
+`s_pending_clutch` 是**单槽**，`s_pending_ch` 是单值。两个模块每循环交替
+`clutch_request_engage(不同通道)` → 后台任务反复"全断 60ms + 吸合 80ms" →
+现场听到"咔咔咔"，电机永远等不到稳定吸合，**料退不出也送不进**。
+
+判断是否又在互抢：网页「AMS」卡片 → **离合仲裁**，
+`target_switch` / `target_abort` 两个计数。正常打印时只在真正换料时各 +1；
+若每秒涨几十就是在打架，超 50 次会标红。
+
+### 6.2 缓冲器跟随送料
 
 Bambu 官方 wiki 对缓冲器的说明：
 
@@ -187,6 +234,9 @@ Bambu 官方 wiki 对缓冲器的说明：
 
 **为什么不用微动驱动这一段**：微动是 ADC 三态分压，现场信号不稳
 （悬空 371mV 就落在 START 区），而 `before_on_use` 只持续几秒，等微动触发太慢。
+
+**注意**：`follow_feed_pump()` 在"停"相位只 `motor_stop()`，**保留离合**
+（下一拍还要接着送，反复吸合会磨离合）。
 
 ---
 
@@ -271,3 +321,4 @@ Bambu 官方 wiki 对缓冲器的说明：
 | 13 | 3 参数 `server.on()` 上传回调为 null | HTTP 500 | v1.1.4 |
 | 14 | 中文日志按字节截断 | UTF-8 断在多字节中间 → 乱码/崩溃 | v1.1.8 |
 | 15 | 上报的 AMS 版本号是编造的 `90.00.00.00` | 新版打印机固件按白名单校验 → 弹「仅支持 AMS / AMS 2 Pro / AMS HT」 | v1.1.13 |
+| 16 | `AMCU_motion()` 用 `cur` 当服务通道、且 `is_channel_printing(cur)` 提前 `return` | 打印中换料时旧通道还 `on_use` → 新通道进料永不执行；且和 `check_buffer_status()` 互抢 `s_pending_clutch` 单槽 → 离合咔咔响、料退不出也送不进 | v1.1.15 |

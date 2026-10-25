@@ -71,6 +71,13 @@ extern bool ams_enable;
 // v1.1.12：before_on_use 跟随送料是否处于"送"的相位（诊断用）
 bool amcu_follow_feed_active(void);
 
+/* v1.1.15 诊断：离合槽位被互抢的程度（正常很慢，飙涨=有模块在打架）
+ *   switch_count —— 挂起的吸合目标被改成别的通道的次数
+ *   abort_count  —— 挂起的吸合请求被"停机"打断的次数 */
+uint32_t amcu_clutch_switch_count(void);
+uint32_t amcu_clutch_abort_count(void);
+void     amcu_clutch_reset_diag(void);
+
 // ==================== 手动点动（Web /hardware_test，测电流/占空比用）====================
 // 非阻塞：吸合离合 → 按 dir/pct 驱动电机 → 到时限自动停并断离合
 bool amcu_jog_start(int channel, int dir, int ms, int pct);

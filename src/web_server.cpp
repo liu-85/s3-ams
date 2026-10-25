@@ -165,7 +165,7 @@ void web_log_install_hook(void)
 }
 
 /* App 版本 */
-static const char *APP_VERSION = "1.1.14-s3ams";
+static const char *APP_VERSION = "1.1.15-s3ams";
 
 /* 单 IO 双微动：每路一个 ADC 脚（开始位/停止位共用同一脚，电阻编码） */
 static const int BOARD_SENSOR_PINS[BOARD_CHANNEL_COUNT] = BOARD_PIN_SENSOR_ARRAY;
@@ -405,6 +405,8 @@ static void handle_status(void)
     json += "\"state_text\":\"" + String(clutch_get_owner()) + "\",";
     json += "\"active_material\":" + String(clutch_active_channel()) + ",";
     json += "\"diag\":{\"conflicts\":" + String(clutch_conflict_count()) +
+            ",\"target_switch\":" + String((unsigned long)amcu_clutch_switch_count()) +
+            ",\"target_abort\":" + String((unsigned long)amcu_clutch_abort_count()) +
             ",\"exchange_ok\":0,\"exchange_fail\":0,\"last_error\":\"—\",\"last_error_ms\":-1}";
     json += "},";
 
@@ -927,7 +929,8 @@ static void handle_ok(void)
 static void handle_diag_reset(void)
 {
     clutch_reset_conflict_count();
-    server.send(200, "application/json", "{\"ok\":true,\"info\":\"已清除离合冲突计数\"}");
+    amcu_clutch_reset_diag();
+    server.send(200, "application/json", "{\"ok\":true,\"info\":\"已清除离合冲突/仲裁计数\"}");
 }
 
 /* 清零全部料位的计米。

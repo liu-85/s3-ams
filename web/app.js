@@ -338,6 +338,17 @@
             ' 次' + ((dg.exchange_fail || 0) > 0
                 ? ' / <span class="err">失败 ' + dg.exchange_fail + ' 次</span>' : '');
 
+        /* v1.1.15：离合槽位仲裁计数。
+         * 正常打印时这两个数应该很慢地涨（只在真正换料时各 +1）。
+         * 如果打印中"咔咔响"时它每秒涨几十，说明两个模块在互抢离合。 */
+        if ($('a_arb')) {
+            var sw = dg.target_switch || 0;
+            var ab = dg.target_abort || 0;
+            $('a_arb').innerHTML = '切目标 ' + sw + ' 次 · 被打断 ' + ab + ' 次' +
+                ((sw + ab > 50)
+                    ? ' <span class="err">（偏高：离合在被反复抢）</span>' : '');
+        }
+
         if (dg.last_error && dg.last_error_ms >= 0) {
             $('a_lasterr').innerHTML = '<span class="err">' + esc(dg.last_error) +
                 '</span><span class="dim">（' + fmtUptime(dg.last_error_ms) + ' 前）</span>';
