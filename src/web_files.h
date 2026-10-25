@@ -1323,7 +1323,7 @@ static const char *WEB_STYLE_CSS =
 "}\n"
 "";
 
-// 来源: web/app.js  (82393 字节)
+// 来源: web/app.js  (82844 字节)
 static const char *WEB_APP_JS =
   "/* ===========================================================================\n"
 "   ESP-AMS-S3 配置界面前端\n"
@@ -3287,10 +3287,19 @@ static const char *WEB_APP_JS =
 "            '（' + (f.size / 1024).toFixed(0) + ' KB）… 期间不要断电。</div>';\n"
 "\n"
 "        /* ★ 用 XHR 而不是 fetch —— 只有 XHR 能拿到上传进度，\n"
-"           而 OTA 要几十秒，没进度条用户一定会以为死了 */\n"
+"           而 OTA 要几十秒，没进度条用户一定会以为死了\n"
+"           ★ 必须用 FormData（multipart/form-data）裸发 octet-stream：\n"
+"             arduino-esp32 的 WebServer 对非 multipart 的 POST 会把整个\n"
+"             body 一次性 readBytesWithTimeout 进 RAM（1MB+ 的固件在不开\n"
+"             PSRAM 的 S3 上读到一半 realloc 失败 → 连接被掐断 → 一直\n"
+"             \"上传中断\"）。multipart 走流式 parseForm，每 1436 字节回调\n"
+"             一次 server.upload()，边收边写 flash，内存恒定。\n"
+"           ★ 千万不要手动 setRequestHeader('Content-Type') ——\n"
+"             边界串必须由浏览器自动生成，手写就把 multipart 毁了 */\n"
 "        var xhr = new XMLHttpRequest();\n"
 "        xhr.open('POST', '/ota_upload', true);\n"
-"        xhr.setRequestHeader('Content-Type', 'application/octet-stream');\n"
+"        var fd = new FormData();\n"
+"        fd.append('firmware', f, f.name);\n"
 "\n"
 "        xhr.upload.onprogress = function (e) {\n"
 "            if (e.lengthComputable) {\n"
@@ -3329,7 +3338,7 @@ static const char *WEB_APP_JS =
 "                '请检查网络后重试（备用分区不会被写坏）</div>';\n"
 "            toast('上传中断', 'bad');\n"
 "        };\n"
-"        xhr.send(f);\n"
+"        xhr.send(fd);\n"
 "    }\n"
 "\n"
 "    /* =======================================================================\n"

@@ -51,7 +51,7 @@ static size_t s_log_tail = 0;
 static bool s_log_full = false;
 
 /* App 版本 */
-static const char *APP_VERSION = "1.1.0-s3ams";
+static const char *APP_VERSION = "1.1.1-s3ams";
 
 /* 单 IO 双微动：每路一个 ADC 脚（开始位/停止位共用同一脚，电阻编码） */
 static const int BOARD_SENSOR_PINS[BOARD_CHANNEL_COUNT] = BOARD_PIN_SENSOR_ARRAY;
@@ -518,28 +518,71 @@ static void handle_wifi_set(void)
     server.send(200, "application/json", "{\"ok\":true}");
 }
 
+/* ==========================================================================
+ * OTA 网页升级（multipart 流式上传）
+ *
+ * ★ 为什么必须 multipart/form-data：
+ *   如果浏览器用 application/octet-stream 裸 POST，arduino-esp32 的
+ *   WebServer 会把**整个 body 一次性读进 RAM**（readBytesWithTimeout
+ *   反复 realloc）。本板不开 PSRAM，堆只有几百 KB，1MB+ 的固件读到一半
+ *   realloc 失败 → _parseRequest 返回 false → 连接被掐断 → 浏览器
+ *   xhr.onerror "上传中断"（进度条还在走是因为发送端还没被通知）。
+ *   multipart 走 _parseForm 流式路径：每 1436 字节触发一次
+ *   server.upload() 回调，我们边收边写 flash，内存占用恒定。
+ *   前端用 FormData 即可（勿手动设 Content-Type，边界要浏览器生成）。
+ * ========================================================================== */
+static bool     s_ota_error = false;
+static size_t   s_ota_written = 0;
+static uint32_t s_ota_start_ms = 0;
+
 static void handle_ota_upload(void)
 {
     HTTPUpload& upload = server.upload();
     if (upload.status == UPLOAD_FILE_START) {
-        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+        s_ota_error = false;
+        s_ota_written = 0;
+        s_ota_start_ms = millis();
+        /* 优先按 Content-Length 开分区（multipart 时它含 boundary 头，
+           略大于镜像，Update 只按实际写入量收尾，安全） */
+        int clen = server.clientContentLength();
+        size_t begin_size = (clen > 0) ? (size_t)clen : UPDATE_SIZE_UNKNOWN;
+        if (!Update.begin(begin_size, U_FLASH)) {
             Update.printError(Serial);
-            server.send(500, "text/plain", "OTA begin failed");
+            log_e("OTA begin 失败（Content-Length=%d）", clen);
+            s_ota_error = true;
             return;
         }
-        log_i("OTA 开始: %s", upload.filename.c_str());
+        log_i("OTA 开始: %s（%u 字节，按 %s 开分区）",
+              upload.filename.c_str(), (unsigned)clen,
+              begin_size == UPDATE_SIZE_UNKNOWN ? "未知大小" : "声明大小");
     } else if (upload.status == UPLOAD_FILE_WRITE) {
-        if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+        if (s_ota_error) return;  /* begin 就失败了，丢弃后续数据 */
+        size_t n = Update.write(upload.buf, upload.currentSize);
+        if (n != upload.currentSize) {
             Update.printError(Serial);
+            log_e("OTA 写入失败: 期望 %u 实写 %u（累计 %u）",
+                  (unsigned)upload.currentSize, (unsigned)n, (unsigned)s_ota_written);
+            Update.abort();
+            s_ota_error = true;
+            return;
         }
+        s_ota_written += n;
     } else if (upload.status == UPLOAD_FILE_END) {
+        if (s_ota_error) {
+            server.send(500, "text/plain", "OTA 失败（写入flash出错，见设备日志）");
+            return;
+        }
         if (Update.end(true)) {
+            log_i("OTA 完成: %u 字节，用时 %ums，重启中…",
+                  (unsigned)s_ota_written,
+                  (unsigned)(millis() - s_ota_start_ms));
             server.send(200, "text/plain", "OTA 成功，设备将重启");
             delay(500);
             ESP.restart();
         } else {
             Update.printError(Serial);
-            server.send(500, "text/plain", "OTA 失败");
+            log_e("OTA end 失败（累计写入 %u）", (unsigned)s_ota_written);
+            server.send(500, "text/plain", "OTA 失败（Update.end 校验未过）");
         }
     }
 }
