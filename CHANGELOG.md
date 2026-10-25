@@ -6,6 +6,52 @@ RELEASE.md 在 `release/vX.Y.Z/`。
 
 ---
 
+## v1.1.16 —— WEB 点动进料不吸合 + 微动只认当前使用通道
+
+**2026-10-25**
+
+**现象**（用户实测 v1.1.15）：WEB 硬件调试用「进料/退料」按键逐个通道测试，
+**进料时当前通道电磁离合不吸合**，退料正常。
+用户同时明确：微动只在打印时当前使用通道缓冲送料时启用，
+其他通道不管什么状态都不做动作、状态也不读取。
+
+**根因一：点动期间 `check_buffer_status()` 照样在跑**
+
+`AMCU_run()` 里 `check_buffer_status()` 在 `AMCU_motion()` **之前**调用，
+而 jog 的让出保护只写在 `AMCU_motion()` 里。于是点动期间缓冲补料照常运行：
+停止位微动触发 → `AMCU_drive_stop()` 断掉点动刚请求的离合；
+开始位微动触发 → `AMCU_drive_channel(别的通道)` 抢离合槽位。
+单槽 `s_pending_clutch` 被反复改写 → 离合吸不上。
+
+连带 bug：`AMCU_drive_stop()` 原来无条件清 `s_pending_dir`，
+一旦夹在「发起吸合」和「吸合完成」之间，pump 就按 STOP 启动 →
+**离合吸合了但电机不转**。
+
+**根因二：微动遍历全部 8 个通道**
+
+```cpp
+for (int i = 0; i < BOARD_CHANNEL_COUNT; i++)
+    if (is_channel_printing(i)) AMCU_buffer_assist_feed(i);   // 每个 printing 通道都动
+```
+
+单电机 + 单离合槽位，同一时刻只能服务 1 个通道。多通道同时 printing 会互抢；
+打印中在 WEB 点动别的通道时，旧通道微动仍在动作，把点动的离合覆盖掉。
+
+**修复**：
+- 微动只认「当前使用通道」，四个条件全满足才读才动：
+  `cur` 在本板 8 通道内 + `is_channel_printing(cur)` +
+  `sensor_channel_enabled(cur)` + 非 `before_on_use`
+- 点动期间缓冲补料完全让出：`if (amcu_jog_busy()) return;`
+- `AMCU_drive_stop()` 有挂起吸合请求时不再清 `s_pending_dir`
+
+**新增诊断**：`/status` 的 `feed` 段加 `jog_ch` / `jog_dir` / `jog_ms_left`。
+WEB 点「通道 3 进料」时 `jog_ch` 应为 3、`jog_dir` 为 1、`clutch_mask` 应为 `0b100`；
+不一致就说明离合被别处抢走。
+
+详见 [release/v1.1.16/RELEASE.md](release/v1.1.16/RELEASE.md)
+
+---
+
 ## v1.1.15 —— 打印中换料：离合咔咔响、料退不出也送不进
 
 **2026-10-25**

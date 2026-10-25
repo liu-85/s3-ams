@@ -613,11 +613,20 @@ void BambuBus_init()
     {
         for (auto &j : i)
         {
-#ifdef _Bambubus_DEBUG_mode_
+            /* ★ v1.1.16：默认 online，和 Tianshu 保持一致。
+             *
+             * 移植时这里曾按"没有 NFC 探测"改成了 offline，但漏掉了
+             * Tianshu 在 AMCU_init() 末尾的 set_filament_online(i,j,true)
+             * （原注释："但为了确保设备能被正确识别，默认设置所有通道为在线状态"）。
+             * 结果 is_filament_online() 永远 false → AMCU_motion() 的
+             * need_send_out 分支判离线 → log_w("送料被挡") + AMCU_drive_stop()
+             * → **离合不吸合、电机不转**。而退料走 is_need_pull_back，
+             * 不检查 online，所以退料正常 —— 现场症状"进料没吸合、退料正常"。
+             *
+             * 本硬件没有 NFC/RFID，无法真实探测料盘有无耗材。报 offline
+             * 只会让打印机拒绝进料，比报 online 更糟；报 online 后若该通道
+             * 确实没装料，打印机会在进料超时后正常报错，符合预期。 */
             j.statu = online;
-#else
-            j.statu = offline;
-#endif
             j.motion_set = waiting;
         }
     }

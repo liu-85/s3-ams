@@ -159,6 +159,17 @@ bool amcu_jog_busy(void)
     return s_jog_active;
 }
 
+/* v1.1.16 诊断：点动当前状态。WEB 硬件调试"进料不吸合"时用它一眼看出
+ * "点的通道/方向"和"离合实际吸在哪个通道"是否一致。 */
+bool amcu_jog_info(int *ch, int *dir, int *ms_left)
+{
+    if (ch)      *ch      = s_jog_active ? s_jog_channel : 0;
+    if (dir)     *dir     = s_jog_active ? (int)s_jog_dir : 0;
+    if (ms_left) *ms_left = s_jog_active
+                            ? (int)((int32_t)s_jog_end_ms - (int32_t)millis()) : 0;
+    return s_jog_active;
+}
+
 // 退料状态（兼容原逻辑）
 bool is_need_pull_back = false;
 int now_filament_num_need_pull_back = 255;
@@ -415,7 +426,17 @@ void AMCU_drive_stop()
     motor_stop();
     s_driving_now = false;
     s_current_channel = 0;
-    s_pending_dir = MOTOR_DIR_STOP;
+    /* ★ v1.1.16：有挂起的吸合请求时不要清 s_pending_dir。
+     *
+     * s_pending_dir 记录的是"这次吸合完成后要跑的方向/速度"，
+     * 由 AMCU_clutch_pump() 吸合成功后读取并用完自己清掉。
+     * 原来这里无条件清成 STOP，一旦 stop 夹在
+     * 「AMCU_drive_channel() 发起吸合」和「clutch_task 吸合完成」之间，
+     * pump 就会按 STOP 启动 → **离合吸合了但电机不转**。
+     * （打印中在 WEB 点动别的通道时，check_buffer_status 的 drive_stop
+     *  正是这么把点动的请求搅掉的，v1.1.16 已让它在点动期间让出；
+     *  这里再补一道保险，防止别处再犯同样的错。） */
+    if (s_pending_kind != 1) s_pending_dir = MOTOR_DIR_STOP;
 
     const bool already_releasing = (s_pending_kind == 3 && s_pending_clutch != NULL);
     const bool already_off = (s_pending_clutch == NULL && clutch_engaged_mask() == 0);
@@ -655,6 +676,26 @@ void check_buffer_status() {
      * 退料优先级高于一切缓冲动作，这里直接整段跳过。 */
     if (is_need_pull_back) return;
 
+    /* ★★ v1.1.16：点动（WEB 硬件调试）期间，缓冲补料必须完全让出 ★★
+     *
+     * 现场症状（2026-10-25 用户实测 v1.1.15）：
+     *   WEB 硬件调试逐个通道测试，**进料时对应通道的电磁离合不吸合**
+     *   （料不动），**退料却正常**。
+     *
+     * 根因：check_buffer_status() 是在 AMCU_run() 里、AMCU_motion()
+     *   **之前**调用的，而 jog 的让出保护只写在 AMCU_motion() 里：
+     *       void AMCU_motion() {
+     *           AMCU_clutch_pump();
+     *           if (s_jog_active) { amcu_jog_pump(); return; }   ← 只有这里有
+     *       ...
+     *   于是点动期间本函数照常运行，AMCU_buffer_assist_feed() 会：
+     *     · 停止位微动触发 → AMCU_drive_stop() → 把点动刚请求的离合**断开**
+     *     · 开始位微动触发 → AMCU_drive_channel(别的通道) → **抢离合槽位**
+     *   单槽 s_pending_clutch 被反复改写 → 离合吸不上/咔咔响。
+     *
+     * 点动是人工调试指令，优先级必须高于一切自动逻辑。 */
+    if (amcu_jog_busy()) return;
+
     /* ★★ v1.1.15：只要有通道在「进料 / 退料」，缓冲补料整体让出 ★★
      *
      * 单电机 + 单离合槽位，缓冲补料和 485 进/退料**不能同时要电机**。
@@ -663,22 +704,37 @@ void check_buffer_status() {
      * 离合反复吸放"咔咔响"，料退不出也送不进。 */
     if (find_motion_channel() >= 0) return;
 
-    for (int i = 0; i < BOARD_CHANNEL_COUNT; i++) {
-        int filament_num = i;
-        _filament_motion_state_set m = get_filament_motion(filament_num);
-        if (m == need_send_out || m == need_pull_back) {
-            continue;  // AMS 进料/退料：微动不参与
-        }
-        /* ★ v1.1.12：before_on_use 由 AMCU_motion() 的 follow_feed_pump()
-           接管（固定脉冲跟随）。这里必须让出，否则两边交替驱动同一台电机，
-           一边送一边停，现场就是"抖一下、抖一下"。 */
-        if (is_channel_before_on_use(filament_num)) {
-            continue;
-        }
-        if (is_channel_printing(filament_num)) {
-            AMCU_buffer_assist_feed(i);
-        }
-    }
+    /* ★★★ v1.1.16：微动只在「打印中 + 当前使用通道 + 该通道开了缓冲送料」时才读 ★★★
+     *
+     * 用户明确要求（2026-10-25）：
+     *   "微动是只在打印时当前使用通道缓冲送料时启用，
+     *    其他通道不管什么状态都不做动作或者说状态不读取。"
+     *
+     * 原实现遍历全部 8 个通道，只要某个通道 motion 是 on_use 就补料：
+     *     for (i = 0; i < BOARD_CHANNEL_COUNT; i++)
+     *         if (is_channel_printing(i)) AMCU_buffer_assist_feed(i);
+     *
+     * 这在本硬件上是错的，两个原因：
+     *   ① 单电机 + 单离合槽位，同一时刻只能服务 1 个通道。
+     *      多个通道同时 printing 时会互相吸合/断开离合抢槽位。
+     *   ② 打印中在 WEB 硬件调试点动**别的**通道时，这里仍在按旧通道的
+     *      微动动作 → 把点动刚请求的离合覆盖掉。
+     *      现场症状：WEB 点"进料"对应通道电磁离合不吸合（料不动），
+     *      点"退料"却正常。
+     *
+     * 所以改成只认"当前使用通道"一个，其他通道的微动状态根本不读。 */
+    int cur = get_now_filament_num();
+    if (cur < 0 || cur >= BOARD_CHANNEL_COUNT) return;   /* 本板只有 8 个物理通道 */
+
+    if (!is_channel_printing(cur)) return;               /* 必须正在打印（on_use 等） */
+    if (!sensor_channel_enabled(cur)) return;            /* 该通道必须开了缓冲送料 */
+
+    /* ★ v1.1.12：before_on_use 由 AMCU_motion() 的 follow_feed_pump()
+       接管（固定脉冲跟随）。这里必须让出，否则两边交替驱动同一台电机，
+       一边送一边停，现场就是"抖一下、抖一下"。 */
+    if (is_channel_before_on_use(cur)) return;
+
+    AMCU_buffer_assist_feed(cur);
 }
 
 // ============================

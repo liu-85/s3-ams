@@ -165,7 +165,7 @@ void web_log_install_hook(void)
 }
 
 /* App 版本 */
-static const char *APP_VERSION = "1.1.15-s3ams";
+static const char *APP_VERSION = "1.1.16-s3ams";
 
 /* 单 IO 双微动：每路一个 ADC 脚（开始位/停止位共用同一脚，电阻编码） */
 static const int BOARD_SENSOR_PINS[BOARD_CHANNEL_COUNT] = BOARD_PIN_SENSOR_ARRAY;
@@ -441,6 +441,16 @@ static void handle_status(void)
         json += "\"printing\":" + String(is_channel_printing(dn) ? 1 : 0) + ",";
         json += "\"tripped\":" + String(current_sense_tripped() ? 1 : 0) + ",";
         json += "\"jog\":" + String(amcu_jog_busy() ? 1 : 0) + ",";
+        /* v1.1.16：点动目标与剩余时间。WEB 硬件调试"进料不吸合"时，
+           对一下 jog_ch 和 clutch_mask 就知道是不是离合被别处抢走了：
+           点通道 3 进料 → jog_ch 应为 3，clutch_mask 应为 0b100(bit2)。 */
+        {
+            int jch = 0, jdir = 0, jms = 0;
+            amcu_jog_info(&jch, &jdir, &jms);
+            json += "\"jog_ch\":" + String(jch) + ",";
+            json += "\"jog_dir\":" + String(jdir) + ",";
+            json += "\"jog_ms_left\":" + String(jms) + ",";
+        }
         json += "\"clutch_mask\":" + String((unsigned)clutch_engaged_mask()) + ",";
         json += "\"clutch_rb\":" + String(clutch_readback_ok() ? 1 : 0) + ",";
         json += "\"motor_dir\":" + String((int)motor_get_dir()) + ",";

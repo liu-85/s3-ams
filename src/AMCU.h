@@ -82,6 +82,8 @@ void     amcu_clutch_reset_diag(void);
 // 非阻塞：吸合离合 → 按 dir/pct 驱动电机 → 到时限自动停并断离合
 bool amcu_jog_start(int channel, int dir, int ms, int pct);
 bool amcu_jog_busy(void);
+/* v1.1.16 诊断：点动当前状态（ch/dir 1 起，dir: 1=进料 -1=退料，ms_left 剩余毫秒） */
+bool amcu_jog_info(int *ch, int *dir, int *ms_left);
 extern int jog_time_ms;      // 点动时长（ms），默认 1000
 extern int jog_speed_pct;    // 点动 PWM 占空比（%），默认 100
 void jog_config_set(int ms, int pct);  // 夹取 + NVS 持久化
