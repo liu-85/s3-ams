@@ -68,6 +68,9 @@ extern float target_meters;
 void amcu_set_ams_enable(bool en);
 extern bool ams_enable;
 
+// v1.1.12：before_on_use 跟随送料是否处于"送"的相位（诊断用）
+bool amcu_follow_feed_active(void);
+
 // ==================== 手动点动（Web /hardware_test，测电流/占空比用）====================
 // 非阻塞：吸合离合 → 按 dir/pct 驱动电机 → 到时限自动停并断离合
 bool amcu_jog_start(int channel, int dir, int ms, int pct);

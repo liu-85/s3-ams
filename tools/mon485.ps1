@@ -111,10 +111,30 @@ try {
                 # v1.1.11：计米。正常送料约 0.05 米/秒，看到几十上百米就是单位又跑飞了
                 $mt = "-"
                 if ($null -ne $s.feed.meters) { $mt = "{0:N3}m" -f [double]$s.feed.meters }
-                $line = "状态: 电机={0}/{1}% 离合=0x{2:X2} 电流={3}mA 峰值={4}mA act485={5}{6} | 料位{7} 动作={8} 在线={9} 打印={10} 堵转={11} 点动={12} 回读={13} cmd={14} 计米={15}" -f
+
+                # v1.1.12：打印阶段 / 跟随送料 / 当前通道微动
+                #   阶段=before_on_use 时 跟随=1 表示"正在送料相位"（1/0 交替跳是正常的）
+                #   微动=S<停止位><开始位>/<mV>，S00 表示两个都没触发（缓冲器在中间档）
+                $ph = "-"
+                if ($null -ne $s.feed.phase) { $ph = [string]$s.feed.phase }
+                $fw = "-"
+                if ($null -ne $s.feed.follow) { $fw = [string]$s.feed.follow }
+                $sw = "-"
+                try {
+                    $ci = [int]$s.feed.cur
+                    $chArr = @($s.sensors.ch)
+                    if ($ci -ge 0 -and $ci -lt $chArr.Count) {
+                        $mvArr = @($s.sensors.mv)
+                        $pair = @($chArr[$ci])
+                        $sw = "S{0}{1}/{2}mV" -f $pair[0], $pair[1], $mvArr[$ci]
+                    }
+                } catch { $sw = "-" }
+
+                $line = "状态: 电机={0}/{1}% 离合=0x{2:X2} 电流={3}mA 峰值={4}mA act485={5}{6} | 料位{7} 动作={8} 在线={9} 打印={10} 堵转={11} 点动={12} 回读={13} cmd={14} 计米={15} 阶段={16} 跟随={17} 微动={18}" -f
                     $dirTxt, $s.feed.motor_pct, $eng, $ma, $pk, $s.act485, $trip,
                     $s.feed.cur, $s.feed.motion_text, $s.feed.online, $s.feed.printing,
-                    $s.feed.tripped, $s.feed.jog, $s.feed.clutch_rb, $s.feed.cmd, $mt
+                    $s.feed.tripped, $s.feed.jog, $s.feed.clutch_rb, $s.feed.cmd, $mt,
+                    $ph, $fw, $sw
             } else {
                 $eng = (@($s.hardware.engaged) -join ",")
                 $line = "状态: 电机={0} 离合={1} 电流={2}mA 峰值={3}mA act485={4}{5}" -f

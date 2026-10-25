@@ -76,6 +76,19 @@ extern void send_uart(const unsigned char *data, uint16_t length);
  * 用于 AMCU 在打印阶段启用缓冲器微动辅助送料。 */
 extern bool is_channel_printing(int num);
 
+/* 打印阶段细分查询（v1.1.12）。
+ *
+ * 为什么需要：map_internal_to_api() 把 before_on_use / on_use / stop_on_use
+ * 统统映射成 waiting，AMCU 用 get_filament_motion() 根本分不出当前是哪一步。
+ * 但三步的电机策略完全不同：
+ *   before_on_use —— 打印机已咬住耗材正在往里拉，AMS 必须"跟随送料"
+ *   on_use        —— 正常打印，靠缓冲微动按需补料
+ *   stop_on_use   —— 暂停，必须停料 + 断离合
+ */
+extern bool is_channel_before_on_use(int num);
+extern bool is_channel_on_use(int num);
+extern bool is_channel_stop_on_use(int num);
+
 _filament_motion_state_set get_filament_motion(int num);
 String get_now_filament_name(int num);
 

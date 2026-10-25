@@ -452,6 +452,91 @@ void AMCU_buffer_assist_feed(int channel)
 }
 
 // ============================
+//  before_on_use 跟随送料（v1.1.12）
+// ============================
+/* 现场（2026-10-25 第四次实测）：
+ *
+ *   送料到位 → 打印机发 09/A5（before_on_use），让挤出机咬住耗材往里拉
+ *   → 我们这时把电机关了 → 打印机只拉得动一点点 → 5 秒后判「挤出失败」
+ *   → 07/00 (stop_on_use) → 09/3F (before_pull_back) → 退料。
+ *
+ * 为什么"断开离合"不够：
+ *   日志证明 09/A5 期间离合本来就是 0x00（已全断）、电机=停止、电流 0mA，
+ *   耗材照样拉不动 —— 说明阻力来自 AMS 侧的压轮与主动轮/齿轮组，
+ *   光断离合解决不了（离合只断开"电机↔主动轮"，压轮始终压着耗材）。
+ *
+ * 所以改成"电机跟随"：在 before_on_use 期间按脉冲送料，
+ * 让 AMS 与挤出机之间的耗材保持松弛，打印机就能顺畅把料拉进喷嘴。
+ *
+ * 为什么不用缓冲微动来驱动：
+ *   微动是 ADC 分压三态（START/MID/STOP），现场信号不稳（悬空 371mV 就落在
+ *   START 区），而且 before_on_use 只持续几秒，等微动触发太慢。
+ *   这里直接按固定节奏送，节奏与打印机拉料速度匹配即可。
+ *
+ * 脉冲参数：送 250ms / 停 350ms。
+ *   100% PWM ≈ 50mm/s → 平均 50 × 250/600 ≈ 21mm/s，
+ *   略高于打印机拉料速度（约 10~20mm/s），保证耗材不会被拉紧；
+ *   停的 350ms 让缓冲器把多送的料吸收掉，不会顶进喷嘴。
+ */
+#define FOLLOW_FEED_ON_MS   250
+#define FOLLOW_FEED_OFF_MS  350
+
+static uint32_t s_follow_last_ms = 0;
+static bool     s_follow_on      = false;
+static int      s_follow_ch      = 0;
+
+/* 跟随送料泵：每循环调用，内部按时间切换"送/停" */
+static void follow_feed_pump(int channel)
+{
+    if (channel < 1 || channel > BOARD_CHANNEL_COUNT) return;
+
+    const uint32_t now = millis();
+
+    /* 首次进入或换通道：从"送"开始，并重置相位 */
+    if (s_follow_ch != channel) {
+        s_follow_ch = channel;
+        s_follow_on = true;
+        s_follow_last_ms = now;
+        AMCU_drive_channel(channel, MOTOR_DIR_FEED, MOTOR_SPEED_485_FEED);
+        return;
+    }
+
+    const uint32_t span = s_follow_on ? FOLLOW_FEED_ON_MS : FOLLOW_FEED_OFF_MS;
+    if (now - s_follow_last_ms < span) return;
+
+    s_follow_last_ms = now;
+    s_follow_on = !s_follow_on;
+
+    if (s_follow_on) {
+        AMCU_drive_channel(channel, MOTOR_DIR_FEED, MOTOR_SPEED_485_FEED);
+    } else {
+        /* 只停电机、保留离合（下一拍还要接着送，反复吸合会磨离合） */
+        motor_stop();
+        s_driving_now = false;
+    }
+}
+
+/* 退出跟随送料。
+ * stop_motor=false 用于"退料进行中"：此时电机正被退料逻辑独占反转，
+ * 绝不能在这里 motor_stop()，否则就是现场那个"退料有时电机没动作"。 */
+static void follow_feed_reset_ex(bool stop_motor)
+{
+    if (stop_motor && s_follow_ch != 0) {
+        /* 退出跟随时如果最后停在"送"相位，电机还在转 —— 必须停掉。
+           否则交回 on_use 的微动逻辑时，微动若处于 MID 且 decision=0，
+           电机会一直转着不放，把耗材顶进喷嘴。 */
+        motor_stop();
+        s_driving_now = false;
+    }
+    s_follow_on      = false;
+    s_follow_ch      = 0;
+    s_follow_last_ms = 0;
+}
+
+/* 供 /status 诊断：跟随送料当前是否在"送"的相位 */
+bool amcu_follow_feed_active(void) { return s_follow_ch != 0 && s_follow_on; }
+
+// ============================
 //  初始化 IO 引脚
 // ============================
 void init_io_pins() {
@@ -490,11 +575,29 @@ void motorCmd(int motorNum, int cmd) {
 //  微动状态检查（兼容 Tianshu 的 check_microswitch_status）
 // ============================
 void check_buffer_status() {
+    /* ★★ v1.1.12：退料进行中，缓冲补料必须完全让出 ★★
+     *
+     * 现场症状：退料"有时候电机没动作"。
+     * 根因：AMCU_buffer_assist_feed() 在缓冲器满（STOP 微动）时会调
+     *   AMCU_drive_stop()，而它内部会 clutch_request_release_all()，
+     *   **把正在挂起的"退料吸合"请求直接覆盖掉**（s_pending_clutch 只有一个槽），
+     *   于是 AMCU_drive_channel() 的退料请求永远等不到吸合完成 → 电机不转。
+     *   打印机在退料途中切换料位时（cur 指向正在打印的通道）最容易撞上。
+     *
+     * 退料优先级高于一切缓冲动作，这里直接整段跳过。 */
+    if (is_need_pull_back) return;
+
     for (int i = 0; i < BOARD_CHANNEL_COUNT; i++) {
         int filament_num = i;
         _filament_motion_state_set m = get_filament_motion(filament_num);
         if (m == need_send_out || m == need_pull_back) {
             continue;  // AMS 进料/退料：微动不参与
+        }
+        /* ★ v1.1.12：before_on_use 由 AMCU_motion() 的 follow_feed_pump()
+           接管（固定脉冲跟随）。这里必须让出，否则两边交替驱动同一台电机，
+           一边送一边停，现场就是"抖一下、抖一下"。 */
+        if (is_channel_before_on_use(filament_num)) {
+            continue;
         }
         if (is_channel_printing(filament_num)) {
             AMCU_buffer_assist_feed(i);
@@ -669,11 +772,39 @@ void AMCU_motion() {
 
     if (ams_enable) act = get_filament_motion(cur);
 
-    // 打印中：由缓冲微动驱动，AMCU_motion 不覆盖（check_buffer_status 已处理）
-    if (is_channel_printing(cur)) {
+    /* ★★★ v1.1.12：退料优先级最高，跟随泵必须完全让出 ★★★
+     *
+     * 现场症状：退料"有时候电机没动作"（不是每次）。
+     * 触发条件：打印机退料途中切换料位 → cur 指向另一个正在打印的通道 →
+     *   走进下面的"打印中"分支 → 跟随泵 reset 里 motor_stop() 把
+     *   正在反转的退料电机掐掉；或者 check_buffer_status 的 drive_stop()
+     *   把挂起的退料吸合请求覆盖掉。
+     * 所以这里先判 is_need_pull_back，退料期间只清跟随泵状态、绝不动电机。 */
+    if (is_need_pull_back) {
+        follow_feed_reset_ex(false);   /* 只清状态，不停电机 */
+    } else if (is_channel_printing(cur)) {
         RGB_GREEN;
         clutch_assert_single(true);
+
+        /* ★ v1.1.12：before_on_use 阶段必须"跟随送料"。
+         *
+         * 打印机发 09/A5 后，挤出机已经咬住耗材在往里拉，
+         * 这时如果我们把电机停死，耗材会被 AMS 侧压轮+齿轮组拽住，
+         * 打印机只拉得动一点点就判「挤出失败」→ 退料。
+         * 现场实测：09/A5 期间离合本来就是 0x00、电机停止、电流 0mA，
+         * 说明光"断开离合"没用（离合只管电机↔主动轮，压轮始终压着耗材）。
+         *
+         * 所以这里按固定节奏脉冲送料，让耗材保持松弛。
+         * 详见 follow_feed_pump() 的注释。 */
+        if (is_channel_before_on_use(cur)) {
+            follow_feed_pump(cur + 1);
+        } else {
+            /* on_use / stop_on_use：交回 check_buffer_status 的微动逻辑 */
+            follow_feed_reset_ex(true);
+        }
         return;
+    } else {
+        follow_feed_reset_ex(true);
     }
 
     switch (act) {

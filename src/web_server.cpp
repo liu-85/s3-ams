@@ -165,7 +165,7 @@ void web_log_install_hook(void)
 }
 
 /* App 版本 */
-static const char *APP_VERSION = "1.1.11-s3ams";
+static const char *APP_VERSION = "1.1.12-s3ams";
 
 /* 单 IO 双微动：每路一个 ADC 脚（开始位/停止位共用同一脚，电阻编码） */
 static const int BOARD_SENSOR_PINS[BOARD_CHANNEL_COUNT] = BOARD_PIN_SENSOR_ARRAY;
@@ -435,7 +435,16 @@ static void handle_status(void)
         json += "\"cmd\":" + String(get_cmd_type()) + ",";
         /* 计米（米）：v1.1.10 及更早版本单位错 1000 倍，这里暴露出来方便核对。
            送料 1 秒应约 0.05 米（50mm），若看到几十上百米就是又跑飞了。 */
-        json += "\"meters\":" + String(get_filament_meters(dn), 4);
+        json += "\"meters\":" + String(get_filament_meters(dn), 4) + ",";
+        /* 打印阶段细分（v1.1.12）：get_filament_motion() 把 before/on/stop_on_use
+           全映射成 waiting，分不出当前在哪一步，这里单独给出来。
+           phase=before_on_use 时 follow=1 表示"跟随送料"正在送料相位。 */
+        const char *phase = "none";
+        if (is_channel_before_on_use(dn))        phase = "before_on_use";
+        else if (is_channel_on_use(dn))          phase = "on_use";
+        else if (is_channel_stop_on_use(dn))     phase = "stop_on_use";
+        json += "\"phase\":\"" + String(phase) + "\",";
+        json += "\"follow\":" + String(amcu_follow_feed_active() ? 1 : 0);
         json += "},";
     }
 

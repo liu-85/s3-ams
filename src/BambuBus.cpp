@@ -257,8 +257,19 @@ static bool process_motion_state_machine(
     {
         bool is_send_out = (statu_flags == 0x03) && (motion_flag == 0x00);
         bool is_before_on_use = (statu_flags == 0x09) && (motion_flag == 0xA5);
-        bool is_stop_on_use = (statu_flags == 0x07) && (motion_flag == 0x00);
-        bool is_on_use = (statu_flags == 0x07) && (motion_flag == 0x7F);
+        /* ★★ v1.1.12：0x0F 是"使用中"（0x01|0x02|0x04|0x08），必须一起认 ★★
+         *
+         * 现场抓包（2026-10-25 第四次）：整份日志里 `0x07/0x7F`（我们原以为的
+         * on_use）**一帧都没有**，而 `0x0F/0xFF` 出现 123 帧、`0x0F/0x00` 33 帧，
+         * 且都出现在送料完成之后、下一次送料之前。
+         * 说明这台打印机用的是 0x0F 编码：bit3(0x08) = "正在使用"。
+         * 只认 0x07 的后果：on_use / stop_on_use 永远匹配不上，
+         * 状态卡在 before_on_use → 打印机认为 AMS 没进入使用态。
+         *
+         * 兼容写法：0x07（旧/理论值）与 0x0F（实测值）都接受。 */
+        bool is_stop_on_use = ((statu_flags == 0x07) || (statu_flags == 0x0F)) && (motion_flag == 0x00);
+        bool is_on_use      = ((statu_flags == 0x07) || (statu_flags == 0x0F)) &&
+                              ((motion_flag == 0x7F) || (motion_flag == 0xFF));
         bool is_before_pullb = (statu_flags == 0x09) && (motion_flag == 0x3F);
 
         const bool accept =
@@ -875,31 +886,62 @@ void send_for_Dxx(unsigned char *buf, int length)
         if (data_save.BambuBus_now_filament_num < 16)
         {
             uint8_t now_ch = data_save.BambuBus_now_filament_num % 4;
-            set_motion_internal(AMS_num, now_ch, _filament_motion_internal::idle);
-            time_sendout_onuse_ticks[now_ch] = 0;
+            /* ★ v1.1.12：打印中不要被"停止广播"清掉。
+               打印机会周期性发 statu=0x01（本日志 1259 帧），
+               一旦把正在打印的通道清成 idle，跟随送料/微动补料立刻断掉，
+               现场表现就是"打一会儿停一会儿"。 */
+            _filament_motion_internal m = filament_ext[AMS_num][now_ch].motion;
+            if (m != _filament_motion_internal::on_use &&
+                m != _filament_motion_internal::before_on_use &&
+                m != _filament_motion_internal::stop_on_use)
+            {
+                set_motion_internal(AMS_num, now_ch, _filament_motion_internal::idle);
+                time_sendout_onuse_ticks[now_ch] = 0;
+            }
         }
     }
     else if (read_num == 0xFF)
     {
-        if (data_save.BambuBus_now_filament_num < 16)
+        /* ★★★ v1.1.12 最关键修复：不要把 0x0F 当成"清空" ★★★
+         *
+         * 现场抓包（2026-10-25 第四次）：
+         *   15:06:10 打印机发 `type=04 statu=0F motion=00 read=FF`
+         *   同一时刻我方应答 `use=0x00 pressure=0xFFFF 料位=FF`
+         *   → 说明内部状态被整段清空了。
+         *
+         * 原来这里无条件执行：所有通道设 idle、now_filament_num = 0xFF。
+         * 而打印机在"使用中"会周期性发 statu=0x0F + read=0xFF（本日志 33 帧），
+         * 于是状态在"送料"和"全清"之间反复横跳：
+         *   ① 电机反复启停 → 耗材断续 → 挤出机拉一点就拉不动
+         *   ② now_filament_num 变成 0xFF 后，get_loaded_filament() 返回 0xFF
+         *      → allow_stop 恒为 false → 打印机发 09/3F (before_pull_back)
+         *      和 03/00/FF (pull_back) 全部被拒 → **退料电机不动**
+         *      （这就是"有的时候退料没动作"的真正原因）
+         *
+         * 修法：只有明确的"复位/取消"（statu_flags == 0x00）才允许清空，
+         * 其余未定义状态一律忽略并保留当前状态。 */
+        if (statu_flags == 0x00)
         {
-            uint8_t now_ch = data_save.BambuBus_now_filament_num % 4;
-            _filament_motion_internal m = filament_ext[AMS_num][now_ch].motion;
-            if (m == _filament_motion_internal::on_use ||
-                m == _filament_motion_internal::before_on_use ||
-                m == _filament_motion_internal::stop_on_use)
+            if (data_save.BambuBus_now_filament_num < 16)
             {
-                return;
+                uint8_t now_ch = data_save.BambuBus_now_filament_num % 4;
+                _filament_motion_internal m = filament_ext[AMS_num][now_ch].motion;
+                if (m == _filament_motion_internal::on_use ||
+                    m == _filament_motion_internal::before_on_use ||
+                    m == _filament_motion_internal::stop_on_use)
+                {
+                    return;
+                }
             }
-        }
 
-        for (uint8_t i = 0; i < 4; i++)
-        {
-            set_motion_internal(AMS_num, i, _filament_motion_internal::idle);
-            time_sendout_onuse_ticks[i] = 0;
-        }
+            for (uint8_t i = 0; i < 4; i++)
+            {
+                set_motion_internal(AMS_num, i, _filament_motion_internal::idle);
+                time_sendout_onuse_ticks[i] = 0;
+            }
 
-        data_save.BambuBus_now_filament_num = 0xFF;
+            data_save.BambuBus_now_filament_num = 0xFF;
+        }
     }
 
     uint16_t pressure = 0xFFFF;
@@ -907,6 +949,18 @@ void send_for_Dxx(unsigned char *buf, int length)
     if (read_num < 4)
     {
         pressure = get_pressure_value(AMS_num, read_num);
+        use_flag = get_filament_use_flag(AMS_num);
+    }
+    else if (read_num == 0xFF && statu_flags != 0x01 &&
+             data_save.BambuBus_now_filament_num < 16)
+    {
+        /* ★ v1.1.12：read=0xFF + statu=0x03/0x0F 时，打印机问的是"当前料位"的状态，
+           不能回 0xFFFF（无耗材）。
+           原来这里固定回 0xFFFF，打印机在 0x0F（使用中）阶段周期性查询时，
+           看到 AMS 报"无耗材"，就会认为 AMS 掉线/空料 → 判挤出失败。
+           statu=0x01 是"全部停止"广播，仍回 0xFFFF。 */
+        uint8_t now_ch = data_save.BambuBus_now_filament_num % 4;
+        pressure = get_pressure_value(AMS_num, now_ch);
         use_flag = get_filament_use_flag(AMS_num);
     }
 
@@ -1278,6 +1332,25 @@ bool is_channel_printing(int num)
     return (m == _filament_motion_internal::on_use ||
             m == _filament_motion_internal::before_on_use ||
             m == _filament_motion_internal::stop_on_use);
+}
+
+/* 打印阶段细分查询（v1.1.12）—— 见 BambuBus.h 注释 */
+bool is_channel_before_on_use(int num)
+{
+    if (num < 0 || num >= 16) return false;
+    return filament_ext[num / 4][num % 4].motion == _filament_motion_internal::before_on_use;
+}
+
+bool is_channel_on_use(int num)
+{
+    if (num < 0 || num >= 16) return false;
+    return filament_ext[num / 4][num % 4].motion == _filament_motion_internal::on_use;
+}
+
+bool is_channel_stop_on_use(int num)
+{
+    if (num < 0 || num >= 16) return false;
+    return filament_ext[num / 4][num % 4].motion == _filament_motion_internal::stop_on_use;
 }
 
 unsigned char get_now_op_num()
