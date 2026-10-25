@@ -10,6 +10,7 @@
 #include "CRC16.h"
 #include "CRC8.h"
 #include "time64.h"
+#include "bus485_raw.h"
 #include <cstring>
 
 // ESP32 相关
@@ -366,6 +367,7 @@ void send_uart(const unsigned char *data, uint16_t length)
     RS485.flush();                        // 等待发送完成
     digitalWrite(BambuBus_pin_de, 0);     // DE 低 = 接收
     TX_IDLE = true;
+    bus485raw_record(1, (const uint8_t *)data, length);  /* 原始报文记录：本机发出 */
 }
 
 uint8_t buf_X[1000];
@@ -430,6 +432,7 @@ static void RX_IRQ(unsigned char data)
             _index = 0;
             memcpy(buf_X, BambuBus_data_buf, length);
             BambuBus_have_data = length;
+            bus485raw_record(0, BambuBus_data_buf, length);  /* 原始报文记录：打印机发来 */
         }
         if (_index >= 999)
         {

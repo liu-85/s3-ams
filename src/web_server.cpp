@@ -12,6 +12,7 @@
 #include "motor.h"
 #include "filament_sensor.h"
 #include "current_sense.h"
+#include "bus485_raw.h"
 #include "BambuBus.h"
 #include "AMCU.h"
 
@@ -123,7 +124,7 @@ void web_log_install_hook(void)
 }
 
 /* App 版本 */
-static const char *APP_VERSION = "1.1.2-s3ams";
+static const char *APP_VERSION = "1.1.3-s3ams";
 
 /* 单 IO 双微动：每路一个 ADC 脚（开始位/停止位共用同一脚，电阻编码） */
 static const int BOARD_SENSOR_PINS[BOARD_CHANNEL_COUNT] = BOARD_PIN_SENSOR_ARRAY;
@@ -658,6 +659,35 @@ static void handle_ota_upload(void)
     }
 }
 
+/* ==========================================================================
+ * 485 原始报文（/bus485raw?since=seq）
+ *   一行一帧：<seq> <t_ms> <RX|TX> <len> <hex>
+ *   RX=打印机发来（前端 Cyan），TX=本机回复（前端 Green）
+ *   since 只回新帧，PC 监控脚本轮询用；不带 since 回整个环形缓冲
+ * ========================================================================== */
+static void handle_bus485raw(void)
+{
+    uint32_t since = 0;
+    if (server.hasArg("since")) {
+        since = (uint32_t)strtoul(server.arg("since").c_str(), NULL, 10);
+    }
+
+    /* 首行是汇总，方便脚本/人一眼看到计数 */
+    String out = "RX_TOTAL=" + String(bus485raw_rx_count()) +
+                 " TX_TOTAL=" + String(bus485raw_tx_count()) +
+                 " LAST_SEQ=" + String(bus485raw_last_seq()) + "\n";
+
+    /* hex 展开后最大 ~32 帧 × 560 字节 ≈ 18KB，用堆上 String 不占静态 */
+    char *buf = (char *)malloc(BUS485_RAW_CAP * 576 + 64);
+    if (buf) {
+        uint32_t first = 0;
+        int n = bus485raw_dump(buf, BUS485_RAW_CAP * 576 + 64, since, &first);
+        if (n > 0) out += String(buf);
+        free(buf);
+    }
+    server.send(200, "text/plain; charset=utf-8", out);
+}
+
 static void handle_not_found(void)
 {
     server.send(404, "text/plain", "Not Found");
@@ -875,6 +905,7 @@ void web_server_start(void)
     server.on("/access_set", HTTP_POST, handle_ok);
     server.on("/color_set", HTTP_POST, handle_ok);
     server.on("/act485_set", HTTP_POST, handle_act485_set);
+    server.on("/bus485raw", HTTP_GET, handle_bus485raw);
     server.onNotFound(handle_not_found);
 
     server.begin();

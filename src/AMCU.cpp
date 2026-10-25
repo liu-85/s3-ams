@@ -242,6 +242,13 @@ static void last_action_set(int f, _filament_motion_state_set m);
 /* 当前挂起的离合请求（非阻塞；后台任务执行完前主循环不卡） */
 static clutch_req_t *s_pending_clutch = NULL;
 
+/* ★ 挂起的电机参数：离合是异步吸合的，从"发起请求"到"机械咬合"要 80ms，
+   这期间必须把 dir/speed 存住 —— 否则咬合后 pump 里 motor_get_dir()
+   拿到的还是 STOP（电机压根没启过），"启动电机"变成 motor_stop()，
+   现场症状就是"该送料时离合响了但电机没电没转"（2026-10-25 实测）。 */
+static motor_dir_t s_pending_dir = MOTOR_DIR_STOP;
+static int         s_pending_speed = MOTOR_SPEED_FULL;
+
 /**
  * 吸合指定通道离合 + 设定电机方向（异步，不阻塞主循环/Web）
  * @param channel 通道号 1~8（对应料盘位）
@@ -277,6 +284,9 @@ bool AMCU_drive_channel(int channel, motor_dir_t dir, int speed_pct)
         /* 未吸合：异步发起，等后台任务完成（下一循环 poll 成功再驱动电机） */
         s_pending_clutch = clutch_request_engage(channel);
         s_current_channel = channel;
+        /* 记住这次要跑的方向/速度，咬合后 pump 按它启动电机 */
+        s_pending_dir = dir;
+        s_pending_speed = speed_pct;
         /* 本周期不启动电机：要等离合机械咬合后才给电，避免打滑 */
         s_driving_now = false;
         RGB_GREEN;
@@ -299,16 +309,19 @@ void AMCU_clutch_pump()
         return;
     }
     if (clutch_is_engaged(want)) {
-        /* 离合已咬合 → 启动电机（方向/速度沿用最近一次设定） */
-        motor_set_dir(motor_get_dir());
+        /* 离合已咬合 → 按挂起时记下的方向/速度启动电机
+           （不能用 motor_get_dir()：电机还没启过，拿到的是 STOP） */
+        motor_set_dir_speed(s_pending_dir, s_pending_speed);
         s_pending_clutch = NULL;
+        s_pending_dir = MOTOR_DIR_STOP;
         s_driving_now = true;
         s_last_drive_ms = millis();
     } else if (clutch_result_poll(s_pending_clutch)) {
         /* 后台已处理完；再确认吸合电平 */
         s_pending_clutch = NULL;
         if (clutch_is_engaged(want)) {
-            motor_set_dir(motor_get_dir());
+            motor_set_dir_speed(s_pending_dir, s_pending_speed);
+            s_pending_dir = MOTOR_DIR_STOP;
             s_driving_now = true;
             s_last_drive_ms = millis();
         }
