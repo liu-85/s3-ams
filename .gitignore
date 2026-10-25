@@ -15,3 +15,4 @@ build/
 *.code-workspace
 Thumbs.db
 .DS_Store
+logs/

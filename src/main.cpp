@@ -29,6 +29,10 @@ void setup() {
     Serial.begin(115200);
     delay(1000);
 
+    /* 最早装上日志 hook：之后的 log_i/log_w/log_e 都会同步一份到
+       网页"设备日志"面板（串口输出不变）。晚了就漏启动日志。 */
+    web_log_install_hook();
+
     log_i("========================================");
     log_i("  s3-ams - ESP32-S3 AMS 固件");
     log_i("  合并项目：Tianshu 协议 + esp32s3-485 硬件");

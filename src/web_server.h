@@ -19,6 +19,10 @@ void web_server_handle(void);
 /* 向日志环形缓冲写入一条（供 /log 端点读取） */
 void web_log(const char *msg);
 
+/* 安装 esp_log vprintf hook：把 log_i/log_w/log_e 同步进网页日志缓冲。
+ * 必须在 setup() 最开头调用，否则启动阶段的日志会漏掉。 */
+void web_log_install_hook(void);
+
 /* 当前网络模式：0=STA已连, 1=AP热点, 2=离线 */
 int web_net_mode(void);
 

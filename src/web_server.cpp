@@ -23,12 +23,13 @@
 #include <esp_chip_info.h>
 #include <esp_ota_ops.h>
 #include <esp_wifi.h>
+#include <esp_log.h>
+#include <stdarg.h>
 
 /* ==========================================================================
  * 常量
  * ========================================================================== */
 #define WEB_SERVER_PORT 80
-#define LOG_RING_SIZE 4096
 #define AP_SSID_PREFIX "ESP-AMS-"
 #define AP_PASSWORD "12345678"
 #define WIFI_TIMEOUT_MS 25000
@@ -44,14 +45,85 @@ static bool s_ap_mode = false;
 static int s_net_mode = 2;  // 0=STA, 1=AP, 2=离线
 static uint32_t s_boot_time = 0;
 
-/* 日志环形缓冲 */
-static char s_log_ring[LOG_RING_SIZE];
-static size_t s_log_head = 0;
-static size_t s_log_tail = 0;
-static bool s_log_full = false;
+/* ==========================================================================
+ * 日志环形缓冲（行式：48 行 × 每行 160 字符，带单调递增 seq）
+ *
+ * ★ 2026-10-25：旧实现是"单字符环"，且 web_log() 没有任何调用方 ——
+ *   固件日志全走 log_i/log_e（只进串口），网页"设备日志"面板永远空的。
+ *   现在：
+ *     1. esp_log_set_vprintf() 挂 hook，把所有 log_i/log_w/log_e 输出
+ *        截一份进本缓冲（串口输出不变）；
+ *     2. 缓冲按"行"组织并带 seq，/log 返回 {"log":[...],"seq":[...]}，
+ *        与前端 renderLog 期望的格式对齐（旧格式是单串，前端拿到会
+ *        lines.join TypeError，面板静默死亡）。
+ *   写入口可能来自多个任务（主循环 / 电流采样定时器 / 离合任务），
+ *   用自旋锁保护；临界区只有一次 strncpy，不会死等。
+ * ========================================================================== */
+#define LOG_LINE_CAP   48
+#define LOG_LINE_LEN   160
+
+static char     s_log_lines[LOG_LINE_CAP][LOG_LINE_LEN];
+static uint32_t s_log_seqs[LOG_LINE_CAP];
+static int      s_log_count = 0;    /* 已写入行数（未满时即行数） */
+static int      s_log_next  = 0;    /* 下一个写入位置（环形） */
+static uint32_t s_log_seq   = 0;    /* 行号计数器 */
+static portMUX_TYPE s_log_mux = portMUX_INITIALIZER_UNLOCKED;
+
+void web_log(const char *msg)
+{
+    if (!msg || !msg[0]) return;
+
+    portENTER_CRITICAL(&s_log_mux);
+
+    /* 超长截断；保证结尾有 '\0' */
+    strncpy(s_log_lines[s_log_next], msg, LOG_LINE_LEN - 1);
+    s_log_lines[s_log_next][LOG_LINE_LEN - 1] = '\0';
+
+    s_log_seqs[s_log_next] = ++s_log_seq;
+    s_log_next = (s_log_next + 1) % LOG_LINE_CAP;
+    if (s_log_count < LOG_LINE_CAP) s_log_count++;
+
+    portEXIT_CRITICAL(&s_log_mux);
+}
+
+/* esp_log hook：截获 log_i/log_w/log_e → 喂 web_log；串口输出保持默认 */
+static int web_log_vprintf(const char *format, va_list args)
+{
+    char line[LOG_LINE_LEN + 16];
+    va_list a1, a2;
+    va_copy(a1, args);
+    int n = vsnprintf(line, sizeof(line), format, a1);
+    va_end(a1);
+
+    if (n > 0) {
+        /* log 宏自带结尾 '\n'；按行拆开分别入库 */
+        char *p = line;
+        for (;;) {
+            char *nl = strchr(p, '\n');
+            if (nl) *nl = '\0';
+            if (*p) web_log(p);
+            if (!nl) break;
+            p = nl + 1;
+        }
+    }
+
+    va_copy(a2, args);
+    int m = vprintf(format, a2);   /* 串口照旧 */
+    va_end(a2);
+    return (m >= 0) ? m : n;
+}
+
+/* 尽早安装 hook（main.cpp setup 最开头调），别漏掉启动日志 */
+void web_log_install_hook(void)
+{
+    static bool installed = false;
+    if (installed) return;
+    installed = true;
+    esp_log_set_vprintf(web_log_vprintf);
+}
 
 /* App 版本 */
-static const char *APP_VERSION = "1.1.1-s3ams";
+static const char *APP_VERSION = "1.1.2-s3ams";
 
 /* 单 IO 双微动：每路一个 ADC 脚（开始位/停止位共用同一脚，电阻编码） */
 static const int BOARD_SENSOR_PINS[BOARD_CHANNEL_COUNT] = BOARD_PIN_SENSOR_ARRAY;
@@ -108,25 +180,6 @@ static bool json_get_double(const String &body, const char *key, double *out)
     if (idx == start || (idx == start + 1 && body[start] == '-')) return false;
     *out = body.substring(start, idx).toDouble();
     return true;
-}
-
-/* ==========================================================================
- * 日志
- * ========================================================================== */
-void web_log(const char *msg)
-{
-    if (!msg) return;
-    size_t len = strlen(msg);
-    for (size_t i = 0; i < len; i++) {
-        char c = msg[i];
-        if (c == '\n') c = ' ';  // 单行存储
-        s_log_ring[s_log_head] = c;
-        s_log_head = (s_log_head + 1) % LOG_RING_SIZE;
-        if (s_log_head == s_log_tail) {
-            s_log_full = true;
-            s_log_tail = (s_log_tail + 1) % LOG_RING_SIZE;
-        }
-    }
 }
 
 /* ==========================================================================
@@ -384,21 +437,39 @@ static void handle_status(void)
 
 static void handle_log(void)
 {
-    // 从环形缓冲导出日志
-    String out;
-    char buf[LOG_RING_SIZE + 1];
-    size_t idx = 0;
-    if (s_log_full) {
-        for (size_t i = s_log_tail; i != s_log_head; i = (i + 1) % LOG_RING_SIZE) {
-            buf[idx++] = s_log_ring[i];
-        }
-    } else {
-        for (size_t i = s_log_tail; i != s_log_head; i = (i + 1) % LOG_RING_SIZE) {
-            buf[idx++] = s_log_ring[i];
-        }
+    /* 行式缓冲直接导出 {"log":[...], "seq":[...], "mem_free":N}，
+       与前端 renderLog 的增量渲染协议对齐（按 seq 只追加新行）。
+       读的时候拿锁拷一份，JSON 拼接在锁外做。 */
+    char lines[LOG_LINE_CAP][LOG_LINE_LEN];
+    uint32_t seqs[LOG_LINE_CAP];
+    int count = 0;
+    portENTER_CRITICAL(&s_log_mux);
+    int start = (s_log_count < LOG_LINE_CAP) ? 0 : s_log_next;
+    count = s_log_count;
+    for (int i = 0; i < count; i++) {
+        int idx = (start + i) % LOG_LINE_CAP;
+        strncpy(lines[i], s_log_lines[idx], LOG_LINE_LEN);
+        seqs[i] = s_log_seqs[idx];
     }
-    buf[idx] = '\0';
-    String json = "{\"log\":\"" + String(buf) + "\"}";
+    portEXIT_CRITICAL(&s_log_mux);
+
+    String json = "{\"log\":[";
+    for (int i = 0; i < count; i++) {
+        if (i) json += ",";
+        json += "\"";
+        /* 转义 " 与 \（日志里可能有路径/引号） */
+        for (const char *p = lines[i]; *p; p++) {
+            if (*p == '"' || *p == '\\') json += '\\';
+            json += *p;
+        }
+        json += "\"";
+    }
+    json += "],\"seq\":[";
+    for (int i = 0; i < count; i++) {
+        if (i) json += ",";
+        json += String(seqs[i]);
+    }
+    json += "],\"mem_free\":" + String(esp_get_free_heap_size()) + "}";
     server.send(200, "application/json; charset=utf-8", json);
 }
 
