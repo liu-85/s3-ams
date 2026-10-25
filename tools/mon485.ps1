@@ -101,7 +101,12 @@ function TS { Get-Date -Format "HH:mm:ss.fff" }
 #   两套偏移混着解会读出一堆假状态 —— 所以这里只解 Dxx，其余原样返回不猜。
 function Decode-Frame([string]$hex) {
     if ($hex.Length -lt 20) { return "" }
-    if ($hex.Substring(0, 4).ToUpper() -ne "3DC5") { return "" }
+    if ($hex.Substring(0, 2).ToUpper() -ne "3D") { return "" }
+    # flag 的 bit7 决定长度字段位置：置位=短头（len 在 b2、crc8 在 b3），
+    # 否则长头（len 在 b4、crc8 在 b6）。下面的偏移只对短头成立。
+    $flag = 0
+    try { $flag = [Convert]::ToInt32($hex.Substring(2, 2), 16) } catch { return "" }
+    if (($flag -band 0x80) -eq 0) { return "" }        # 只解短头
     if ($hex.Substring(8, 2) -ne "04") { return "" }   # 只解 Dxx
 
     try {
