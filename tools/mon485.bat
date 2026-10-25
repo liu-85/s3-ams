@@ -1,25 +1,47 @@
 @echo off
 setlocal
 rem =====================================================================
-rem  mon485.bat —— 485 通讯监控（打印机原始指令 + 本机回复 + WEB日志）
+rem  mon485.bat -- 485 monitor (printer frames + our replies + WEB log + motor)
 rem
-rem  用法：  mon485.bat [IP] [轮询ms]
-rem  例：    mon485.bat                      (默认 192.168.2.100 300ms)
-rem         mon485.bat 192.168.2.100 200
+rem  Usage: mon485.bat [IP] [poll_ms]
+rem  e.g.   mon485.bat                      (default 192.168.2.100 / 50ms)
+rem         mon485.bat 192.168.2.100 50
+rem         mon485.bat 192.168.2.100 20    (use this if you see frame loss)
 rem
-rem  字体颜色：
-rem    青色 Cyan   = RX  打印机 -> 本机（打印机发来的原始指令）
-rem    绿色 Green  = TX  本机 -> 打印机（本机给的回复）
-rem    灰色 Gray   = 状态行 / WEB 日志（同样的消息没变化时不刷新）
+rem  Everything is also written to tools\logs\mon485_yyyyMMdd_HHmmss.log
+rem  so nothing is lost when the console scrolls. Open it with Notepad/VSCode.
 rem
-rem  依赖固件 v1.1.3+（/bus485raw 端点；旧版该功能 404，
-rem  脚本会黄字提示并只监控 WEB 日志/状态）
-rem  Ctrl+C 停止
+rem  Colors:
+rem    Cyan    = RX  printer -> device
+rem    Green   = TX  device  -> printer
+rem    Gray    = status line / WEB log
+rem    Yellow  = motor action event (dir / clutch / action / print phase changed)
+rem    Red     = error log / frame-loss warning
+rem
+rem  Every frame carries a #seq number. If you see a red "frame loss" line,
+rem  the device's 32-frame ring buffer was overrun - lower the 2nd argument.
+rem
+rem  Requires firmware v1.1.3+ (/bus485raw endpoint).
+rem  Ctrl+C to stop.
 rem =====================================================================
+
+chcp 65001 >nul 2>&1
+
 set "AMS_IP=%~1"
 if "%AMS_IP%"=="" set "AMS_IP=192.168.2.100"
 set "AMS_MS=%~2"
-if "%AMS_MS%"=="" set "AMS_MS=300"
+if "%AMS_MS%"=="" set "AMS_MS=50"
 
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0mon485.ps1"
-exit /b %ERRORLEVEL%
+echo.
+echo   AMS IP    : %AMS_IP%
+echo   Poll      : %AMS_MS% ms
+echo   Log dir   : %~dp0logs
+echo.
+
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0mon485.ps1" -Ip "%AMS_IP%" -Ms %AMS_MS%
+set RC=%ERRORLEVEL%
+
+echo.
+echo   Monitor exited (code %RC%). Press any key to close.
+pause >nul
+exit /b %RC%
