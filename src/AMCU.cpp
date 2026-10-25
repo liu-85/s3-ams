@@ -127,6 +127,10 @@ bool amcu_jog_start(int channel, int dir, int ms, int pct)
     return true;
 }
 
+/* 是否正在等离合机械吸合（定义见文件后部"离合挂起状态"之后）。
+ * 前向声明：amcu_jog_pump() 在那些静态变量之前，需要先看到接口。 */
+static bool amcu_engage_pending(void);
+
 static void amcu_jog_pump(void)
 {
     if (!s_jog_active) return;
@@ -145,11 +149,26 @@ static void amcu_jog_pump(void)
     }
 
     if (clutch_is_engaged(s_jog_channel)) {
-        /* 离合已咬合：按点动速度驱动（幂等，同方向同速度不重写） */
-        motor_set_dir_speed(s_jog_dir, s_jog_pct);
-        s_driving_now = true;
+        /* ★ v1.1.17：还有挂起的吸合请求在等机械稳定 → 先别给电机，
+         *   交给 AMCU_clutch_pump() 在稳定时间过去后统一启动。
+         *
+         * clutch_apply_one() 是「先 gpio_set_level() 再 vTaskDelay(80ms)」，
+         * 所以 clutch_is_engaged() 在电平置高后**立即**就返回 true，
+         * 但电磁铁机械咬合还要 CLUTCH_ENGAGE_MS(80ms)。
+         * 原来这里一看 engaged 就直接 motor_set_dir_speed()，
+         * 电磁铁还没咬合就带负载 → 打滑、吸合不彻底。
+         *
+         * 现场症状（2026-10-25 用户实测）：WEB 点「进料」电机在转、
+         * 但当前通道离合"没吸合彻底"；点「退料」却正常。
+         * 原因就是进料多半要**切换通道**（全断60+静默20+吸合80=160ms），
+         * 而退料时离合往往已吸着同一通道，clutch_engage() 走幂等分支
+         * 立即返回、机械早就稳定 —— 所以退料看着"彻底"。 */
+        if (!amcu_engage_pending()) {
+            motor_set_dir_speed(s_jog_dir, s_jog_pct);
+            s_driving_now = true;
+        }
     } else if (!clutch_is_busy()) {
-        /* 发起离合吸合请求（异步）；吸合后下一循环本函数给电机 */
+        /* 发起离合吸合请求（异步）；吸合稳定后由 AMCU_clutch_pump() 给电机 */
         AMCU_drive_channel(s_jog_channel, s_jog_dir, s_jog_pct);
     }
 }
@@ -295,6 +314,20 @@ static int         s_pending_speed = MOTOR_SPEED_FULL;
 static int         s_pending_kind = 0;   /* 0=无, 1=吸合, 3=全断 */
 static int         s_pending_ch   = 0;
 
+/* v1.1.17：离合请求发起时刻。电机必须等这段机械稳定时间过去才能给电。
+ * 为什么不能只看 clutch_is_engaged()：clutch_apply_one() 先置电平再
+ * vTaskDelay(CLUTCH_ENGAGE_MS)，电平一置高 is_engaged() 就为 true，
+ * 但电磁铁机械咬合还要 80ms。
+ * 为什么不能只看 clutch_result_poll()：req_slot 只有 4 个槽，
+ * 高频请求会把槽覆盖掉，导致 done 永远不来 —— 所以加时间判据兜底。 */
+static uint32_t    s_engage_req_ms = 0;
+
+/* 是否正在等离合机械吸合（供 amcu_jog_pump 前向调用） */
+static bool amcu_engage_pending(void)
+{
+    return (s_pending_clutch != NULL && s_pending_kind == 1);
+}
+
 /* v1.1.15 诊断计数器（暴露到 /status 的 clutch.diag）：
  *   s_clutch_switch —— 挂起的吸合目标通道被改成别的通道的次数
  *   s_clutch_abort  —— 挂起的吸合请求被"停机"打断的次数
@@ -334,6 +367,16 @@ bool AMCU_drive_channel(int channel, motor_dir_t dir, int speed_pct)
     }
 
     if (clutch_is_engaged(channel)) {
+        /* ★ v1.1.17：本通道刚发起吸合、机械稳定时间还没过时，
+         *   不要在这里直接启动电机，交给 AMCU_clutch_pump() 在
+         *   CLUTCH_ENGAGE_MS 过去后统一启动。
+         *   否则又是"带着负载吸合"→ 打滑、吸合不彻底。 */
+        if (amcu_engage_pending() && s_pending_ch == channel) {
+            s_current_channel = channel;
+            s_driving_now = false;
+            RGB_GREEN;
+            return false;
+        }
         /* 已吸合目标通道：直接给电机，不重复请求 */
         motor_set_dir_speed(dir, speed_pct);
         s_current_channel = channel;
@@ -353,6 +396,7 @@ bool AMCU_drive_channel(int channel, motor_dir_t dir, int speed_pct)
             s_pending_clutch = clutch_request_engage(channel);
             s_pending_kind = 1;
             s_pending_ch = channel;
+            s_engage_req_ms = millis();   /* v1.1.17：记发起时刻，电机等它稳定 */
             /* 记住这次要跑的方向/速度，咬合后 pump 按它启动电机 */
             s_pending_dir = dir;
             s_pending_speed = speed_pct;
@@ -385,8 +429,26 @@ void AMCU_clutch_pump()
             s_driving_now = false;
             return;
         }
-        if (clutch_is_engaged(want)) {
-            /* 离合已咬合 → 按挂起时记下的方向/速度启动电机
+
+        const bool eng = clutch_is_engaged(want);
+
+        /* ★★ v1.1.17：必须等机械稳定时间过去才给电机 ★★
+         *
+         * 两个判据，满足其一即可：
+         *   ① done —— 后台 clutch_task 已跑完 clutch_engage()，
+         *      里面的 vTaskDelay(CLUTCH_ENGAGE_MS) 自然已经过去（权威）
+         *   ② 时间 —— 距请求发起已过 CLUTCH_ENGAGE_MS + CLUTCH_SETTLE_MS（兜底）
+         *      因为 req_slot 只有 4 个槽，高频请求会覆盖槽位导致 done 永远不来
+         *
+         * 只看 eng 是不够的：clutch_apply_one() 先 gpio_set_level() 再
+         * vTaskDelay(80ms)，电平一置高 eng 就为 true，但电磁铁还没咬合。
+         * 这时候给电机就是"带着负载吸合"→ 打滑、吸合不彻底。 */
+        const bool settled = done ||
+            ((uint32_t)(millis() - s_engage_req_ms) >=
+             (CLUTCH_ENGAGE_MS + CLUTCH_SETTLE_MS));
+
+        if (eng && settled) {
+            /* 离合已咬合且机械稳定 → 按挂起时记下的方向/速度启动电机
                （不能用 motor_get_dir()：电机还没启过，拿到的是 STOP） */
             motor_set_dir_speed(s_pending_dir, s_pending_speed);
             s_pending_clutch = NULL;
@@ -394,7 +456,7 @@ void AMCU_clutch_pump()
             s_pending_dir = MOTOR_DIR_STOP;
             s_driving_now = true;
             s_last_drive_ms = millis();
-        } else if (done) {
+        } else if (done && !eng) {
             /* 后台已处理完但电平仍不对（吸合失败）：放弃本笔，
                下一循环 AMCU_drive_channel() 会重新发起，避免死等 */
             s_pending_clutch = NULL;

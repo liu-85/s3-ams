@@ -6,6 +6,52 @@ RELEASE.md 在 `release/vX.Y.Z/`。
 
 ---
 
+## v1.1.17 —— 离合没吸合彻底就给电机
+
+**2026-10-25**
+
+**现象**（用户实测 v1.1.16）：WEB 硬件调试点动逐通道测试，
+**进料时电机在转但当前通道离合"没吸合彻底"**；
+**退料却正常**，手摸电磁齿轮转得很快、明显吸合彻底。
+
+**根因：电机在电磁铁还没机械咬合时就开始带负载。**
+
+`clutch_apply_one()` 是「先 `gpio_set_level()` 再 `vTaskDelay(CLUTCH_ENGAGE_MS=80ms)`」，
+所以 `clutch_is_engaged()` 在电平置高后**立即**返回 true，而机械咬合还要 80ms。
+上层却靠 `clutch_is_engaged()` 决定何时给电机 → 主循环下一轮（几毫秒）就
+`motor_set_dir_speed()` → 带着负载吸合 → 打滑、吸合不实。
+
+**为什么退料"看着正常"（最易误判）**：
+
+| | 进料 | 退料 |
+|---|---|---|
+| 离合状态 | 多要从上一通道切过来 | 往往已吸着同一通道 |
+| `clutch_engage()` | 完整流程 全断60+静默20+吸合80 = **160ms** | **幂等分支立即返回** |
+| 结果 | 没过稳定期就给电机 → 吸不实 | 早就稳定 → 彻底 |
+
+退料"彻底"是假象——它根本没经历等待。
+
+**修复**：`AMCU_clutch_pump()` 增加 `settled` 判据，两个条件满足其一才给电机：
+
+```cpp
+const bool settled = done ||                                   /* 后台已跑完，80ms 已过（权威） */
+    ((uint32_t)(millis() - s_engage_req_ms) >=
+     (CLUTCH_ENGAGE_MS + CLUTCH_SETTLE_MS));                    /* 时间兜底，防 req_slot 被覆盖 */
+if (eng && settled) motor_set_dir_speed(s_pending_dir, s_pending_speed);
+```
+
+配套：
+- `AMCU_drive_channel()` 记 `s_engage_req_ms`；"已吸合"分支若本通道还在等稳定则返回 false
+- `amcu_jog_pump()`（WEB 点动）在吸合未稳定时不在这里给电机，交给 pump 统一启动
+- 新增 `amcu_engage_pending()`（前向声明）
+
+效果：电机比之前晚约 100~160ms 启动，换来离合完全咬合后再带负载。
+**点动时长建议 ≥ 1000ms**（默认值），200ms 下限会被稳定时间占掉大半。
+
+详见 [release/v1.1.17/RELEASE.md](release/v1.1.17/RELEASE.md)
+
+---
+
 ## v1.1.16 —— WEB 点动进料不吸合 + 微动只认当前使用通道
 
 **2026-10-25**
