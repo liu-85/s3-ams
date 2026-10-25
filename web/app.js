@@ -1115,6 +1115,26 @@
                 (typeof d.act485 === 'number') ? (d.act485 !== 0) : false;
         }
 
+        /* 上报给打印机的 AMS 版本号（v1.1.13）。
+         * 对不上打印机的白名单就会弹「仅支持 AMS / AMS 2 Pro / AMS HT」。 */
+        if ($('ams_ver_now')) {
+            $('ams_ver_now').textContent =
+                (d.ams_ver || '?') + (d.ams_ver_raw ? '  (0x' +
+                ('00000000' + (d.ams_ver_raw >>> 0).toString(16)).slice(-8).toUpperCase() + ')' : '');
+        }
+        if ($('ams_ver_sel') && document.activeElement !== $('ams_ver_sel') &&
+            typeof d.ams_ver_raw === 'number') {
+            var has = false;
+            for (var ai = 0; ai < $('ams_ver_sel').options.length; ai++) {
+                if (Number($('ams_ver_sel').options[ai].value) === d.ams_ver_raw) {
+                    $('ams_ver_sel').selectedIndex = ai;
+                    has = true;
+                    break;
+                }
+            }
+            if (!has) { $('ams_ver_sel').selectedIndex = -1; }
+        }
+
         /* WiFi 现在是不是在跑。能打开这个网页就说明是开的，
          * 所以这里主要是在"485 自动模式"下解释"为什么网页打不开"。 */
         if ($('comm_wifi')) {
@@ -1219,6 +1239,33 @@
                     }
                     post('/act485_set', { on: on }, function (r) {
                         toast((r && r.info) || '已保存', (r && r.ok) ? 'ok' : 'bad');
+                        refresh();
+                    });
+                };
+            }
+
+            /* AMS 版本号保存（v1.1.13）。
+             * 打印机拿这个版本号跟白名单比对，对不上就弹窗
+             * 「当前固件仅支持 AMS / AMS 2 Pro / AMS HT」。
+             * 立即生效，但打印机要等下一次 0x103 查询才会看到新值 ——
+             * 想马上让打印机重新识别，拔插一次 485 或重启打印机。 */
+            if ($('btn_ams_ver_save')) {
+                $('btn_ams_ver_save').onclick = function () {
+                    var sel = $('ams_ver_sel');
+                    if (!sel || sel.selectedIndex < 0) {
+                        toast('请先选一个版本号', 'bad');
+                        return;
+                    }
+                    var raw = Number(sel.options[sel.selectedIndex].value);
+                    if (raw === 1509949440 && !confirm(
+                            '90.00.00.00 是 Tianshu 编造的版本号，新版打印机固件\n' +
+                            '会把它当成"不认识的 AMS"直接弹窗。\n\n' +
+                            '确定要改回这个值吗？')) {
+                        return;
+                    }
+                    post('/ams_ver_set', { raw: raw }, function (r) {
+                        toast((r && r.ok) ? ('已改为 ' + r.ver) : ((r && r.err) || '保存失败'),
+                              (r && r.ok) ? 'ok' : 'bad');
                         refresh();
                     });
                 };

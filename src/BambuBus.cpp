@@ -36,6 +36,68 @@ int cmd = 0;
 #define SERSIAL_NUMBER long_packge_version_serial_number_AMS_lite
 #define VERSION_NAME long_packge_version_version_and_name_AMS_lite
 
+/* ==========================================================================
+ * AMS 固件版本号（v1.1.13）
+ * ==========================================================================
+ *
+ * 打印机会拿这个 4 字节版本号去跟自己的**白名单**比对，对不上就当成
+ * "不认识的 AMS 设备"，直接弹窗：
+ *   当前固件仅支持 AMS / AMS 2 Pro / AMS HT，最多可连接 4 台，
+ *   请务必先移除所有 AMS，再重新插入上述支持的设备。[0500-40A5]
+ *
+ * ★ Tianshu 原版写的是 `00 00 00 5A`（90.00.00.00）—— 这是个**编造的版本号**，
+ *   旧打印机固件不校验，新版一校验就废。现场表现就是"经常弹窗"。
+ *
+ * 实测可用的真实版本号（都从真机抓包得到，二选一）：
+ *   01.00.06.87  → {0x57,0x06,0x00,0x01}  BMCU-X/BMCU-U 在用，A1 FW 01.08.01.00 验证过
+ *   00.00.06.49  → {0x31,0x06,0x00,0x00}  BMCU370 实测抓包
+ *   00.00.08.15  → {0x0F,0x08,0x00,0x00}  AMS Lite 线
+ *
+ * 默认用最新的 01.00.06.87。如果换了打印机还弹窗，去网页
+ * 「和打印机的通信方式」→「AMS 版本号」换成别的，**不用重编译**。
+ *
+ * 小端存放：uint32 0x01000657 → 字节 57 06 00 01 → 显示 01.00.06.87
+ */
+#define AMS_FW_VER_DEFAULT  0x01000657u   /* 01.00.06.87 */
+
+static uint32_t s_ams_fw_ver = AMS_FW_VER_DEFAULT;
+
+uint32_t Bambubus_get_ams_fw_version(void)
+{
+    return s_ams_fw_ver;
+}
+
+void Bambubus_set_ams_fw_version(uint32_t v)
+{
+    /* 全 0 / 全 0xFF 明显是脏数据，拒绝 */
+    if (v == 0 || v == 0xFFFFFFFFu) {
+        log_w("AMS 版本号 0x%08X 非法，忽略", (unsigned)v);
+        return;
+    }
+    s_ams_fw_ver = v;
+
+    Preferences p;
+    if (p.begin("s3ams-bus", false)) {
+        p.putUInt("ver", v);
+        p.end();
+    }
+    log_i("AMS 版本号已改为 %02u.%02u.%02u.%02u（重启后仍然有效）",
+          (unsigned)((v >> 24) & 0xFF), (unsigned)((v >> 16) & 0xFF),
+          (unsigned)((v >> 8) & 0xFF), (unsigned)(v & 0xFF));
+}
+
+static void ams_fw_ver_load(void)
+{
+    Preferences p;
+    if (!p.begin("s3ams-bus", true)) return;
+    uint32_t v = p.getUInt("ver", AMS_FW_VER_DEFAULT);
+    p.end();
+    if (v != 0 && v != 0xFFFFFFFFu) s_ams_fw_ver = v;
+    log_i("AMS 上报版本号: %02u.%02u.%02u.%02u",
+          (unsigned)((s_ams_fw_ver >> 24) & 0xFF), (unsigned)((s_ams_fw_ver >> 16) & 0xFF),
+          (unsigned)((s_ams_fw_ver >> 8) & 0xFF), (unsigned)(s_ams_fw_ver & 0xFF));
+}
+
 // ==================== 新协议内部状态机定义 ====================
 enum class _filament_motion_internal : uint8_t
 {
@@ -478,6 +540,8 @@ void BambuBus_init()
     bool _init_ready = Bambubus_read();
     crc_8.reset(0x39, 0x66, 0, false, false);
     crc_16.reset(0x1021, 0x913D, 0, false, false);
+
+    ams_fw_ver_load();   /* v1.1.13：上报给打印机的 AMS 版本号 */
 
     for (int i = 0; i < 4; i++)
     {
@@ -1227,9 +1291,28 @@ void send_for_long_packge_version(unsigned char *buf, int length)
     }
     else if (printer_data_long.type == 0x103)
     {
-        payload = long_packge_version_version_and_name_AMS08;
-        payload_len = sizeof(long_packge_version_version_and_name_AMS08);
-        payload[payload_len - 1] = AMS_num;
+        /* ★ v1.1.13：版本号改成可配置的真实值，不再用 Tianshu 编造的 90.00.00.00。
+         *
+         * 包结构（21 字节）：
+         *   [0..3]  版本号 uint32 小端，例如 01.00.06.87 → 57 06 00 01
+         *   [4..8]  型号代号 "AMS08"（AMS / AMS 2 Pro / AMS HT 这条线）
+         *   [9..19] 补 0
+         *   [20]    台号
+         *
+         * 打印机会同时校验「版本号是否在白名单」和「型号代号」，两者任一
+         * 对不上都可能弹「当前固件仅支持 AMS / AMS 2 Pro / AMS HT」。 */
+        static unsigned char ver_pkt[21];
+        uint32_t v = s_ams_fw_ver;
+        ver_pkt[0] = (unsigned char)(v & 0xFF);
+        ver_pkt[1] = (unsigned char)((v >> 8) & 0xFF);
+        ver_pkt[2] = (unsigned char)((v >> 16) & 0xFF);
+        ver_pkt[3] = (unsigned char)((v >> 24) & 0xFF);
+        memcpy(ver_pkt + 4, "AMS08", 5);
+        memset(ver_pkt + 9, 0x00, 11);
+        ver_pkt[20] = AMS_num;
+
+        payload = ver_pkt;
+        payload_len = sizeof(ver_pkt);
     }
 
     if (payload == nullptr) return;

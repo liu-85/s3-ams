@@ -165,7 +165,7 @@ void web_log_install_hook(void)
 }
 
 /* App 版本 */
-static const char *APP_VERSION = "1.1.12-s3ams";
+static const char *APP_VERSION = "1.1.13-s3ams";
 
 /* 单 IO 双微动：每路一个 ADC 脚（开始位/停止位共用同一脚，电阻编码） */
 static const int BOARD_SENSOR_PINS[BOARD_CHANNEL_COUNT] = BOARD_PIN_SENSOR_ARRAY;
@@ -371,6 +371,17 @@ static void handle_status(void)
     json += "\"build_date\":\"" + String(__DATE__) + "\",";
     json += "\"comm_mode\":2,";  // 485 直连（自动）
     json += "\"comm_mode_text\":\"RS-485 直连打印机（BambuBus）\",";
+    /* 上报给打印机的 AMS 版本号（v1.1.13）。
+       打印机拿它跟白名单比对，对不上就弹「仅支持 AMS / AMS 2 Pro / AMS HT」。 */
+    {
+        uint32_t av = Bambubus_get_ams_fw_version();
+        char avbuf[24];
+        snprintf(avbuf, sizeof(avbuf), "%02u.%02u.%02u.%02u",
+                 (unsigned)((av >> 24) & 0xFF), (unsigned)((av >> 16) & 0xFF),
+                 (unsigned)((av >> 8) & 0xFF), (unsigned)(av & 0xFF));
+        json += "\"ams_ver\":\"" + String(avbuf) + "\",";
+        json += "\"ams_ver_raw\":" + String((unsigned long)av) + ",";
+    }
     json += "\"wifi_on\":1,";  // WiFi 常开（本固件无 MQTT 模式）
     json += "\"act485\":" + String(ams_enable ? 1 : 0) + ",";  // 485 运动执行开关回显
     json += "\"jog_ms\":" + String(jog_time_ms) + ",";
@@ -1088,6 +1099,37 @@ static void handle_comm_set(void)
         "{\"ok\":true,\"info\":\"本固件固定 RS-485 直连打印机（BambuBus），无需切换通信模式\"}");
 }
 
+/* /ams_ver_set：改上报给打印机的 AMS 版本号（v1.1.13）
+ *
+ * 前端 post('/ams_ver_set', {raw: 16778839})，raw 是 4 字节版本号按小端拼成的
+ * uint32（0x01000657 = 01.00.06.87 = 16778839）。
+ *
+ * 为什么做成可改：不同打印机固件的白名单不一样，换个打印机可能要换版本号。
+ * 改完**立即生效**（下一次 0x103 查询就用新值），不用重启。
+ */
+static void handle_ams_ver_set(void)
+{
+    if (!server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"ok\":false,\"err\":\"no body\"}");
+        return;
+    }
+    String body = server.arg("plain");
+    long raw = 0;
+    if (!json_get_int(body, "raw", &raw)) {
+        server.send(400, "application/json", "{\"ok\":false,\"err\":\"缺少 raw\"}");
+        return;
+    }
+    Bambubus_set_ams_fw_version((uint32_t)raw);
+
+    uint32_t v = Bambubus_get_ams_fw_version();
+    char msg[96];
+    snprintf(msg, sizeof(msg),
+             "{\"ok\":true,\"ver\":\"%02u.%02u.%02u.%02u\",\"info\":\"已保存，下一次版本查询即生效\"}",
+             (unsigned)((v >> 24) & 0xFF), (unsigned)((v >> 16) & 0xFF),
+             (unsigned)((v >> 8) & 0xFF), (unsigned)(v & 0xFF));
+    server.send(200, "application/json", msg);
+}
+
 /* ==========================================================================
  * 启动
  * ========================================================================== */
@@ -1115,6 +1157,7 @@ void web_server_start(void)
     server.on("/jog_set", HTTP_POST, handle_jog_set);
     server.on("/hardware_test", HTTP_POST, handle_hardware_test);
     server.on("/comm_set", HTTP_POST, handle_comm_set);
+    server.on("/ams_ver_set", HTTP_POST, handle_ams_ver_set);
     server.on("/assist_set", HTTP_POST, handle_ok);
     server.on("/retract_set", HTTP_POST, handle_ok);
     server.on("/temper_set", HTTP_POST, handle_ok);

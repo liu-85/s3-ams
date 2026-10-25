@@ -530,12 +530,27 @@
             </label>
             <button id="btn_act485_save" style="flex:0 0 96px">保存</button>
           </div>
+          <div class="row" style="margin-top:8px">
+            <select id="ams_ver_sel" style="flex:1">
+              <option value="16778839">01.00.06.87 —— 推荐（A1 固件 01.08.01.00 验证过）</option>
+              <option value="1585">00.00.06.49 —— BMCU370 真机抓包</option>
+              <option value="1509949440">90.00.00.00 —— Tianshu 原值（新版固件会弹窗，别用）</option>
+            </select>
+            <button id="btn_ams_ver_save" style="flex:0 0 96px">保存</button>
+          </div>
+          <div class="kv"><span>上报版本</span><b id="ams_ver_now">-</b></div>
           <div class="kv"><span>当前生效</span><b id="comm_now">-</b></div>
           <div class="kv"><span>WiFi 状态</span><b id="comm_wifi">-</b></div>
           <div class="kv"><span>485 总线</span><b id="comm_bus">-</b></div>
           <div class="tip">
-            <b>三条通路互斥，改完要重启才生效。</b>原因很简单：它们都能表达
-            「打印机要换料」，同时开着就是两份指令抢同一个状态机 —— 一条说送料、
+            <b>AMS 版本号（上面的下拉框）</b>：这是固件在总线上<b>报给打印机的
+            「AMS 固件版本」</b>。打印机会拿它跟自己的白名单比对，对不上就把你
+            这台当成<b>不认识的 AMS 设备</b>，直接弹窗
+            「当前固件仅支持 AMS / AMS 2 Pro / AMS HT，最多可连接 4 台」
+            <code>[0500-40A5]</code>。改完<b>立即生效</b>，不用重启；
+            如果换台打印机还弹，就换一个值再试。
+            <div class="hr"></div>
+            <b>三条通路互斥，改完要重启才生效。</b>原因很简单：它们都能表达            「打印机要换料」，同时开着就是两份指令抢同一个状态机 —— 一条说送料、
             另一条说退料，电机听谁的？所以切换只写配置，由重启决定这次起哪一条。
             <div class="hr"></div>
             <b>WiFi 上电就启动（默认开）</b>：开着 → 网页随时能看 485 报文，

@@ -89,6 +89,15 @@ extern bool is_channel_before_on_use(int num);
 extern bool is_channel_on_use(int num);
 extern bool is_channel_stop_on_use(int num);
 
+/* 上报给打印机的 AMS 固件版本号（v1.1.13）。
+ *
+ * 打印机会拿它跟白名单比对，编造的版本号（Tianshu 的 90.00.00.00）
+ * 会被判成"不认识的 AMS"→ 弹窗「当前固件仅支持 AMS / AMS 2 Pro / AMS HT」。
+ * 默认 0x01000657 = 01.00.06.87，网页可改，存 NVS "s3ams-bus"。
+ */
+extern uint32_t Bambubus_get_ams_fw_version(void);
+extern void Bambubus_set_ams_fw_version(uint32_t v);
+
 _filament_motion_state_set get_filament_motion(int num);
 String get_now_filament_name(int num);
 
