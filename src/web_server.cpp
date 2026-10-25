@@ -5,6 +5,9 @@
  * 使用 ESP32 Arduino 的 WiFi + WebServer + Update 库。
  */
 
+/* ams_log.h 必须第一个 include：它先拉 Arduino.h 拿到原始 log_* 宏，
+   再劫持成「串口照旧 + 抄送网页日志」。见文件头注释。 */
+#include "ams_log.h"
 #include "web_server.h"
 #include "web_files.h"
 #include "board_pins.h"
@@ -25,6 +28,7 @@
 #include <esp_ota_ops.h>
 #include <esp_wifi.h>
 #include <esp_log.h>
+#include <esp_task_wdt.h>
 #include <stdarg.h>
 
 /* ==========================================================================
@@ -65,6 +69,7 @@ static uint32_t s_boot_time = 0;
 
 static char     s_log_lines[LOG_LINE_CAP][LOG_LINE_LEN];
 static uint32_t s_log_seqs[LOG_LINE_CAP];
+static uint16_t s_log_rep[LOG_LINE_CAP];   /* 该行被连续重复的次数（0=只出现过1次） */
 static int      s_log_count = 0;    /* 已写入行数（未满时即行数） */
 static int      s_log_next  = 0;    /* 下一个写入位置（环形） */
 static uint32_t s_log_seq   = 0;    /* 行号计数器 */
@@ -76,15 +81,41 @@ void web_log(const char *msg)
 
     portENTER_CRITICAL(&s_log_mux);
 
+    /* 与上一条完全相同：合并成「… ×N」，不占新行、不推进 seq。
+       现场要求：同样的消息没变化时不更新 —— 前端按 seq 增量渲染，
+       这里不推进 seq，面板就不会被重复消息刷屏；次数记在行尾，
+       刷新页面时可见（handle_log 负责拼接 ×N）。 */
+    if (s_log_count > 0) {
+        int last = (s_log_next - 1 + LOG_LINE_CAP) % LOG_LINE_CAP;
+        if (strncmp(msg, s_log_lines[last], LOG_LINE_LEN) == 0) {
+            if (s_log_rep[last] < 999) s_log_rep[last]++;
+            portEXIT_CRITICAL(&s_log_mux);
+            return;
+        }
+    }
+
     /* 超长截断；保证结尾有 '\0' */
     strncpy(s_log_lines[s_log_next], msg, LOG_LINE_LEN - 1);
     s_log_lines[s_log_next][LOG_LINE_LEN - 1] = '\0';
 
+    s_log_rep[s_log_next] = 0;
     s_log_seqs[s_log_next] = ++s_log_seq;
     s_log_next = (s_log_next + 1) % LOG_LINE_CAP;
     if (s_log_count < LOG_LINE_CAP) s_log_count++;
 
     portEXIT_CRITICAL(&s_log_mux);
+}
+
+/* 供 ams_log.h 的 log_* 劫持宏调用：格式化后进网页日志环 */
+void web_logf(const char *fmt, ...)
+{
+    if (!fmt) return;
+    char line[LOG_LINE_LEN + 16];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(line, sizeof(line), fmt, args);
+    va_end(args);
+    web_log(line);
 }
 
 /* esp_log hook：截获 log_i/log_w/log_e → 喂 web_log；串口输出保持默认 */
@@ -124,7 +155,7 @@ void web_log_install_hook(void)
 }
 
 /* App 版本 */
-static const char *APP_VERSION = "1.1.4-s3ams";
+static const char *APP_VERSION = "1.1.5-s3ams";
 
 /* 单 IO 双微动：每路一个 ADC 脚（开始位/停止位共用同一脚，电阻编码） */
 static const int BOARD_SENSOR_PINS[BOARD_CHANNEL_COUNT] = BOARD_PIN_SENSOR_ARRAY;
@@ -443,6 +474,7 @@ static void handle_log(void)
        读的时候拿锁拷一份，JSON 拼接在锁外做。 */
     char lines[LOG_LINE_CAP][LOG_LINE_LEN];
     uint32_t seqs[LOG_LINE_CAP];
+    uint16_t reps[LOG_LINE_CAP];
     int count = 0;
     portENTER_CRITICAL(&s_log_mux);
     int start = (s_log_count < LOG_LINE_CAP) ? 0 : s_log_next;
@@ -451,6 +483,7 @@ static void handle_log(void)
         int idx = (start + i) % LOG_LINE_CAP;
         strncpy(lines[i], s_log_lines[idx], LOG_LINE_LEN);
         seqs[i] = s_log_seqs[idx];
+        reps[i] = s_log_rep[idx];
     }
     portEXIT_CRITICAL(&s_log_mux);
 
@@ -463,6 +496,8 @@ static void handle_log(void)
             if (*p == '"' || *p == '\\') json += '\\';
             json += *p;
         }
+        /* 连续重复的消息合并显示为「… ×N」（rep 是第 1 次之后的重复数） */
+        if (reps[i] > 0) json += " \xC3\x97" + String(reps[i] + 1);
         json += "\"";
     }
     json += "],\"seq\":[";
@@ -620,6 +655,49 @@ static bool     s_ota_error = false;
 static size_t   s_ota_written = 0;
 static uint32_t s_ota_start_ms = 0;
 
+/* --------------------------------------------------------------------------
+ * OTA 期间的任务看门狗（TWDT）联动
+ *
+ * ★ v1.1.4 及以前「上传中断」的真正原因（2026-10-26 实锤）：
+ *   main.cpp 用 esp_task_wdt_add(NULL) 把主循环任务订阅进了 10s 看门狗。
+ *   而 multipart 上传时，server.handleClient() 会在**一次调用里**把整个
+ *   1.8MB 收完（边收边写 flash，几十秒不返回）—— 主循环卡在里面，
+ *   喂不了狗 → 第 10 秒 TWDT panic 重启 → 浏览器连接被reset →
+ *   xhr.onerror「上传中断」。证据：OTA 测试期间设备 uptime 从 124s
+ *   掉到 9s（中途重启了）。
+ *
+ *   对策：上传期间把主循环任务临时退出看门狗（START 时 delete），
+ *   结束/中断时再加回来（END/ABORTED）；另外每写完一个数据块兜底
+ *   喂一次狗（万一 delete 失败也死不了）；最后在 web_server_handle
+ *   里加保险丝：20s 没有上传进度就恢复订阅，防客户端半途断开后
+ *   系统长期裸奔。
+ * ------------------------------------------------------------------------ */
+static bool     s_ota_wdt_off = false;      /* true=主循环已退出 TWDT，需恢复 */
+static uint32_t s_ota_last_prog_ms = 0;     /* 最近一次上传进度时刻 */
+
+static void ota_wdt_off_enter(void)
+{
+    if (s_ota_wdt_off) return;
+    s_ota_last_prog_ms = millis();
+    esp_err_t err = esp_task_wdt_delete(NULL);   /* NULL = 当前任务 = 主循环 */
+    if (err == ESP_OK) {
+        s_ota_wdt_off = true;
+        log_i("OTA: 上传期间主循环临时退出任务看门狗（%ums 起）",
+              (unsigned)millis());
+    } else {
+        /* 没能退订（理论上只有本来就未订阅才会失败）→ 退化为每块喂狗 */
+        log_w("OTA: 退出看门狗失败(%s)，改为每数据块喂狗", esp_err_to_name(err));
+    }
+}
+
+static void ota_wdt_on_restore(void)
+{
+    if (!s_ota_wdt_off) return;
+    s_ota_wdt_off = false;
+    esp_task_wdt_add(NULL);   /* 重新订阅主循环任务 */
+    log_i("OTA: 已恢复任务看门狗订阅");
+}
+
 static void handle_ota_upload(void)
 {
     HTTPUpload& upload = server.upload();
@@ -633,6 +711,7 @@ static void handle_ota_upload(void)
             s_ota_error = true;
             return;
         }
+        ota_wdt_off_enter();
         log_i("OTA 开始: %s（流式 multipart，UNKNOWN 尺寸）", upload.filename.c_str());
     } else if (upload.status == UPLOAD_FILE_WRITE) {
         if (s_ota_error) return;  /* begin 就失败了，丢弃后续数据 */
@@ -646,23 +725,40 @@ static void handle_ota_upload(void)
             return;
         }
         s_ota_written += n;
+        s_ota_last_prog_ms = millis();
+        esp_task_wdt_reset();   /* 兜底喂狗（退订失败时靠这个续命） */
     } else if (upload.status == UPLOAD_FILE_END) {
         if (s_ota_error) {
-            server.send(500, "text/plain", "OTA 失败（写入flash出错，见设备日志）");
+            ota_wdt_on_restore();
+            server.send(500, "application/json",
+                        "{\"ok\":false,\"info\":\"OTA 失败（写入 flash 出错，见设备日志）\"}");
             return;
         }
         if (Update.end(true)) {
             log_i("OTA 完成: %u 字节，用时 %ums，重启中…",
                   (unsigned)s_ota_written,
                   (unsigned)(millis() - s_ota_start_ms));
-            server.send(200, "text/plain", "OTA 成功，设备将重启");
-            delay(500);
+            ota_wdt_on_restore();
+            /* 前端 xhr.onload 解析 JSON 判断成败，别发纯文本 */
+            server.send(200, "application/json",
+                        "{\"ok\":true,\"info\":\"OTA 成功，设备将重启\"}");
+            /* 给响应留足flush时间（弱信号下 500ms 不一定发得出去） */
+            delay(1000);
             ESP.restart();
         } else {
             Update.printError(Serial);
             log_e("OTA end 失败（累计写入 %u）", (unsigned)s_ota_written);
-            server.send(500, "text/plain", "OTA 失败（Update.end 校验未过）");
+            ota_wdt_on_restore();
+            server.send(500, "application/json",
+                        "{\"ok\":false,\"info\":\"OTA 失败（Update.end 校验未过）\"}");
         }
+    } else if (upload.status == UPLOAD_FILE_ABORTED) {
+        /* 客户端半途断开：library 走这条，END 不会来，必须在这里收尾，
+           否则看门狗一直退订着 + flash 半边新固件没人管 */
+        Update.abort();
+        log_w("OTA: 客户端中断上传（已写入 %u 字节，已丢弃）",
+              (unsigned)s_ota_written);
+        ota_wdt_on_restore();
     }
 }
 
@@ -930,6 +1026,15 @@ void web_server_start(void)
 void web_server_handle(void)
 {
     server.handleClient();
+
+    /* OTA 看门狗保险丝：客户端半途断开时 upload 的 END 不会触发
+       （library 走 UPLOAD_FILE_ABORTED，已在那里恢复；这里再兜一层）。
+       主循环恢复后若 20s 没有新的上传进度，就把看门狗订阅加回来，
+       避免系统长期裸奔；真卡死时 10s 后 panic 自恢复。 */
+    if (s_ota_wdt_off && (millis() - s_ota_last_prog_ms > 20000)) {
+        log_w("OTA: 上传疑似已中断，恢复任务看门狗");
+        ota_wdt_on_restore();
+    }
 }
 
 int web_net_mode(void)

@@ -10,6 +10,9 @@
  *   - ADC2 降级处理（WiFi 占用时 GPIO11~13 读不到）
  */
 
+/* ams_log.h 必须第一个 include：劫持 log_i/log_w/log_e，
+   让串口日志同步进网页「设备日志」面板（详见头文件注释）。 */
+#include "ams_log.h"
 #include "filament_sensor.h"
 #include "board_pins.h"
 

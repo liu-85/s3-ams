@@ -1960,10 +1960,19 @@
             '（' + (f.size / 1024).toFixed(0) + ' KB）… 期间不要断电。</div>';
 
         /* ★ 用 XHR 而不是 fetch —— 只有 XHR 能拿到上传进度，
-           而 OTA 要几十秒，没进度条用户一定会以为死了 */
+           而 OTA 要几十秒，没进度条用户一定会以为死了
+           ★ 必须用 FormData（multipart/form-data）裸发 octet-stream：
+             arduino-esp32 的 WebServer 对非 multipart 的 POST 会把整个
+             body 一次性 readBytesWithTimeout 进 RAM（1MB+ 的固件在不开
+             PSRAM 的 S3 上读到一半 realloc 失败 → 连接被掐断 → 一直
+             "上传中断"）。multipart 走流式 parseForm，每 1436 字节回调
+             一次 server.upload()，边收边写 flash，内存恒定。
+           ★ 千万不要手动 setRequestHeader('Content-Type') ——
+             边界串必须由浏览器自动生成，手写就把 multipart 毁了 */
         var xhr = new XMLHttpRequest();
         xhr.open('POST', '/ota_upload', true);
-        xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+        var fd = new FormData();
+        fd.append('firmware', f, f.name);
 
         xhr.upload.onprogress = function (e) {
             if (e.lengthComputable) {
@@ -2002,7 +2011,7 @@
                 '请检查网络后重试（备用分区不会被写坏）</div>';
             toast('上传中断', 'bad');
         };
-        xhr.send(f);
+        xhr.send(fd);
     }
 
     /* =======================================================================
