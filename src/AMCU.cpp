@@ -11,6 +11,8 @@
 #include "AMCU.h"
 #include <Arduino.h>
 #include <driver/gpio.h>
+#include <Preferences.h>
+#include "current_sense.h"
 
 // ============================
 //  硬件参数定义
@@ -35,6 +37,125 @@ _filament_motion_state_set act = waiting;
 bool ams_enable = true;
 float target = 0;
 
+/* Web "485 运动执行" 开关的 setter：
+   打开 → 打印机点进料/退料会真的驱动本机电机（立即生效）
+   关闭 → 只走协议层，不驱动电机
+   之前 /act485_set 走 handle_ok 占位，根本没碰这个变量。 */
+void amcu_set_ams_enable(bool en)
+{
+    ams_enable = en;
+    log_i("485 运动执行开关 -> %s", en ? "ON（驱动电机）" : "OFF（仅协议）");
+}
+
+/* ============================
+ *  手动点动（Web 硬件调试 / 堵转阈值实测）
+ * ============================
+ * 流程：jog_start 记录参数 → 每循环 jog_pump：
+ *   吸合目标离合（异步）→ 到时限自动 AMCU_drive_stop
+ * 点动期间 AMCU_motion 让出总线（否则 waiting 状态会把它立刻停掉）。
+ * 堵转保护跳闸时也立即结束点动（见 jog_pump 内的 tripped 检查）。 */
+
+/* 虚拟计米状态（时间法，无 AS5600；声明提前供点动复用） */
+static uint32_t s_last_drive_ms = 0;
+static bool     s_driving_now   = false;
+
+static bool      s_jog_active = false;
+static uint32_t  s_jog_end_ms = 0;
+static int       s_jog_channel = 0;
+static motor_dir_t s_jog_dir = MOTOR_DIR_STOP;
+static int       s_jog_pct = MOTOR_SPEED_FULL;
+
+int  jog_time_ms = 1000;     /* 点动时长默认 1s */
+int  jog_speed_pct = 100;    /* 点动 PWM 默认 100%（实测电机启动阈值用） */
+
+#define JOG_TIME_MS_MIN 200
+#define JOG_TIME_MS_MAX 60000
+#define JOG_PCT_MIN     5
+#define JOG_PCT_MAX     100
+
+static void jog_config_load(void)
+{
+    Preferences prefs;
+    prefs.begin("s3ams-jog", true);
+    jog_time_ms   = prefs.getInt("time_ms", 1000);
+    jog_speed_pct = prefs.getInt("speed_pct", 100);
+    prefs.end();
+    if (jog_time_ms < JOG_TIME_MS_MIN) jog_time_ms = JOG_TIME_MS_MIN;
+    if (jog_time_ms > JOG_TIME_MS_MAX) jog_time_ms = JOG_TIME_MS_MAX;
+    if (jog_speed_pct < JOG_PCT_MIN) jog_speed_pct = JOG_PCT_MIN;
+    if (jog_speed_pct > JOG_PCT_MAX) jog_speed_pct = JOG_PCT_MAX;
+}
+
+void jog_config_set(int ms, int pct)
+{
+    if (ms < JOG_TIME_MS_MIN) ms = JOG_TIME_MS_MIN;
+    if (ms > JOG_TIME_MS_MAX) ms = JOG_TIME_MS_MAX;
+    if (pct < JOG_PCT_MIN) pct = JOG_PCT_MIN;
+    if (pct > JOG_PCT_MAX) pct = JOG_PCT_MAX;
+    jog_time_ms = ms;
+    jog_speed_pct = pct;
+    Preferences prefs;
+    prefs.begin("s3ams-jog", false);
+    prefs.putInt("time_ms", jog_time_ms);
+    prefs.putInt("speed_pct", jog_speed_pct);
+    prefs.end();
+    log_i("点动参数已更新: %ums @ %d%%（duty %u/255）",
+          (unsigned)jog_time_ms, jog_speed_pct,
+          (unsigned)motor_pct_to_duty(jog_speed_pct));
+}
+
+bool amcu_jog_start(int channel, int dir, int ms, int pct)
+{
+    if (channel < 1 || channel > BOARD_CHANNEL_COUNT) return false;
+    if (dir != MOTOR_DIR_FEED && dir != MOTOR_DIR_RETRACT) return false;
+    if (ms < JOG_TIME_MS_MIN) ms = JOG_TIME_MS_MIN;
+    if (ms > JOG_TIME_MS_MAX) ms = JOG_TIME_MS_MAX;
+    if (pct < JOG_PCT_MIN) pct = JOG_PCT_MIN;
+    if (pct > JOG_PCT_MAX) pct = JOG_PCT_MAX;
+
+    s_jog_channel = channel;
+    s_jog_dir = (motor_dir_t)dir;
+    s_jog_pct = pct;
+    s_jog_end_ms = millis() + ms;
+    s_jog_active = true;
+    log_i("点动开始: 通道%d %s %ums @ %d%%（duty %u/255）",
+          channel, dir == MOTOR_DIR_FEED ? "进料" : "退料",
+          (unsigned)ms, pct, (unsigned)motor_pct_to_duty(pct));
+    return true;
+}
+
+static void amcu_jog_pump(void)
+{
+    if (!s_jog_active) return;
+
+    /* 堵转保护跳闸 → 立即结束点动（电机/离合已由保护回调停掉） */
+    if (current_sense_tripped()) {
+        s_jog_active = false;
+        return;
+    }
+
+    if ((int32_t)(millis() - s_jog_end_ms) >= 0) {
+        AMCU_drive_stop();
+        s_jog_active = false;
+        log_i("点动结束（到时自动停止）");
+        return;
+    }
+
+    if (clutch_is_engaged(s_jog_channel)) {
+        /* 离合已咬合：按点动速度驱动（幂等，同方向同速度不重写） */
+        motor_set_dir_speed(s_jog_dir, s_jog_pct);
+        s_driving_now = true;
+    } else if (!clutch_is_busy()) {
+        /* 发起离合吸合请求（异步）；吸合后下一循环本函数给电机 */
+        AMCU_drive_channel(s_jog_channel, s_jog_dir, s_jog_pct);
+    }
+}
+
+bool amcu_jog_busy(void)
+{
+    return s_jog_active;
+}
+
 // 退料状态（兼容原逻辑）
 bool is_need_pull_back = false;
 int now_filament_num_need_pull_back = 255;
@@ -57,9 +178,6 @@ float target_meters = 0.0f;        /* 目标送料距离（米）；0 = 不限�
  * 仅用于 get_filament_meters() 数值累加（显示/记录），
  * 当 target_meters == 0 时不参与停料判断。 */
 #define FILAMENT_PUSH_M_PER_SEC     0.05f
-static uint32_t s_last_drive_ms = 0;
-static bool     s_driving_now   = false;
-
 /* 累计到 filament_meters 的推进（虚拟计米；本硬件无 AS5600，用时间法） */
 static void accumulate_feed_meters(int f)
 {
@@ -311,6 +429,16 @@ void AMCU_init() {
     motor_init();
     clutch_init();
     clutch_task_start();  /* 启动非阻塞离合后台任务（修 Web 卡顿） */
+    jog_config_load();
+
+    /* 电机电流采样（AT8236 ISEN / GPIO3）+ 堵转保护 */
+    current_sense_init();
+    /* 堵转跳闸动作：停电机 + 异步断离合（电流模块不直接依赖离合，走回调） */
+    current_sense_set_stall_cb([]() {
+        log_w("堵转保护：执行停机（电机停 + 离合断）");
+        AMCU_drive_stop();
+    });
+
     AMCU_drive_stop();
     RGB_BLUE;
 
@@ -373,6 +501,21 @@ void AMCU_motion() {
 
     /* ★ 关键：结算上一笔挂起的离合请求（非阻塞，Web 不卡） */
     AMCU_clutch_pump();
+
+    /* 手动点动进行中：总线归点动用，状态机让出
+       （否则 waiting 分支每循环 AMCU_drive_stop 会把点动立刻停掉） */
+    if (s_jog_active) {
+        amcu_jog_pump();
+        return;
+    }
+
+    /* 堵转保护 latch 期间禁止状态机再次驱动电机
+       （否则 驱动→跳闸→停止→再驱动 无限循环；清除用 /current_clear） */
+    if (current_sense_tripped()) {
+        AMCU_drive_stop();
+        RGB_RED;
+        return;
+    }
 
     /* 累计虚拟计米（时间法，本硬件无 AS5600） */
     if (s_driving_now && cur >= 0 && cur < MAX_FILAMENT_NUM) {

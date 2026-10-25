@@ -11,6 +11,7 @@
 #include "clutch.h"
 #include "motor.h"
 #include "filament_sensor.h"
+#include "current_sense.h"
 #include "BambuBus.h"
 #include "AMCU.h"
 
@@ -50,10 +51,64 @@ static size_t s_log_tail = 0;
 static bool s_log_full = false;
 
 /* App 版本 */
-static const char *APP_VERSION = "1.0.0-s3ams";
+static const char *APP_VERSION = "1.1.0-s3ams";
 
 /* 单 IO 双微动：每路一个 ADC 脚（开始位/停止位共用同一脚，电阻编码） */
 static const int BOARD_SENSOR_PINS[BOARD_CHANNEL_COUNT] = BOARD_PIN_SENSOR_ARRAY;
+
+/* ==========================================================================
+ * 简易 JSON 取值（前端 body 都是 {"k":v,...} 小对象，没必要上 ArduinoJson）
+ *   json_get_int/double：找到 "key" 后的冒号，解析其后的数字
+ *   多字段 body 也安全（不会像 indexOf("}") 那样把后一个字段吃进来）
+ * ========================================================================== */
+static bool json_get_int(const String &body, const char *key, long *out)
+{
+    String k = String("\"") + key + "\"";
+    int idx = body.indexOf(k);
+    if (idx < 0) return false;
+    idx = body.indexOf(':', idx + k.length());
+    if (idx < 0) return false;
+    idx++;
+    while (idx < (int)body.length() &&
+           (body[idx] == ' ' || body[idx] == '\t' || body[idx] == '\n' || body[idx] == '\r')) {
+        idx++;
+    }
+    bool neg = false;
+    if (idx < (int)body.length() && body[idx] == '-') { neg = true; idx++; }
+    long v = 0;
+    bool any = false;
+    while (idx < (int)body.length() && isDigit((unsigned char)body[idx])) {
+        v = v * 10 + (body[idx] - '0');
+        idx++;
+        any = true;
+    }
+    if (!any) return false;
+    *out = neg ? -v : v;
+    return true;
+}
+
+static bool json_get_double(const String &body, const char *key, double *out)
+{
+    String k = String("\"") + key + "\"";
+    int idx = body.indexOf(k);
+    if (idx < 0) return false;
+    idx = body.indexOf(':', idx + k.length());
+    if (idx < 0) return false;
+    idx++;
+    while (idx < (int)body.length() &&
+           (body[idx] == ' ' || body[idx] == '\t' || body[idx] == '\n' || body[idx] == '\r')) {
+        idx++;
+    }
+    int start = idx;
+    if (idx < (int)body.length() && body[idx] == '-') idx++;
+    while (idx < (int)body.length() &&
+           (isDigit((unsigned char)body[idx]) || body[idx] == '.')) {
+        idx++;
+    }
+    if (idx == start || (idx == start + 1 && body[start] == '-')) return false;
+    *out = body.substring(start, idx).toDouble();
+    return true;
+}
 
 /* ==========================================================================
  * 日志
@@ -220,6 +275,11 @@ static void handle_status(void)
     json += "\"build_time\":\"" + String(__TIME__) + "\",";
     json += "\"build_date\":\"" + String(__DATE__) + "\",";
     json += "\"comm_mode\":2,";  // 485 直连（自动）
+    json += "\"comm_mode_text\":\"RS-485 直连打印机（BambuBus）\",";
+    json += "\"wifi_on\":1,";  // WiFi 常开（本固件无 MQTT 模式）
+    json += "\"act485\":" + String(ams_enable ? 1 : 0) + ",";  // 485 运动执行开关回显
+    json += "\"jog_ms\":" + String(jog_time_ms) + ",";
+    json += "\"jog_speed_pct\":" + String(jog_speed_pct) + ",";
     json += "\"current_access\":" + String((cur >= 0) ? (cur + 1) : 0) + ",";
     json += "\"mem_free\":" + String(esp_get_free_heap_size()) + ",";
     json += "\"mem_min_free\":0,";
@@ -247,8 +307,28 @@ static void handle_status(void)
             "\"limits\":[],\"motor_direction\":" + String((int)motor_get_dir()) +
             ",\"conflicts\":" + String(clutch_conflict_count()) + "},";
 
-    /* ===== 电流采样（本板型未实现连续采样，如实告知前端） ===== */
-    json += "\"current\":{\"board\":false},";
+    /* ===== 电流采样（AT8236 ISEN / GPIO3）+ 堵转保护 ===== */
+    json += "\"current\":{";
+    json += "\"board\":" + String(BOARD_CURRENT_SENSE_ENABLED ? "true" : "false") + ",";
+    if (current_sense_ready()) {
+        json += "\"ready\":true,";
+        json += "\"enabled\":" + String(current_sense_enabled() ? "true" : "false") + ",";
+        json += "\"mv\":" + String(current_sense_mv()) + ",";
+        json += "\"ma\":" + String(current_sense_ma()) + ",";
+        json += "\"peak_mv\":" + String(current_sense_peak_mv()) + ",";
+        json += "\"peak_ma\":" + String(current_sense_peak_ma()) + ",";
+        json += "\"tripped\":" + String(current_sense_tripped() ? "true" : "false") + ",";
+        json += "\"trips\":" + String((unsigned long)current_sense_trips()) + ",";
+        json += "\"r_mohm\":" + String(current_sense_r_mohm()) + ",";
+        /* V = I×R → mV/A 数值上就等于 R(mΩ)（200mΩ = 200mV/A） */
+        json += "\"mv_per_a\":" + String(current_sense_r_mohm()) + ",";
+        json += "\"stall_ma\":" + String(current_sense_stall_ma()) + ",";
+        json += "\"stall_ms\":" + String(current_sense_stall_ms()) + ",";
+        json += "\"blank_ms\":" + String(current_sense_blank_ms());
+    } else {
+        json += "\"ready\":false";
+    }
+    json += "},";
 
     /* ===== 传感器（双微动 ADC） ===== */
     json += "\"sensors\":{";
@@ -482,6 +562,173 @@ static void handle_diag_reset(void)
     server.send(200, "application/json", "{\"ok\":true,\"info\":\"已清除离合冲突计数\"}");
 }
 
+/* 485 运动执行开关（Web 驱动 ams_enable）
+   前端 post('/act485_set', {on:0|1})，on=1 打开、on=0 关闭。
+   之前走 handle_ok 占位 → 根本没碰 ams_enable，勾选不生效。 */
+static void handle_act485_set(void)
+{
+    if (!server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"ok\":false,\"err\":\"no body\"}");
+        return;
+    }
+    String body = server.arg("plain");
+    int oidx = body.indexOf("\"on\"");
+    int on = -1;
+    if (oidx >= 0) on = body.substring(oidx + 4, body.indexOf("}", oidx)).toInt();
+
+    amcu_set_ams_enable(on == 1);
+    String resp = on == 1
+        ? "{\"ok\":true,\"info\":\"485 运动执行已打开（打印机点进料/退料会驱动本机电机）\"}"
+        : "{\"ok\":true,\"info\":\"485 运动执行已关闭（仅走协议，不驱动电机）\"}";
+    server.send(200, "application/json", resp);
+}
+
+/* ==========================================================================
+ * 电机电流采样 / 堵转保护（AT8236 ISEN · GPIO3）
+ * ========================================================================== */
+
+/* /current_set：{r_mohm, stall_ma, stall_ms, blank_ms} 全部可选；
+   或 {reset:1} 恢复默认。返回夹取后实际生效的值。 */
+static void handle_current_set(void)
+{
+    if (!server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"ok\":false,\"err\":\"no body\"}");
+        return;
+    }
+    String body = server.arg("plain");
+
+    if (body.indexOf("\"reset\"") >= 0) {
+        current_sense_reset_defaults();
+    } else {
+        int r   = current_sense_r_mohm();
+        int sma = current_sense_stall_ma();
+        int sms = current_sense_stall_ms();
+        int bms = current_sense_blank_ms();
+        bool changed = false;
+        long v;
+        double d;
+        if (json_get_int(body, "r_mohm", &v))   { r = (int)v;   changed = true; }
+        if (json_get_int(body, "stall_ma", &v)) { sma = (int)v; changed = true; }
+        if (json_get_int(body, "stall_ms", &v)) { sms = (int)v; changed = true; }
+        if (json_get_int(body, "blank_ms", &v)) { bms = (int)v; changed = true; }
+        if (json_get_double(body, "stall_ma", &d)) { sma = (int)d; changed = true; }
+        if (changed) {
+            current_sense_set_config(r, sma, sms, bms);
+        } else {
+            server.send(200, "application/json", "{\"ok\":true,\"info\":\"没有要保存的项\"}");
+            return;
+        }
+    }
+
+    const char *info = current_sense_stall_ma() > 0
+        ? "已保存并生效（堵转保护开启）"
+        : "已保存并生效（阈值 0 = 只显示、不保护）";
+    String resp = "{\"ok\":true,\"info\":\"" + String(info) + "\"" +
+        ",\"r_mohm\":" + String(current_sense_r_mohm()) +
+        ",\"stall_ma\":" + String(current_sense_stall_ma()) +
+        ",\"stall_ms\":" + String(current_sense_stall_ms()) +
+        ",\"blank_ms\":" + String(current_sense_blank_ms()) + "}";
+    server.send(200, "application/json", resp);
+}
+
+/* /current_clear：清除堵转 latch + 峰值窗口 */
+static void handle_current_clear(void)
+{
+    current_sense_clear();
+    server.send(200, "application/json",
+        "{\"ok\":true,\"info\":\"已清除堵转 latch 与峰值（电机可再次驱动）\"}");
+}
+
+/* /current_channel_set：本机单电机共享，电流采样不区分通道 —— 收下但不假装生效 */
+static void handle_current_channel_set(void)
+{
+    server.send(200, "application/json",
+        "{\"ok\":true,\"info\":\"本机单个共享电机，电流采样不区分通道\"}");
+}
+
+/* ==========================================================================
+ * 手动点动（/jog_set 存参数，/hardware_test 执行一次）
+ * ========================================================================== */
+
+/* /jog_set：{seconds, speed_pct} 各自可选，没传的保持原值 */
+static void handle_jog_set(void)
+{
+    if (!server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"ok\":false,\"err\":\"no body\"}");
+        return;
+    }
+    String body = server.arg("plain");
+    int ms = jog_time_ms;
+    int pct = jog_speed_pct;
+    bool changed = false;
+    long v;
+    double d;
+    if (json_get_double(body, "seconds", &d)) { ms = (int)(d * 1000.0); changed = true; }
+    if (json_get_int(body, "speed_pct", &v))  { pct = (int)v; changed = true; }
+
+    if (changed) jog_config_set(ms, pct);
+
+    String resp = String("{\"ok\":true,\"info\":\"点动参数已保存\"") +
+        ",\"jog_ms\":" + String(jog_time_ms) +
+        ",\"jog_speed_pct\":" + String(jog_speed_pct) + "}";
+    server.send(200, "application/json", resp);
+}
+
+/* /hardware_test：{channel, direction} —— 按点动参数驱动一次（非阻塞，到时自停） */
+static void handle_hardware_test(void)
+{
+    if (!server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"ok\":false,\"err\":\"no body\"}");
+        return;
+    }
+    String body = server.arg("plain");
+    long ch = 0, dir = 0;
+    json_get_int(body, "channel", &ch);
+    json_get_int(body, "direction", &dir);
+
+    if (ch < 1 || ch > BOARD_CHANNEL_COUNT || (dir != 1 && dir != -1)) {
+        server.send(400, "application/json",
+            "{\"ok\":false,\"info\":\"参数错误：channel 1~8，direction ±1\"}");
+        return;
+    }
+    if (current_sense_tripped()) {
+        server.send(200, "application/json",
+            "{\"ok\":false,\"info\":\"堵转保护已动作（latch），请先「清除故障/峰值」\"}");
+        return;
+    }
+    if (amcu_jog_busy() || clutch_is_busy()) {
+        server.send(200, "application/json",
+            "{\"ok\":false,\"info\":\"上一次动作尚未结束，请稍候\"}");
+        return;
+    }
+
+    bool ok = amcu_jog_start((int)ch, (int)dir, jog_time_ms, jog_speed_pct);
+    if (!ok) {
+        server.send(200, "application/json", "{\"ok\":false,\"info\":\"点动启动失败\"}");
+        return;
+    }
+    String resp = "{\"ok\":true,\"info\":\"通道" + String((int)ch) +
+        (dir == 1 ? " 进料" : " 退料") + " " + String(jog_time_ms) +
+        "ms @ " + String(jog_speed_pct) + "%（duty " +
+        String((unsigned)motor_pct_to_duty(jog_speed_pct)) + "/255）\"}";
+    server.send(200, "application/json", resp);
+}
+
+/* /comm_set：本固件固定 RS-485 直连打印机（BambuBus），没有可切的通信模式 */
+static void handle_comm_set(void)
+{
+    if (!server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"ok\":false,\"err\":\"no body\"}");
+        return;
+    }
+    String body = server.arg("plain");
+    long mode = 2;
+    json_get_int(body, "mode", &mode);
+    log_i("comm_set: 请求模式 %ld（本固件固定 RS-485 直连，无其他模式）", mode);
+    server.send(200, "application/json",
+        "{\"ok\":true,\"info\":\"本固件固定 RS-485 直连打印机（BambuBus），无需切换通信模式\"}");
+}
+
 /* ==========================================================================
  * 启动
  * ========================================================================== */
@@ -502,15 +749,18 @@ void web_server_start(void)
     server.on("/wifi_set", HTTP_POST, handle_wifi_set);
     server.on("/ota_upload", HTTP_POST, handle_ota_upload);
     server.on("/diag_reset", HTTP_POST, handle_diag_reset);
-    server.on("/current_set", HTTP_POST, handle_ok);
-    server.on("/current_clear", HTTP_POST, handle_ok);
+    server.on("/current_set", HTTP_POST, handle_current_set);
+    server.on("/current_clear", HTTP_POST, handle_current_clear);
+    server.on("/current_channel_set", HTTP_POST, handle_current_channel_set);
+    server.on("/jog_set", HTTP_POST, handle_jog_set);
+    server.on("/hardware_test", HTTP_POST, handle_hardware_test);
+    server.on("/comm_set", HTTP_POST, handle_comm_set);
     server.on("/assist_set", HTTP_POST, handle_ok);
     server.on("/retract_set", HTTP_POST, handle_ok);
     server.on("/temper_set", HTTP_POST, handle_ok);
     server.on("/access_set", HTTP_POST, handle_ok);
     server.on("/color_set", HTTP_POST, handle_ok);
-    server.on("/comm_set", HTTP_POST, handle_ok);
-    server.on("/jog_set", HTTP_POST, handle_ok);
+    server.on("/act485_set", HTTP_POST, handle_act485_set);
     server.onNotFound(handle_not_found);
 
     server.begin();

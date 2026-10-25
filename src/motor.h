@@ -17,7 +17,8 @@
 
 /* 速度百分比（0~100） */
 #define MOTOR_SPEED_FULL 100
-#define MOTOR_SPEED_485_FEED 90  /* 485 进料占空比 90% */
+/* 485 进料占空比：实测电机需 ≥80 才转得动，留足裕量取满占空比 */
+#define MOTOR_SPEED_485_FEED 100
 
 /* 方向 */
 typedef enum {

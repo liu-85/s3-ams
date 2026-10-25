@@ -157,6 +157,10 @@ static int sensor_read_mv(int i)
 static int sensor_classify(int mv)
 {
     if (mv < 0) return COMBO_MID;  /* 读不到时保持中间 */
+    /* ★ 无信号门限：微动未接/悬空时 ADC 读 ~371mV 噪声，正好落 START 区
+       （371 < 433）导致 A1/A2 间隔误触发。低于 BOARD_SENSOR_MV_NOISE
+       视为无动作（中间态），只有读到稳定的 START/STOP 分压才认。 */
+    if (mv < BOARD_SENSOR_MV_NOISE) return COMBO_MID;
     if (mv < BOARD_SENSOR_MV_START) return COMBO_START;
     if (mv > BOARD_SENSOR_MV_STOP) return COMBO_STOP;
     return COMBO_MID;

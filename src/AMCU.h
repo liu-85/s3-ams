@@ -64,6 +64,18 @@ extern float target_meters;
 extern float last_pullback_meters[MAX_FILAMENT_NUM];
 extern float target_meters;
 
+// 485 运动执行开关（Web 驱动）
+void amcu_set_ams_enable(bool en);
+extern bool ams_enable;
+
+// ==================== 手动点动（Web /hardware_test，测电流/占空比用）====================
+// 非阻塞：吸合离合 → 按 dir/pct 驱动电机 → 到时限自动停并断离合
+bool amcu_jog_start(int channel, int dir, int ms, int pct);
+bool amcu_jog_busy(void);
+extern int jog_time_ms;      // 点动时长（ms），默认 1000
+extern int jog_speed_pct;    // 点动 PWM 占空比（%），默认 100
+void jog_config_set(int ms, int pct);  // 夹取 + NVS 持久化
+
 // 缓冲器辅助送料（打印时由微动驱动）
 void AMCU_buffer_assist_feed(int channel);
 
