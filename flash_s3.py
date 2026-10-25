@@ -54,20 +54,43 @@ def find_esptool():
     sys.exit("找不到 esptool.exe，请用 pip install esptool 或修改脚本")
 
 
-def write_flash(port, bl, pt, fw):
+def _esptool_cmd(port, *args):
+    """拼 esptool 命令行（兼容 exe 与 python -m esptool 两种安装形态）"""
     esptool = find_esptool()
-    cmd = [
-        sys.executable, esptool if esptool != "esptool" else "-m",
-        "esptool" if esptool == "esptool" else "",
-        "--port", port, "--chip", "esp32s3", "--baud", "460800",
-        "write_flash",
-        "0x0", str(bl),
-        "0x8000", str(pt),
-        "0x20000", str(fw),
-    ]
     if esptool != "esptool":
-        cmd = [esptool, "--port", port, "--chip", "esp32s3", "--baud", "460800",
-               "write_flash", "0x0", str(bl), "0x8000", str(pt), "0x20000", str(fw)]
+        return [esptool, "--port", port, "--chip", "esp32s3", "--baud", "460800", *args]
+    return [sys.executable, "-m", "esptool", "--port", port, "--chip", "esp32s3",
+            "--baud", "460800", *args]
+
+
+def erase_otadata(port):
+    """★ 2026-10-25 血的教训：必须擦 otadata（0xF000 / 0x2000）
+
+    网页 OTA 成功后，otadata 会被改成指向 ota_1。此后串口刷机只写
+    ota_0@0x20000 —— bootloader 按 otadata 仍然从 ota_1 启动，
+    也就是**新固件刷进去了但根本没跑**。症状：
+      - 串口日志里没有 "Loaded app from partition at offset 0x20000"
+      - 明明改了代码、编译刷机都成功，行为却一点没变
+      - /status 的 app_version 还是上一版
+    擦掉 otadata（全 0xFF）后，bootloader 回退到第一个有效 app = ota_0。
+    """
+    print("=== 擦除 otadata（0xF000/0x2000）：强制下次从 ota_0 启动 ===")
+    cmd = _esptool_cmd(port, "erase_region", "0xF000", "0x2000")
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    out = (r.stdout or "") + (r.stderr or "")
+    if r.returncode != 0 or "not found" in out.lower():
+        print("⚠ otadata 擦除失败（设备可能仍从 ota_1 启动）：")
+        print(out[-400:])
+        return False
+    print("  otadata 已擦除")
+    return True
+
+
+def write_flash(port, bl, pt, fw):
+    cmd = _esptool_cmd(port, "write_flash",
+                       "0x0", str(bl),
+                       "0x8000", str(pt),
+                       "0x20000", str(fw))
     print("=== 三段刷写：boot@0x0 + part@0x8000 + app@0x20000（保留 NVS）===")
     print("  bootloader : ", bl, f"({bl.stat().st_size}B)")
     print("  partitions : ", pt, f"({pt.stat().st_size}B)")
@@ -134,6 +157,7 @@ def main():
         bl, pt, fw = default_artifacts()
 
     write_flash(args.port, bl, pt, fw)
+    erase_otadata(args.port)   # 必须在写完之后擦：否则 OTA 残留会把启动拽回 ota_1
     if not args.no_watch:
         time.sleep(1)
         watch_boot(args.port)

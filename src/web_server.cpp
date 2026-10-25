@@ -94,9 +94,19 @@ void web_log(const char *msg)
         }
     }
 
-    /* 超长截断；保证结尾有 '\0' */
-    strncpy(s_log_lines[s_log_next], msg, LOG_LINE_LEN - 1);
-    s_log_lines[s_log_next][LOG_LINE_LEN - 1] = '\0';
+    /* 截断时回退到完整 UTF-8 字符边界（v1.1.8）：
+       中文日志常在 LOG_LINE_LEN-1 字节处被切断，留下半个汉字
+       （如 0xE6 后面没有 continuation 字节）→ /log 返回的 JSON 里
+       出现非法 UTF-8 → 前端 JSON.parse 直接抛错，日志面板空白。
+       回退规则：截断点若落在 continuation 字节(10xxxxxx)上，
+       一路退到该字符的 lead 字节，整个字符丢弃。 */
+    size_t n = strlen(msg);
+    if (n > (size_t)(LOG_LINE_LEN - 1)) {
+        n = LOG_LINE_LEN - 1;
+        while (n > 0 && ((unsigned char)msg[n] & 0xC0) == 0x80) n--;
+    }
+    memcpy(s_log_lines[s_log_next], msg, n);
+    s_log_lines[s_log_next][n] = '\0';
 
     s_log_rep[s_log_next] = 0;
     s_log_seqs[s_log_next] = ++s_log_seq;
@@ -155,7 +165,7 @@ void web_log_install_hook(void)
 }
 
 /* App 版本 */
-static const char *APP_VERSION = "1.1.7-s3ams";
+static const char *APP_VERSION = "1.1.8-s3ams";
 
 /* 单 IO 双微动：每路一个 ADC 脚（开始位/停止位共用同一脚，电阻编码） */
 static const int BOARD_SENSOR_PINS[BOARD_CHANNEL_COUNT] = BOARD_PIN_SENSOR_ARRAY;
@@ -509,10 +519,13 @@ static void handle_log(void)
     for (int i = 0; i < count; i++) {
         if (i) json += ",";
         json += "\"";
-        /* 转义 " 与 \（日志里可能有路径/引号） */
+        /* 转义 " 与 \；控制字符换成空格（日志里偶有 \r 等，
+           直接塞进 JSON 会让前端 JSON.parse 失败） */
         for (const char *p = lines[i]; *p; p++) {
-            if (*p == '"' || *p == '\\') json += '\\';
-            json += *p;
+            unsigned char c = (unsigned char)*p;
+            if (c < 0x20) { json += ' '; continue; }
+            if (c == '"' || c == '\\') json += '\\';
+            json += (char)c;
         }
         /* 连续重复的消息合并显示为「… ×N」（rep 是第 1 次之后的重复数） */
         if (reps[i] > 0) json += " \xC3\x97" + String(reps[i] + 1);
