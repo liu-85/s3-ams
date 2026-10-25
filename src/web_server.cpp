@@ -155,7 +155,7 @@ void web_log_install_hook(void)
 }
 
 /* App 版本 */
-static const char *APP_VERSION = "1.1.5-s3ams";
+static const char *APP_VERSION = "1.1.6-s3ams";
 
 /* 单 IO 双微动：每路一个 ADC 脚（开始位/停止位共用同一脚，电阻编码） */
 static const int BOARD_SENSOR_PINS[BOARD_CHANNEL_COUNT] = BOARD_PIN_SENSOR_ARRAY;
@@ -471,10 +471,20 @@ static void handle_log(void)
 {
     /* 行式缓冲直接导出 {"log":[...], "seq":[...], "mem_free":N}，
        与前端 renderLog 的增量渲染协议对齐（按 seq 只追加新行）。
-       读的时候拿锁拷一份，JSON 拼接在锁外做。 */
-    char lines[LOG_LINE_CAP][LOG_LINE_LEN];
-    uint32_t seqs[LOG_LINE_CAP];
-    uint16_t reps[LOG_LINE_CAP];
+       读的时候拿锁拷一份，JSON 拼接在锁外做。
+
+       ★★★ v1.1.6 血的教训：这里原来是**栈上**数组
+       char lines[48][160] ≈ 7.7KB。Arduino loopTask 栈只有 8KB，
+       叠加 WebServer 的 handleClient→_handleRequest 调用链直接
+       **栈溢出 panic**。症状极具误导性：
+         - /log 一抓设备就重启（返回空/超时）
+         - 更毒的是：网页 OTA 上传要几十秒，前端每 2 秒 pollLog 一次，
+           上传期间第一次轮询就崩 → OTA 连接断 → "升级失败"
+         - v1.1.2~1.1.5 的 OTA 失败、"/log 为空"都有它的份
+       handle_log 只在 loopTask 单线程调用，改 static 零风险。 */
+    static char     lines[LOG_LINE_CAP][LOG_LINE_LEN];
+    static uint32_t seqs[LOG_LINE_CAP];
+    static uint16_t reps[LOG_LINE_CAP];
     int count = 0;
     portENTER_CRITICAL(&s_log_mux);
     int start = (s_log_count < LOG_LINE_CAP) ? 0 : s_log_next;
@@ -487,7 +497,10 @@ static void handle_log(void)
     }
     portEXIT_CRITICAL(&s_log_mux);
 
-    String json = "{\"log\":[";
+    /* 一次 reserve 到位，避免 48 次 += 反复 realloc 拖慢弱网响应 */
+    String json;
+    json.reserve(LOG_LINE_CAP * (LOG_LINE_LEN + 24) + 64);
+    json = "{\"log\":[";
     for (int i = 0; i < count; i++) {
         if (i) json += ",";
         json += "\"";

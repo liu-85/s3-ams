@@ -1323,7 +1323,7 @@ static const char *WEB_STYLE_CSS =
 "}\n"
 "";
 
-// 来源: web/app.js  (82844 字节)
+// 来源: web/app.js  (83211 字节)
 static const char *WEB_APP_JS =
   "/* ===========================================================================\n"
 "   ESP-AMS-S3 配置界面前端\n"
@@ -3283,6 +3283,11 @@ static const char *WEB_APP_JS =
 "        var bar = prog.getElementsByTagName('i')[0];\n"
 "        prog.style.display = 'block';\n"
 "        bar.style.width = '0%';\n"
+"        /* ★ 上传一开始就暂停日志轮询：OTA 要几十秒，期间每 2 秒一次\n"
+"           的 pollLog 会和上传抢这台单客户端的 Web 服务器，弱信号下\n"
+"           还可能把上传连接拖垮（v1.1.5 实测教训）。成功路径保持\n"
+"           暂停等设备重启；失败/中断时在下面恢复，方便看设备日志。 */\n"
+"        logPaused = true;\n"
 "        $('ota_box').innerHTML = '<div class=\"tip\">正在上传 ' + esc(f.name) +\n"
 "            '（' + (f.size / 1024).toFixed(0) + ' KB）… 期间不要断电。</div>';\n"
 "\n"
@@ -3328,12 +3333,16 @@ static const char *WEB_APP_JS =
 "                    }\n"
 "                }, 1000);\n"
 "            } else {\n"
+"                /* 失败：恢复日志轮询，让「设备日志」面板把固件记录的\n"
+"                   OTA 失败原因（OTA end 失败/写入失败…）显示出来 */\n"
+"                logPaused = false;\n"
 "                $('ota_box').innerHTML = '<div class=\"tip err\">' +\n"
 "                    esc((d && d.info) || ('上传失败（HTTP ' + xhr.status + '）')) + '</div>';\n"
 "                toast('升级失败', 'bad');\n"
 "            }\n"
 "        };\n"
 "        xhr.onerror = function () {\n"
+"            logPaused = false;\n"
 "            $('ota_box').innerHTML = '<div class=\"tip err\">上传中断，' +\n"
 "                '请检查网络后重试（备用分区不会被写坏）</div>';\n"
 "            toast('上传中断', 'bad');\n"

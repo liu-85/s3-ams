@@ -1956,6 +1956,11 @@
         var bar = prog.getElementsByTagName('i')[0];
         prog.style.display = 'block';
         bar.style.width = '0%';
+        /* ★ 上传一开始就暂停日志轮询：OTA 要几十秒，期间每 2 秒一次
+           的 pollLog 会和上传抢这台单客户端的 Web 服务器，弱信号下
+           还可能把上传连接拖垮（v1.1.5 实测教训）。成功路径保持
+           暂停等设备重启；失败/中断时在下面恢复，方便看设备日志。 */
+        logPaused = true;
         $('ota_box').innerHTML = '<div class="tip">正在上传 ' + esc(f.name) +
             '（' + (f.size / 1024).toFixed(0) + ' KB）… 期间不要断电。</div>';
 
@@ -2001,12 +2006,16 @@
                     }
                 }, 1000);
             } else {
+                /* 失败：恢复日志轮询，让「设备日志」面板把固件记录的
+                   OTA 失败原因（OTA end 失败/写入失败…）显示出来 */
+                logPaused = false;
                 $('ota_box').innerHTML = '<div class="tip err">' +
                     esc((d && d.info) || ('上传失败（HTTP ' + xhr.status + '）')) + '</div>';
                 toast('升级失败', 'bad');
             }
         };
         xhr.onerror = function () {
+            logPaused = false;
             $('ota_box').innerHTML = '<div class="tip err">上传中断，' +
                 '请检查网络后重试（备用分区不会被写坏）</div>';
             toast('上传中断', 'bad');
