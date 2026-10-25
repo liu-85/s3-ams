@@ -155,7 +155,7 @@ void web_log_install_hook(void)
 }
 
 /* App 版本 */
-static const char *APP_VERSION = "1.1.6-s3ams";
+static const char *APP_VERSION = "1.1.7-s3ams";
 
 /* 单 IO 双微动：每路一个 ADC 脚（开始位/停止位共用同一脚，电阻编码） */
 static const int BOARD_SENSOR_PINS[BOARD_CHANNEL_COUNT] = BOARD_PIN_SENSOR_ARRAY;
@@ -367,6 +367,11 @@ static void handle_status(void)
     json += "\"jog_speed_pct\":" + String(jog_speed_pct) + ",";
     json += "\"current_access\":" + String((cur >= 0) ? (cur + 1) : 0) + ",";
     json += "\"mem_free\":" + String(esp_get_free_heap_size()) + ",";
+    /* 主循环任务栈的历史最小剩余字节（v1.1.7 加）：
+       8KB 栈时 /log 请求会把栈用穿（Stack canary panic），
+       现在栈加到 32KB，这个值能直接看出余量够不够 ——
+       稳定运行后应 >20KB；若掉到 2KB 以下说明还要加栈。 */
+    json += "\"stack_free\":" + String((unsigned)uxTaskGetStackHighWaterMark(NULL)) + ",";
     json += "\"mem_min_free\":0,";
     json += "\"uptime\":" + String((long)millis()) + ",";
 
