@@ -32,6 +32,27 @@ static const char *s_owner = NULL;     /* 当前占用者名 */
 static bool     s_busy = false;        /* 是否处于复合动作中 */
 static uint32_t s_conflicts = 0;       /* 累计违规次数 */
 
+/* ★ v1.1.9：引脚回读能力标记
+ *
+ * 踩过的坑：ESP-IDF 的 gpio_config(GPIO_MODE_OUTPUT) 只打开输出驱动，
+ * 会把输入缓冲关掉（IO_MUX 的 FUN_IE=0）。此时 gpio_get_level() 读回来的
+ * 恒为 0 —— 于是 clutch_engaged_mask() 永远返回 0：
+ *   - clutch_is_engaged() 永远 false → AMCU_drive_channel() 永远走
+ *     "未吸合，异步发起"分支 → 电机永远不被 motor_set_dir_speed() 启动
+ *   - 现场症状：送料时离合"咔"一声响了，电机却一点不动、电流 0mA
+ * 修法：配置成 GPIO_MODE_INPUT_OUTPUT（输出 + 输入缓冲都开），
+ *      并在 init 里做一次"写吸合电平读回"自检；
+ *      万一自检失败（不同 IDF 版本行为差异），退回软件记账 s_active。 */
+static bool     s_readback_ok = true;
+
+static inline uint8_t s_sw_mask(void)
+{
+    if (s_active >= 1 && s_active <= BOARD_CHANNEL_COUNT) {
+        return (uint8_t)(1u << (s_active - 1));
+    }
+    return 0;
+}
+
 /* ==========================================================================
  * 底层：唯一碰引脚的地方
  * ========================================================================== */
@@ -69,7 +90,16 @@ uint8_t clutch_engaged_mask(void)
             mask |= (uint8_t)(1u << i);
         }
     }
+    /* 回读不可信时用软件记账兜底（否则整条送料链会因 mask=0 而永不启动电机） */
+    if (!s_readback_ok && mask == 0) {
+        return s_sw_mask();
+    }
     return mask;
+}
+
+bool clutch_readback_ok(void)
+{
+    return s_readback_ok;
 }
 
 bool clutch_is_engaged(int channel)
@@ -127,7 +157,9 @@ bool clutch_init(void)
     for (int i = 0; i < BOARD_CHANNEL_COUNT; i++) {
         gpio_config_t cfg = {
             .pin_bit_mask = (1ULL << s_pins[i]),
-            .mode         = GPIO_MODE_OUTPUT,
+            /* ★ 必须是 INPUT_OUTPUT：OUTPUT-only 会关掉输入缓冲，
+               gpio_get_level() 恒 0，导致离合状态永远读不到（详见文件头注释） */
+            .mode         = GPIO_MODE_INPUT_OUTPUT,
             .pull_up_en   = GPIO_PULLUP_DISABLE,
             .pull_down_en = GPIO_PULLDOWN_DISABLE,
             .intr_type    = GPIO_INTR_DISABLE,
@@ -147,6 +179,19 @@ bool clutch_init(void)
     s_conflicts = 0;
     clutch_apply_all_off(false);
 
+    /* 引脚回读自检：写一次"吸合"电平立刻读回（只加电 ~1ms，不会真的吸合） */
+    if (bad < BOARD_CHANNEL_COUNT) {
+        gpio_set_level((gpio_num_t)s_pins[0], s_active_level);
+        vTaskDelay(pdMS_TO_TICKS(1));
+        s_readback_ok = (gpio_get_level((gpio_num_t)s_pins[0]) == s_active_level);
+        gpio_set_level((gpio_num_t)s_pins[0], s_inactive_level);
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    if (!s_readback_ok) {
+        log_e("★ 离合引脚回读不可信（GPIO_MODE_INPUT_OUTPUT 仍读不到吸合电平）"
+              " —— 改用软件记账判断吸合状态");
+    }
+
     /* 上电回读自检 */
     {
         uint8_t stuck = clutch_engaged_mask();
@@ -163,8 +208,9 @@ bool clutch_init(void)
         }
     }
 
-    log_i("%d 路电磁离合已初始化（高电平吸合，吸合等待%ums）%s",
+    log_i("%d 路电磁离合已初始化（高电平吸合，吸合等待%ums，回读%s）%s",
           BOARD_CHANNEL_COUNT, (unsigned)CLUTCH_ENGAGE_MS,
+          s_readback_ok ? "正常" : "不可信(用软件记账)",
           bad ? "  ★ 有脚配置失败" : "");
     return (bad < BOARD_CHANNEL_COUNT);
 }
@@ -216,9 +262,9 @@ bool clutch_engage(int channel)
         return false;
     }
 
-    /* 5) 吸合目标 */
-    clutch_apply_one(index, true, true);
+    /* 5) 吸合目标（先记账再等机械稳定：回读兜底模式要靠 s_active 判状态） */
     s_active = channel;
+    clutch_apply_one(index, true, true);
 
     xSemaphoreGive(s_lock);
     return true;

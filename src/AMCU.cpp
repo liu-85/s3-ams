@@ -252,6 +252,19 @@ static clutch_req_t *s_pending_clutch = NULL;
 static motor_dir_t s_pending_dir = MOTOR_DIR_STOP;
 static int         s_pending_speed = MOTOR_SPEED_FULL;
 
+/* v1.1.9：挂起请求的类型/通道。
+ *
+ * 之前每次调用都无条件 clutch_request_*()，而 AMCU_drive_channel() 在
+ * need_send_out 分支里是**每循环**调用的（主循环几百 Hz）：
+ *   - 离合队列（8 深）瞬间塞满 → clutch_queue_push 走兜底分支，
+ *     退化成在主循环里同步执行 clutch_engage()（内含 80ms+60ms vTaskDelay）
+ *     → 主循环被卡、WEB 变慢、485 接收延迟
+ *   - req_slot 只有 4 个槽，epoch 每请求 ++ → 句柄被反复回收，
+ *     clutch_result_poll() 永远等不到完成
+ * 修法：同一目标通道已有挂起请求时不再重复入队；换目标才重新请求。 */
+static int         s_pending_kind = 0;   /* 0=无, 1=吸合, 3=全断 */
+static int         s_pending_ch   = 0;
+
 /**
  * 吸合指定通道离合 + 设定电机方向（异步，不阻塞主循环/Web）
  * @param channel 通道号 1~8（对应料盘位）
@@ -281,15 +294,22 @@ bool AMCU_drive_channel(int channel, motor_dir_t dir, int speed_pct)
         motor_set_dir_speed(dir, speed_pct);
         s_current_channel = channel;
         s_pending_clutch = NULL;
+        s_pending_kind = 0;
         s_driving_now = true;
         s_last_drive_ms = millis();
     } else {
-        /* 未吸合：异步发起，等后台任务完成（下一循环 poll 成功再驱动电机） */
-        s_pending_clutch = clutch_request_engage(channel);
+        /* 未吸合：异步发起，等后台任务完成（下一循环 poll 成功再驱动电机）
+           ★ 同一通道已有挂起请求时不重复入队（否则队列被塞满 → 主循环被同步
+             clutch_engage() 卡住 80ms+，WEB 卡顿、485 收包延迟） */
+        if (s_pending_clutch == NULL || s_pending_kind != 1 || s_pending_ch != channel) {
+            s_pending_clutch = clutch_request_engage(channel);
+            s_pending_kind = 1;
+            s_pending_ch = channel;
+            /* 记住这次要跑的方向/速度，咬合后 pump 按它启动电机 */
+            s_pending_dir = dir;
+            s_pending_speed = speed_pct;
+        }
         s_current_channel = channel;
-        /* 记住这次要跑的方向/速度，咬合后 pump 按它启动电机 */
-        s_pending_dir = dir;
-        s_pending_speed = speed_pct;
         /* 本周期不启动电机：要等离合机械咬合后才给电，避免打滑 */
         s_driving_now = false;
         RGB_GREEN;
@@ -305,42 +325,69 @@ bool AMCU_drive_channel(int channel, motor_dir_t dir, int speed_pct)
 void AMCU_clutch_pump()
 {
     if (s_pending_clutch == NULL) return;
-    int want = s_current_channel;
-    if (want < 1 || want > BOARD_CHANNEL_COUNT) {
-        s_pending_clutch = NULL;
-        s_driving_now = false;
-        return;
-    }
-    if (clutch_is_engaged(want)) {
-        /* 离合已咬合 → 按挂起时记下的方向/速度启动电机
-           （不能用 motor_get_dir()：电机还没启过，拿到的是 STOP） */
-        motor_set_dir_speed(s_pending_dir, s_pending_speed);
-        s_pending_clutch = NULL;
-        s_pending_dir = MOTOR_DIR_STOP;
-        s_driving_now = true;
-        s_last_drive_ms = millis();
-    } else if (clutch_result_poll(s_pending_clutch)) {
-        /* 后台已处理完；再确认吸合电平 */
-        s_pending_clutch = NULL;
+
+    const bool done = clutch_result_poll(s_pending_clutch);
+
+    if (s_pending_kind == 1) {
+        /* ---- 吸合请求 ---- */
+        int want = s_pending_ch;
+        if (want < 1 || want > BOARD_CHANNEL_COUNT) {
+            s_pending_clutch = NULL;
+            s_pending_kind = 0;
+            s_driving_now = false;
+            return;
+        }
         if (clutch_is_engaged(want)) {
+            /* 离合已咬合 → 按挂起时记下的方向/速度启动电机
+               （不能用 motor_get_dir()：电机还没启过，拿到的是 STOP） */
             motor_set_dir_speed(s_pending_dir, s_pending_speed);
+            s_pending_clutch = NULL;
+            s_pending_kind = 0;
             s_pending_dir = MOTOR_DIR_STOP;
             s_driving_now = true;
             s_last_drive_ms = millis();
+        } else if (done) {
+            /* 后台已处理完但电平仍不对（吸合失败）：放弃本笔，
+               下一循环 AMCU_drive_channel() 会重新发起，避免死等 */
+            s_pending_clutch = NULL;
+            s_pending_kind = 0;
+            s_driving_now = false;
         }
+        /* 未完成：什么都不做，等下一循环（非阻塞，Web 不受影响） */
+        return;
     }
-    /* 未完成：什么都不做，等下一循环（非阻塞，Web 不受影响） */
+
+    /* ---- 断开请求：完成或已确认全断就清掉挂起 ---- */
+    if (done || clutch_engaged_mask() == 0) {
+        s_pending_clutch = NULL;
+        s_pending_kind = 0;
+    }
+    s_driving_now = false;
 }
 
 /**
  * 停止电机 + 异步释放所有离合
+ *
+ * ★ 幂等：本函数在 case waiting/default 里是**每循环**调用的。
+ *   之前无条件 clutch_request_release_all()，队列瞬间塞满后
+ *   clutch_queue_push 退化成主循环内同步 clutch_release_all()（60ms 延时）
+ *   → 主循环被卡、WEB 卡、485 掉包。现在只有"确实还没断"时才入队。
  */
 void AMCU_drive_stop()
 {
     motor_stop();
-    s_pending_clutch = clutch_request_release_all();  /* 非阻塞，后台吸收时序 */
-    s_current_channel = 0;
     s_driving_now = false;
+    s_current_channel = 0;
+    s_pending_dir = MOTOR_DIR_STOP;
+
+    const bool already_releasing = (s_pending_kind == 3 && s_pending_clutch != NULL);
+    const bool already_off = (s_pending_clutch == NULL && clutch_engaged_mask() == 0);
+
+    if (!already_releasing && !already_off) {
+        s_pending_clutch = clutch_request_release_all();
+        s_pending_kind = 3;
+        s_pending_ch = 0;
+    }
     RGB_BLUE;
 }
 
@@ -491,7 +538,11 @@ void AMCU_run() {
             RGB_GREEN;
         }
     } else if (state == need_send_out) {
-        s_last_action[now_f] = (uint8_t)need_send_out;
+        /* ★ 不要在这里写 s_last_action[now_f]：
+           AMCU_motion() 的 case need_send_out 靠 "s_last_action != need_send_out"
+           来判断"刚进入送料"，用它记录 last_pullback_meters 基准。
+           这里抢先写成 need_send_out 会让基准永远不记录（恒 0），
+           一旦 target_meters>0 就会立刻判"已到位"→ 送一点就停。 */
         RGB_GREEN;
     } else if (state == waiting) {
         s_last_action[now_f] = (uint8_t)waiting;
@@ -578,8 +629,11 @@ void AMCU_motion() {
         break;
 
     case need_send_out: {
-        /* 进入送料前，记录"当前基准"（Tianshu 语义） */
-        if (s_last_action[cur] != (uint8_t)need_send_out) {
+        /* 进入送料前，记录"当前基准"（Tianshu 语义）。
+           entered 只在"刚进入送料"这一个周期为真 → 下面的日志只打一次，
+           不会刷屏，但能在网页「设备日志」里直接看到这一轮送料是启动还是被挡。 */
+        const bool entered = (s_last_action[cur] != (uint8_t)need_send_out);
+        if (entered) {
             last_pullback_meters[cur] = get_filament_meters(cur);
             s_last_action[cur] = (uint8_t)need_send_out;
         }
@@ -593,9 +647,17 @@ void AMCU_motion() {
             break;
         }
         if (is_filament_online(cur)) {
-            AMCU_drive_channel(ch, MOTOR_DIR_FEED, MOTOR_SPEED_485_FEED);
+            bool driving = AMCU_drive_channel(ch, MOTOR_DIR_FEED, MOTOR_SPEED_485_FEED);
+            if (entered) {
+                log_i("送料开始: 料位%d→通道%d PWM=%d%% 电机%s",
+                      cur, ch, MOTOR_SPEED_485_FEED,
+                      driving ? "已启动" : "等离合吸合后启动");
+            }
             RGB_GREEN;
         } else {
+            if (entered) {
+                log_w("送料被挡: 料位%d 被判为离线(online=0)，不驱动电机", cur);
+            }
             AMCU_drive_stop();
             RGB_BLUE;
         }

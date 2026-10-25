@@ -857,17 +857,24 @@ void send_for_Dxx(unsigned char *buf, int length)
     }
     else if (read_num == 0xFF && statu_flags == 0x03 && fliment_motion_flag == 0x00)
     {
-        uint8_t now_ch = data_save.BambuBus_now_filament_num % 4;
-        if (filament_ext[AMS_num][now_ch].motion == _filament_motion_internal::before_pull_back)
+        /* ★ 必须先判 < 16：BambuBus_now_filament_num 初值/全复位后是 0xFF，
+           0xFF % 4 == 3 → 会去改"通道3"，把真正的送料通道漏掉 */
+        if (data_save.BambuBus_now_filament_num < 16)
         {
-            set_motion_internal(AMS_num, now_ch, _filament_motion_internal::pull_back);
+            uint8_t now_ch = data_save.BambuBus_now_filament_num % 4;
+            if (filament_ext[AMS_num][now_ch].motion == _filament_motion_internal::before_pull_back)
+            {
+                set_motion_internal(AMS_num, now_ch, _filament_motion_internal::pull_back);
+            }
         }
     }
     else if (read_num == 0xFF && statu_flags == 0x01)
     {
-        uint8_t now_ch = data_save.BambuBus_now_filament_num % 4;
-        if (now_ch < 4)
+        /* ★ 同上：0xFF % 4 == 3 的坑。未确定当前料位时直接忽略，
+           不能瞎清通道 3（否则真实送料通道永远停不下来 / 被误清） */
+        if (data_save.BambuBus_now_filament_num < 16)
         {
+            uint8_t now_ch = data_save.BambuBus_now_filament_num % 4;
             set_motion_internal(AMS_num, now_ch, _filament_motion_internal::idle);
             time_sendout_onuse_ticks[now_ch] = 0;
         }

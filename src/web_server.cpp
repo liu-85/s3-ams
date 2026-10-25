@@ -165,7 +165,7 @@ void web_log_install_hook(void)
 }
 
 /* App 版本 */
-static const char *APP_VERSION = "1.1.8-s3ams";
+static const char *APP_VERSION = "1.1.9-s3ams";
 
 /* 单 IO 双微动：每路一个 ADC 脚（开始位/停止位共用同一脚，电阻编码） */
 static const int BOARD_SENSOR_PINS[BOARD_CHANNEL_COUNT] = BOARD_PIN_SENSOR_ARRAY;
@@ -396,6 +396,45 @@ static void handle_status(void)
     json += "\"diag\":{\"conflicts\":" + String(clutch_conflict_count()) +
             ",\"exchange_ok\":0,\"exchange_fail\":0,\"last_error\":\"—\",\"last_error_ms\":-1}";
     json += "},";
+
+    /* ===== 送料链诊断（v1.1.9 加）=====
+       一次就能看出"该送料但电机不转"卡在哪一环：
+         motion=1(need_send_out) 才该驱动；
+         online=0 → 该料位被判离线，AMCU 会 drive_stop；
+         printing=1 → 判成"打印中"，AMCU_motion 直接让出、不驱动；
+         tripped=1 → 堵转 latch，状态机被禁止驱动（用 /current_clear 清）；
+         jog=1 → 点动没结束，状态机让出；
+         clutch_mask=0 而离合实际在响 → 引脚回读有问题（clutch_rb=0）。 */
+    {
+        int dn = get_now_filament_num();
+        if (dn < 0 || dn >= 16) dn = 0;
+        _filament_motion_state_set dm = get_filament_motion(dn);
+        const char *dtxt = "waiting";
+        switch (dm) {
+        case need_pull_back: dtxt = "need_pull_back"; break;
+        case need_send_out:  dtxt = "need_send_out";  break;
+        case waiting:        dtxt = "waiting";        break;
+        case act_send_mm:    dtxt = "act_send_mm";    break;
+        case act_pull_mm:    dtxt = "act_pull_mm";    break;
+        case select_pos:     dtxt = "select_pos";     break;
+        case release_all:    dtxt = "release_all";    break;
+        case cancel:         dtxt = "cancel";         break;
+        }
+        json += "\"feed\":{";
+        json += "\"cur\":" + String(dn) + ",";
+        json += "\"motion\":" + String((int)dm) + ",";
+        json += "\"motion_text\":\"" + String(dtxt) + "\",";
+        json += "\"online\":" + String(is_filament_online(dn) ? 1 : 0) + ",";
+        json += "\"printing\":" + String(is_channel_printing(dn) ? 1 : 0) + ",";
+        json += "\"tripped\":" + String(current_sense_tripped() ? 1 : 0) + ",";
+        json += "\"jog\":" + String(amcu_jog_busy() ? 1 : 0) + ",";
+        json += "\"clutch_mask\":" + String((unsigned)clutch_engaged_mask()) + ",";
+        json += "\"clutch_rb\":" + String(clutch_readback_ok() ? 1 : 0) + ",";
+        json += "\"motor_dir\":" + String((int)motor_get_dir()) + ",";
+        json += "\"motor_pct\":" + String(motor_get_speed_pct()) + ",";
+        json += "\"cmd\":" + String(get_cmd_type());
+        json += "},";
+    }
 
     /* ===== 复位/诊断 ===== */
     json += "\"reset\":{\"cause\":\"—\",\"cause_desc\":\"—\",\"boot_count\":1,\"uptime_ms\":" + String((long)millis()) + "},";

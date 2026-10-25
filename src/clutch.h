@@ -46,6 +46,9 @@ int clutch_active_channel(void);
 /* 实际吸合掩码（bit0 = 通道1），读引脚 */
 uint8_t clutch_engaged_mask(void);
 
+/* 引脚回读是否可信（v1.1.9 加：不可信时 clutch_engaged_mask 用软件记账兜底） */
+bool clutch_readback_ok(void);
+
 /* 某通道是否吸合（读引脚） */
 bool clutch_is_engaged(int channel);
 
