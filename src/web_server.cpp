@@ -165,7 +165,7 @@ void web_log_install_hook(void)
 }
 
 /* App 版本 */
-static const char *APP_VERSION = "1.1.9-s3ams";
+static const char *APP_VERSION = "1.1.10-s3ams";
 
 /* 单 IO 双微动：每路一个 ADC 脚（开始位/停止位共用同一脚，电阻编码） */
 static const int BOARD_SENSOR_PINS[BOARD_CHANNEL_COUNT] = BOARD_PIN_SENSOR_ARRAY;
@@ -812,8 +812,14 @@ static void handle_ota_upload(void)
             /* 前端 xhr.onload 解析 JSON 判断成败，别发纯文本 */
             server.send(200, "application/json",
                         "{\"ok\":true,\"info\":\"OTA 成功，设备将重启\"}");
-            /* 给响应留足flush时间（弱信号下 500ms 不一定发得出去） */
-            delay(1000);
+            /* 主动把 TCP 发送缓冲推出去，再等一会儿才重启。
+               只靠 delay() 不够：ESP.restart() 会直接把 socket 掐断，
+               弱信号下浏览器连响应头都没读完就收到 RST →
+               XHR onerror → 页面报"上传中断/升级失败"，但固件其实写进去了
+               （2026-10-25 现场：报失败，刷新后版本号已经是新的）。
+               前端另有"版本号比对"兜底，这里尽量减少误报。 */
+            server.client().flush();
+            delay(1500);
             ESP.restart();
         } else {
             Update.printError(Serial);

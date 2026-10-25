@@ -536,17 +536,42 @@ void AMCU_run() {
             now_filament_num_need_pull_back = now_f;
             last_pullback_time = millis();
             RGB_GREEN;
+            log_i("退料开始: 料位%d→通道%d PWM=%d%%",
+                  now_f, now_f + 1, MOTOR_SPEED_FULL);
         }
-    } else if (state == need_send_out) {
-        /* ★ 不要在这里写 s_last_action[now_f]：
-           AMCU_motion() 的 case need_send_out 靠 "s_last_action != need_send_out"
-           来判断"刚进入送料"，用它记录 last_pullback_meters 基准。
-           这里抢先写成 need_send_out 会让基准永远不记录（恒 0），
-           一旦 target_meters>0 就会立刻判"已到位"→ 送一点就停。 */
-        RGB_GREEN;
-    } else if (state == waiting) {
-        s_last_action[now_f] = (uint8_t)waiting;
-        RGB_BLUE;
+    } else {
+        /* ★★ v1.1.10 关键修复：离开退料状态必须清 latch ★★
+         *
+         * 现场症状（2026-10-25 实测）：
+         *   第一次退料电机正常反转把料退出来；
+         *   第二次退料 —— 状态机明明切到了 need_pull_back（/status 的
+         *   feed.motion_text=need_pull_back），但电机=停止、离合=0x00、电流=0mA。
+         *
+         * 根因：s_last_need_pull_back[] 只在触发时置 true，
+         *   全项目**没有任何地方把它清回 false**
+         *   （本意是让 last_action_set() 去清，但那个函数定义了从未被调用）。
+         *   于是第二次进 need_pull_back 时 !s_last_need_pull_back[now_f] 为假
+         *   → is_need_pull_back 不置位 → AMCU_motion() 里那段
+         *   "if (is_need_pull_back) { ...退料驱动... }" 整块被跳过 → 电机不动。
+         *
+         * 参考 Tianshu 原版：它判断的是 last_action[now_f] != need_pull_back，
+         *   而 last_action[now_f] 在进入 waiting 时会被改写（第 419 行），
+         *   所以天然可以反复触发。移植时换成独立布尔 latch 却漏了复位。 */
+        if (s_last_need_pull_back[now_f]) {
+            s_last_need_pull_back[now_f] = false;
+        }
+
+        if (state == need_send_out) {
+            /* ★ 不要在这里写 s_last_action[now_f]：
+               AMCU_motion() 的 case need_send_out 靠 "s_last_action != need_send_out"
+               来判断"刚进入送料"，用它记录 last_pullback_meters 基准。
+               这里抢先写成 need_send_out 会让基准永远不记录（恒 0），
+               一旦 target_meters>0 就会立刻判"已到位"→ 送一点就停。 */
+            RGB_GREEN;
+        } else if (state == waiting) {
+            s_last_action[now_f] = (uint8_t)waiting;
+            RGB_BLUE;
+        }
     }
 
     // 运行 BambuBus 通信（含 UART 接收）
@@ -603,9 +628,18 @@ void AMCU_motion() {
             is_need_pull_back = false;
             now_filament_num_need_pull_back = 255;
 
+            /* ★ 本轮退料结束 → 清该通道的 latch，允许它以后再退一次。
+               只靠 AMCU_run 里"离开 need_pull_back 状态"来清是不够的：
+               退料途中打印机可能已经切到别的料位（now_f 变了），
+               那时 AMCU_run 清的是新料位的 latch，原通道的会一直留着 true。 */
+            if (pull_back_channel >= 0 && pull_back_channel < MAX_FILAMENT_NUM) {
+                s_last_need_pull_back[pull_back_channel] = false;
+            }
+
             if (ams_enable && pull_back_channel >= 0) {
                 set_filament_motion(pull_back_channel, waiting);
             }
+            log_i("退料结束: 料位%d 已反转 %d 秒，停电机", pull_back_channel, timeout_seconds);
             RGB_BLUE;
         } else {
             int ch = now_filament_num_need_pull_back + 1;
@@ -665,7 +699,14 @@ void AMCU_motion() {
     }
 
     case waiting:
-        AMCU_drive_stop();
+        /* ★ 退料进行中不要停电机（对应 Tianshu 原版
+           `if (!is_need_pull_back) switchInterrupt();`）：
+           打印机在退料途中切换当前料位时 cur 会变成别的通道，
+           那个通道的 act 是 waiting → 这里 AMCU_drive_stop() 会把
+           正在反转的退料电机掐掉，表现为"退料只转了一下就停"。 */
+        if (!is_need_pull_back) {
+            AMCU_drive_stop();
+        }
         RGB_BLUE;
         break;
 
@@ -715,7 +756,9 @@ void AMCU_motion() {
         break;
 
     default:
-        AMCU_drive_stop();
+        if (!is_need_pull_back) {
+            AMCU_drive_stop();
+        }
         RGB_BLUE;
         break;
     }
