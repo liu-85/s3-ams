@@ -28,7 +28,7 @@ struct SettingsData {
 #define SETTINGS_MAGIC_NUMBER    0x53415425  // "STA%" = Settings Active V5
 
 // 默认值定义
-#define DEFAULT_PULLBACK_TIMEOUT    7
+#define DEFAULT_PULLBACK_TIMEOUT    4
 #define DEFAULT_SLEEP_TIMEOUT_MIN   15
 #define DEFAULT_SCREEN_ALWAYS_ON    0
 #define DEFAULT_AMS_COUNT         4
@@ -57,3 +57,9 @@ bool settings_is_valid();
 
 // 获取指定电机的退料超时时间
 int get_motor_pullback_timeout(int motor_index);
+
+// 设置全局退料超时（所有通道统一），返回实际保存的秒数；非法返回 -1
+int settings_set_pullback_timeout_all(int sec);
+
+// 读取全局退料超时（所有通道相同时返回该值，否则返回通道0的值）
+int settings_get_pullback_timeout_common(void);

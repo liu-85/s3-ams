@@ -247,6 +247,23 @@
         </div>
 
         <div class="card">
+          <h2>退料时间 <span class="sub">自动换料退料超时 · 所有通道统一</span></h2>
+          <div class="row">
+            <input type="number" id="pullback_seconds" min="3" max="30" step="1" value="4">
+            <span style="align-self:center" class="dim">秒</span>
+            <button class="primary" style="flex:1" id="btn_pullback_save">保存退料时间</button>
+          </div>
+          <div class="tip">
+            <b>自动换料退料时长</b>：打印机换色时，本设备<b>退旧料允许的最长时间</b>，
+            所有通道<b>统一</b>。默认 <b>4 秒</b>（原为 7 秒）。填超范围会被夹到 3~30 秒。
+            <div class="hr"></div>
+            <b>只作用于自动换料退料</b>，<b>不影响</b>上面「手动点动」的时长（点动时长独立设置）。
+            <br>· 换色时<b>旧料还没退干净电机就停了</b> → 把这个值调大；
+            <br>· <b>退到位后还在空转</b>等超时 → 调小，能明显缩短换色等待。
+          </div>
+        </div>
+
+        <div class="card">
           <h2>电机电流采样 <span class="sub">AT8236 ISEN · GPIO3 · 堵转保护</span></h2>
           <div id="current_live" class="dim">读取中…</div>
 

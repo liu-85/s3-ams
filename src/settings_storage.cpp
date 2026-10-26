@@ -133,3 +133,20 @@ int get_motor_pullback_timeout(int motor_index) {
     }
     return DEFAULT_PULLBACK_TIMEOUT;
 }
+
+int settings_set_pullback_timeout_all(int sec) {
+    /* 合法范围与加载校验一致（settings_storage.cpp:54 的 3~30）。
+       本硬件是单电机 + 8 离合，全局一个值即可，这里统一写 16 路。 */
+    if (sec < 3 || sec > 30) return -1;
+    for (int i = 0; i < 16; i++) {
+        PULLBACK_TIMEOUT[i] = sec;
+    }
+    settings_save_to_flash();
+    return sec;
+}
+
+int settings_get_pullback_timeout_common(void) {
+    /* 各通道通常一致（由 settings_set_pullback_timeout_all 统一写过）。
+       返回通道 0 的值作为代表；万一不一致也安全（不崩溃）。 */
+    return PULLBACK_TIMEOUT[0];
+}

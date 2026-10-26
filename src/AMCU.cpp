@@ -16,6 +16,7 @@
 #include <driver/gpio.h>
 #include <Preferences.h>
 #include "current_sense.h"
+#include "settings_storage.h"
 
 // ============================
 //  硬件参数定义
@@ -949,7 +950,9 @@ void AMCU_motion() {
 
     // 退料超时处理
     if (is_need_pull_back) {
-        int timeout_seconds = 7;
+        /* 兜底值：只有 now_filament_num_need_pull_back 越界时才用。
+           正常走下面的 PULLBACK_TIMEOUT[]。与 DEFAULT_PULLBACK_TIMEOUT 保持一致（v1.1.18 改 4）。 */
+        int timeout_seconds = DEFAULT_PULLBACK_TIMEOUT;
         if (now_filament_num_need_pull_back >= 0 &&
             now_filament_num_need_pull_back < 4 * MAX_AMS_NUM) {
             timeout_seconds = PULLBACK_TIMEOUT[now_filament_num_need_pull_back];

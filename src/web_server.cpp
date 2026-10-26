@@ -18,6 +18,7 @@
 #include "bus485_raw.h"
 #include "BambuBus.h"
 #include "AMCU.h"
+#include "settings_storage.h"
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -165,7 +166,7 @@ void web_log_install_hook(void)
 }
 
 /* App 版本 */
-static const char *APP_VERSION = "1.1.17-s3ams";
+static const char *APP_VERSION = "1.1.18-s3ams";
 
 /* 单 IO 双微动：每路一个 ADC 脚（开始位/停止位共用同一脚，电阻编码） */
 static const int BOARD_SENSOR_PINS[BOARD_CHANNEL_COUNT] = BOARD_PIN_SENSOR_ARRAY;
@@ -386,6 +387,7 @@ static void handle_status(void)
     json += "\"act485\":" + String(ams_enable ? 1 : 0) + ",";  // 485 运动执行开关回显
     json += "\"jog_ms\":" + String(jog_time_ms) + ",";
     json += "\"jog_speed_pct\":" + String(jog_speed_pct) + ",";
+    json += "\"pullback_sec\":" + String(settings_get_pullback_timeout_common()) + ",";
     json += "\"current_access\":" + String((cur >= 0) ? (cur + 1) : 0) + ",";
     json += "\"mem_free\":" + String(esp_get_free_heap_size()) + ",";
     /* 主循环任务栈的历史最小剩余字节（v1.1.7 加）：
@@ -1158,6 +1160,35 @@ static void handle_ams_ver_set(void)
     server.send(200, "application/json", msg);
 }
 
+/* /pullback_set：改退料（自动换料退料）超时时间（v1.1.18）
+ *
+ * 前端 post('/pullback_set', {sec: 4})，单位秒，范围 3~30。
+ * 本硬件是单电机 + 8 离合，全局一个值，这里统一写 16 路并持久化。
+ * 改完立即生效（下一次退料就用新值），不用重启。 */
+static void handle_pullback_set(void)
+{
+    if (!server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"ok\":false,\"err\":\"no body\"}");
+        return;
+    }
+    String body = server.arg("plain");
+    long sec = 0;
+    if (!json_get_int(body, "sec", &sec)) {
+        server.send(400, "application/json", "{\"ok\":false,\"err\":\"缺少 sec\"}");
+        return;
+    }
+    int saved = settings_set_pullback_timeout_all((int)sec);
+    if (saved < 0) {
+        server.send(200, "application/json",
+            "{\"ok\":false,\"info\":\"退料时间需在 3~30 秒之间\"}");
+        return;
+    }
+    char msg[96];
+    snprintf(msg, sizeof(msg),
+             "{\"ok\":true,\"sec\":%d,\"info\":\"退料时间已保存（所有通道统一）\"}", saved);
+    server.send(200, "application/json", msg);
+}
+
 /* ==========================================================================
  * 启动
  * ========================================================================== */
@@ -1186,6 +1217,7 @@ void web_server_start(void)
     server.on("/hardware_test", HTTP_POST, handle_hardware_test);
     server.on("/comm_set", HTTP_POST, handle_comm_set);
     server.on("/ams_ver_set", HTTP_POST, handle_ams_ver_set);
+    server.on("/pullback_set", HTTP_POST, handle_pullback_set);
     server.on("/assist_set", HTTP_POST, handle_ok);
     server.on("/retract_set", HTTP_POST, handle_ok);
     server.on("/temper_set", HTTP_POST, handle_ok);

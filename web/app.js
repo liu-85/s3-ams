@@ -466,6 +466,11 @@
             syncJogPctInput(d.jog_speed_pct);
         }
 
+        /* ---- 退料时间（v1.1.18） ---- */
+        if (typeof d.pullback_sec === 'number' && d.pullback_sec > 0) {
+            syncPullbackInput(d.pullback_sec);
+        }
+
         /* ---- 硬件 ---- */
         updateHardware(d.hardware);
 
@@ -1521,6 +1526,35 @@
     }
 
     /* =======================================================================
+       退料时间（自动换料退料超时，v1.1.18 新增）
+       ======================================================================= */
+    function syncPullbackInput(sec) {
+        var el = $('pullback_seconds');
+        /* 正在输入时不覆盖：/status 每 2 秒来一次，
+           无脑写 value 会把用户刚敲的数字冲掉 */
+        if (el && document.activeElement !== el) {
+            var s = String(sec);
+            if (el.value !== s) el.value = s;
+        }
+    }
+
+    function savePullback() {
+        var v = parseInt(val('pullback_seconds'), 10);
+        if (isNaN(v)) {
+            toast('请填退料秒数', 'bad');
+            return;
+        }
+        if (v < 3 || v > 30) {
+            toast('退料时间请在 3~30 秒之间', 'bad');
+            return;
+        }
+        post('/pullback_set', { sec: v }, function (d) {
+            if (d && typeof d.sec === 'number') syncPullbackInput(d.sec);
+            toast((d && d.info) || '已保存', (d && d.ok) ? 'ok' : 'bad');
+        });
+    }
+
+    /* =======================================================================
        蠕动参数
        ======================================================================= */
     function saveCreep() {
@@ -2264,6 +2298,7 @@
         $('btn_access_save').onclick = saveAccess;
         $('btn_cur_channel_save').onclick = saveCurrentChannel;
         $('btn_jog_save').onclick = saveJog;
+        $('btn_pullback_save').onclick = savePullback;
         $('btn_creep_save').onclick = saveCreep;
         $('btn_assist_toggle').onclick = toggleAssist;
         $('btn_assist_hold').onclick = toggleAssistHold;
