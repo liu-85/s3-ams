@@ -6,6 +6,43 @@ RELEASE.md 在 `release/vX.Y.Z/`。
 
 ---
 
+## v1.1.19 —— WEB 控制台改版 + 网络配置补齐 MQTT 设置
+
+**2026-10-26**
+
+**需求**：
+1. 按 `E:\ai\sw\esp-ams静态控制台` 模板改版 WEB 页面。
+2. 网络配置里 MQTT 设置缺失（打印机 IP / 访问码 8 位 / 序列号），只剩一个「保存并连接」，补齐。
+
+**WEB 改版**（三件套整体替换，固件接口不变）：
+
+- 左侧栏 + 4 分组导航（监控 / 连接 / 调试 / 系统），序号 1-7
+- 新增独立「参数设置」页；微动并入「硬件调试」；打印机配置并入「网络配置」
+- 通道颜色改为**点色块弹窗选色**（预设 / 其他 / 自定义）
+- 硬件点动 **8 通道双列**（左 1-4 / 右 5-8）
+- 右侧固定日志列（可收起）；说明文字默认折叠
+
+**MQTT 设置补齐（根因）**：
+
+- 模板是静态控制台，MQTT 表单原本靠 `GET /get_mqtt_info` **动态生成**；
+  无设备/无接口时请求失败 → 表单不渲染 → 只剩「保存并连接」按钮。
+- 修复：表单改为 **index.html 静态字段**（打印机 IP / 访问码 8 位 / 序列号 /
+  用户名 / 端口 / 客户端 ID），永远显示；`loadMqttForm()` 改为只填值不重建 DOM。
+- 固件新增 `GET /get_mqtt_info`（不回传访问码）+ `POST /mqtt_connect`（存 NVS
+  `s3ams-mqtt`，掉电保留）；`/status` 的 `mqtt_configured` 动态化。
+- ⚠️ 本固件走 RS-485 直连，**MQTT 参数只保存，不实际连接**。
+
+**顺带补齐接口**（避免 404 弹「请求失败」）：
+
+- `POST /stop` → **真实现**：取消点动 + 停电机 + 断全部离合（新增 `amcu_jog_stop()`）
+- `POST /ap_set` → **真实现**：`wifi_start_ap()` / `wifi_stop_ap()`
+- `GET /boot_clear`、`POST /creep_set`、`POST /assist_test`、`POST /extruder_src_set`
+  → 统一回 `{"ok":false,"info":"本固件（RS-485 直连）不支持该操作"}`（新增 `handle_unsupported()`）
+
+**新增**：`json_get_str()`（简易 JSON 字符串字段解析，无需引入 ArduinoJson）。
+
+---
+
 ## v1.1.18 —— 退料时间改为 4 秒 + WEB 可调
 
 **2026-10-26**

@@ -117,33 +117,72 @@
     var PAGES = [
         ['status',    '运行状态', '1'],
         ['diag',      '上电诊断', '2'],
-        ['wifi',      'WiFi 配置', '3'],
-        ['mqtt',      '打印机配置', '4'],
-        ['access',    '通道设置', '5'],
-        ['hardware',  '硬件调试', '6'],
-        ['sensors',   '微动开关', '7'],
-        ['ota',       '系统升级', '8']
+        ['wifi',      '网络配置', '3'],
+        ['access',    '通道设置', '4'],
+        ['hardware',  '硬件调试', '5'],
+        ['params',    '参数设置', '6'],
+        ['ota',       '系统升级', '7']
     ];
+    /* 合并页（布局优化）：导航里「网络配置」一项同时承载 WiFi 配置 + 打印机配置。
+     * page_mqtt 不再单独出现在菜单，跟随 page_wifi 一起显示 / 隐藏。 */
+    var EXTRA_SECTIONS = { wifi: ['mqtt'] };
     var PAGE_KEY = 'ams.page';
+    /* 导航分组（布局优化）：按功能把页面归组，菜单里用分组标题分隔。
+     * PAGES 本身不变，showPage / 序号徽章逻辑照旧，只影响菜单外观。 */
+    var GROUPS = [
+        ['监控', ['status', 'diag']],
+        ['连接', ['wifi', 'access']],
+        ['调试', ['hardware', 'params']],
+        ['系统', ['ota']]
+    ];
 
     function buildMenu() {
         var nav = $('menu');
         nav.innerHTML = '';
-        PAGES.forEach(function (p) {
-            var a = document.createElement('a');
-            a.href = 'javascript:void(0)';
-            a.setAttribute('data-page', p[0]);
-            a.innerHTML = '<span>' + esc(p[1]) + '</span>' +
-                          '<span class="n">' + p[2] + '</span>';
-            a.onclick = function () { showPage(p[0]); toggleMenu(false); };
-            nav.appendChild(a);
+        GROUPS.forEach(function (g) {
+            var div = document.createElement('div');
+            div.className = 'menu-group';
+            div.textContent = g[0];
+            nav.appendChild(div);
+            g[1].forEach(function (key) {
+                var p = null;
+                for (var i = 0; i < PAGES.length; i++) {
+                    if (PAGES[i][0] === key) { p = PAGES[i]; break; }
+                }
+                if (!p) return;
+                var a = document.createElement('a');
+                a.href = 'javascript:void(0)';
+                a.setAttribute('data-page', p[0]);
+                a.innerHTML = '<span>' + esc(p[1]) + '</span>' +
+                              '<span class="n">' + p[2] + '</span>';
+                a.onclick = function () { showPage(p[0]); toggleMenu(false); };
+                nav.appendChild(a);
+            });
         });
     }
 
     function showPage(name) {
+        /* 防御：旧版可能把已合并的页面（如 'mqtt'）存进 localStorage。
+           若 name 不在当前页面集合，回退到运行状态，避免整页空白。 */
+        var valid = false;
+        for (var pi = 0; pi < PAGES.length; pi++) {
+            if (PAGES[pi][0] === name) { valid = true; break; }
+        }
+        if (!valid && !EXTRA_SECTIONS[name]) { name = 'status'; }
         PAGES.forEach(function (p) {
             var sec = $('page_' + p[0]);
             if (sec) sec.className = 'page' + (p[0] === name ? ' on' : '');
+        });
+        /* 合并页联动：先关掉所有被合并的 section，再打开当前页的合并项 */
+        Object.keys(EXTRA_SECTIONS).forEach(function (k) {
+            (EXTRA_SECTIONS[k] || []).forEach(function (s) {
+                var sec = $('page_' + s);
+                if (sec) sec.className = 'page';
+            });
+        });
+        (EXTRA_SECTIONS[name] || []).forEach(function (s) {
+            var sec = $('page_' + s);
+            if (sec) sec.className = 'page on';
         });
         var links = $('menu').getElementsByTagName('a');
         for (var i = 0; i < links.length; i++) {
@@ -451,7 +490,7 @@
                 lastAccessSig = sig;
             }
         } else if (!accessFromDevice) {
-            renderAccess([1, 2, 3, 4], DEFAULT_COLORS, cur);
+            renderAccess([1, 2, 3, 4, 5, 6, 7, 8], DEFAULT_COLORS, cur);
         }
         /* 同步「当前通道」下拉框（只在用户没正在操作时更新） */
         var curSel = $('cur_channel_sel');
@@ -498,7 +537,8 @@
     /* =======================================================================
        通道设置
        ======================================================================= */
-    var DEFAULT_COLORS = [0xd94f4f, 0x3f9d4f, 0x3f6fd9, 0xd9a93f];
+    var DEFAULT_COLORS = [0xd94f4f, 0x3f9d4f, 0x3f6fd9, 0xd9a93f,
+                          0x7a4fd9, 0x2fb8a5, 0xe57ad9, 0xd98a3f];
 
     function rgbToHex(v) {
         if (typeof v !== 'number') return '#3f6fd9';
@@ -523,12 +563,74 @@
                 html += '<option value="' + c + '"' +
                         (access[i] === c ? ' selected' : '') + '>通道 ' + c + '</option>';
             }
+            var colHex = rgbToHex(colors[i] !== undefined ? colors[i] : DEFAULT_COLORS[i]);
             html += '</select>' +
-                '<input type="color" class="swatch acc-col" data-idx="' + i + '" value="' +
-                rgbToHex(colors[i] !== undefined ? colors[i] : DEFAULT_COLORS[i]) + '">' +
+                '<div class="swatch acc-col" data-idx="' + i + '" data-color="' + colHex +
+                '" style="background:' + colHex + '" title="点我改颜色"></div>' +
                 '</div>';
         }
         box.innerHTML = html;
+        /* 点色块 → 弹出颜色选择器（2026-10-26：颜色设置做成弹窗） */
+        var sws = box.getElementsByClassName('acc-col');
+        for (var s = 0; s < sws.length; s++) {
+            sws[s].onclick = function () { openColorPop(parseInt(this.getAttribute('data-idx'), 10)); };
+        }
+    }
+
+    /* =======================================================================
+       颜色选择弹窗（2026-10-26：颜色设置做成弹窗，参考耗材色板）
+       ======================================================================= */
+    var COLOR_PRESET = [0xd94f4f, 0x3f9d4f, 0x3f6fd9, 0xd9a93f, 0x333333, 0xeeeeee,
+                        0x7a4fd9, 0x2fb8a5, 0xe57ad9, 0xd98a3f];
+    var COLOR_MORE = [0xf07a7a, 0x6bbf6b, 0x6b9af0, 0xe8c14f, 0x8a6a4a, 0xbfbfbf,
+                      0x5a5a5a, 0xa8d94f, 0x4fd9d9, 0x4f6fd9, 0xd94f9d, 0x9d4fd9];
+    var colorPopTarget = -1;
+
+    function buildColorGrid(containerId, arr) {
+        var el = $(containerId);
+        el.innerHTML = '';
+        for (var i = 0; i < arr.length; i++) {
+            var hx = rgbToHex(arr[i]);
+            var s = document.createElement('div');
+            s.className = 'cp-swatch';
+            s.style.background = hx;
+            s.setAttribute('data-color', hx);
+            s.onclick = function () { pickColor(this.getAttribute('data-color')); };
+            el.appendChild(s);
+        }
+    }
+
+    function openColorPop(idx) {
+        colorPopTarget = idx;
+        buildColorGrid('color_pop_preset', COLOR_PRESET);
+        buildColorGrid('color_pop_more', COLOR_MORE);
+        var curHex = '#3f6fd9';
+        var rows = $('access_info').getElementsByClassName('acc-row');
+        for (var i = 0; i < rows.length; i++) {
+            if (parseInt(rows[i].getAttribute('data-idx'), 10) === idx) {
+                var sw = rows[i].getElementsByClassName('acc-col')[0];
+                if (sw) curHex = sw.getAttribute('data-color') || curHex;
+                break;
+            }
+        }
+        if ($('color_pop_custom')) $('color_pop_custom').value = curHex;
+        $('color_pop').style.display = 'flex';
+    }
+    function closeColorPop() {
+        colorPopTarget = -1;
+        if ($('color_pop')) $('color_pop').style.display = 'none';
+    }
+    function pickColor(hex) {
+        if (colorPopTarget < 0) return;
+        var rows = $('access_info').getElementsByClassName('acc-row');
+        for (var i = 0; i < rows.length; i++) {
+            if (parseInt(rows[i].getAttribute('data-idx'), 10) === colorPopTarget) {
+                var sw = rows[i].getElementsByClassName('acc-col')[0];
+                if (sw) { sw.style.background = hex; sw.setAttribute('data-color', hex); }
+                break;
+            }
+        }
+        closeColorPop();
     }
 
     /** 只更新"使用中"标记，不重建整块 —— 否则用户正在改的下拉框会被冲掉 */
@@ -550,7 +652,10 @@
         var cols = $('access_info').getElementsByClassName('acc-col');
         var list = [], colors = [];
         for (var i = 0; i < sels.length; i++) list.push(parseInt(sels[i].value, 10));
-        for (var j = 0; j < cols.length; j++) colors.push(hexToNum(cols[j].value));
+        for (var j = 0; j < cols.length; j++) {
+            var cv = cols[j].getAttribute('data-color');
+            colors.push(hexToNum(cv || '#3f6fd9'));
+        }
 
         post('/access_set', { access_list: list, color_list: colors }, function (d) {
             accessFromDevice = false;
@@ -578,13 +683,13 @@
          *   旧代码写 `hw.channels && hw.channels.length` —— 数字没有 length，
          *   条件恒假 → 永远回退到写死的 [1,2,3,4]。这就是"固件编成 8 通道、
          *   网页却只画 4 路"的确切原因。
-         *   现在两种形状都接受（万一有固件给的是数组），都没有才退到 4。 */
+         *   现在两种形状都接受（万一有固件给的是数组），都没有才退到 8。 */
         var channels;
         if (Object.prototype.toString.call(hw.channels) === '[object Array]') {
             channels = hw.channels;
         } else {
             var nch = (typeof hw.channels === 'number' && hw.channels > 0)
-                ? hw.channels : 4;
+                ? hw.channels : 8;
             channels = [];
             for (var ci = 1; ci <= nch; ci++) channels.push(ci);
         }
@@ -677,16 +782,26 @@
         if (sig !== hwSig) {
             hwSig = sig;
             var box = $('hardware_test');
-            var h = '<div class="dim" style="font-size:13px">单通道点动（按住概念：按一次动一次）</div>';
-            for (var k = 0; k < channels.length; k++) {
-                h += '<div class="row" style="margin-top:8px">' +
-                     '<span style="flex:0 0 66px;align-self:center">通道' + channels[k] + '</span>' +
-                     '<button data-ch="' + channels[k] + '" data-dir="1" class="hw-feed"' +
-                     (busyNow ? ' disabled' : '') + ' style="flex:1">进料</button>' +
-                     '<button data-ch="' + channels[k] + '" data-dir="-1" class="hw-back"' +
-                     (busyNow ? ' disabled' : '') + ' style="flex:1">退料</button>' +
-                     '</div>';
+            var half = Math.ceil(channels.length / 2);
+            var h = '<div class="dim" style="font-size:13px">单通道点动（按住概念：按一次动一次）</div>' +
+                    '<div class="ch-grid">';
+            /* 两列：左侧通道 1..half，右侧 half+1..N */
+            for (var col = 0; col < 2; col++) {
+                h += '<div class="ch-col">';
+                for (var k = col * half; k < (col ? channels.length : half); k++) {
+                    h += '<div class="ch-item">' +
+                         '<div class="row" style="margin-top:8px">' +
+                         '<span style="flex:0 0 66px;align-self:center">通道' + channels[k] + '</span>' +
+                         '<button data-ch="' + channels[k] + '" data-dir="1" class="hw-feed"' +
+                         (busyNow ? ' disabled' : '') + ' style="flex:1">进料</button>' +
+                         '<button data-ch="' + channels[k] + '" data-dir="-1" class="hw-back"' +
+                         (busyNow ? ' disabled' : '') + ' style="flex:1">退料</button>' +
+                         '</div>' +
+                         '</div>';
+                }
+                h += '</div>';
             }
+            h += '</div>';
             box.innerHTML = h;
             var feeds = box.getElementsByClassName('hw-feed');
             var backs = box.getElementsByClassName('hw-back');
@@ -899,8 +1014,8 @@
         var chans = sg.ch || [];
         /* 本板型通道数：以固件下发的逐路状态数组长度为准（8 通道就是 8 项）。
          * ★ 不要写死 4 —— 写死的话 5~8 路的微动状态在网页上根本不存在，
-         *   用户会以为"8 通道没生效"。 */
-        var nch = chans.length || 4;
+         *   用户会以为"8 通道没生效"。拿不到状态时按 8 通道占位渲染。 */
+        var nch = chans.length || 8;
         /* ★ 2026-10-22：dual = 1 表示这一版接线是「每路 2 只微动合占 1 个 ADC 脚」
          *   （电阻编码）。此时 mv[i] 里有该路微动脚的实测电压，
          *   接错电阻/没接地一眼就看出来 */
@@ -983,6 +1098,8 @@
                     '打印 / 流量校准阶段由缓冲器微动决定送与停。</span></div>';
             }
             var havePin = 0;
+            var half = Math.ceil(nch / 2);
+            var cols = ['', ''];
             for (var i = 0; i < nch; i++) {
                 var bufOn = !!(enabled & (1 << i));   /* 这一路缓冲送料开着吗 */
                 var st = chans[i] || [0, 0];
@@ -992,7 +1109,8 @@
                 }
                 /* 两只微动都由「缓冲送料」这一个开关管 */
                 var use = [bufOn, bufOn];
-                html += '<div class="row" style="margin-top:10px;align-items:center">' +
+                var unit = '<div class="ch-item">' +
+                    '<div class="row" style="margin-top:10px;align-items:center">' +
                     '<span style="flex:0 0 72px">料盘位' + (i + 1) + '</span>' +
                     '<span class="badges" style="flex:1 1 auto;margin:0">';
                 for (var k = 0; k < 2; k++) {
@@ -1002,7 +1120,7 @@
                     var tip = noPin
                         ? '本板型没有给这个角色分配 GPIO'
                         : '';
-                    html += '<span class="badge' + (st[k] ? ' trig' : '') +
+                    unit += '<span class="badge' + (st[k] ? ' trig' : '') +
                             ((use[k] && !noPin) ? '' : ' off') + '"' +
                             (tip ? ' title="' + tip + '"' : '') +
                             '>' + names[k] + (st[k] ? ' 触发' : '') + '</span>';
@@ -1029,7 +1147,7 @@
                     pinLine = '接线：' + names[0] + ' ' + pinLabel(pn[0]) + ' · ' +
                               names[1] + ' ' + pinLabel(pn[1]);
                 }
-                html += '</span></div>' +
+                unit += '</span></div>' +
                     '<div class="dim" style="font-size:12px;margin:2px 0 0 72px">' +
                     pinLine +
                     '</div>' +
@@ -1040,8 +1158,12 @@
                     'class="sensor-toggle' + (bufOn ? ' primary' : ' ghost') + '" ' +
                     'data-en="' + (bufOn ? 1 : 0) + '">缓冲送料 ' +
                     (bufOn ? '已开' : '已关') + '</button>' +
+                    '</div>' +
                     '</div>';
+                cols[i < half ? 0 : 1] += unit;
             }
+            html += '<div class="ch-grid"><div class="ch-col">' + cols[0] +
+                    '</div><div class="ch-col">' + cols[1] + '</div></div>';
 
             /* 板型差异说明：C3 的 IO 装不下 4×2 只微动，网页上
              * 会看到很多「无」——先说清楚这是板型限制，不是接线问题。
@@ -1425,23 +1547,23 @@
     /* =======================================================================
        打印机配置
        ======================================================================= */
+    /* 表单字段在 index.html 里是**静态**的（打印机 IP / 访问码 / 序列号 / 用户名 / 端口 / 客户端ID）。
+     * 这里只把设备里已保存的值填进去，**不重建 DOM** ——
+     * 这样即使固件没有 /get_mqtt_info（本固件走 RS-485，MQTT 仅保存备用），
+     * 输入框也照样显示，不会只剩一个"保存并连接"按钮。 */
     function loadMqttForm() {
         get('/get_mqtt_info', function (d) {
             d = d || {};
-            var html = '' +
-                '<div class="row"><input id="mq_host" placeholder="打印机 IP，如 192.168.2.50" value="' +
-                    esc(d.host || '') + '"></div>' +
-                '<div class="row"><input id="mq_serial" placeholder="序列号（打印机设置里可见）" value="' +
-                    esc(d.serial || '') + '"></div>' +
-                '<div class="row"><input id="mq_user" placeholder="用户名（默认 bblp）" value="' +
-                    esc(d.user || 'bblp') + '"></div>' +
-                '<div class="row"><input id="mq_pass" type="password" ' +
-                    'placeholder="访问码（留空表示不修改）" autocomplete="off"></div>' +
-                '<div class="row"><input id="mq_port" type="number" placeholder="端口" value="' +
-                    esc(d.port || 8883) + '"></div>' +
-                '<div class="row"><input id="mq_cid" placeholder="客户端 ID（留空自动生成）" value="' +
-                    esc(d.client_id || '') + '"></div>';
-            $('mqtt_form').innerHTML = html;
+            function fill(id, v) {
+                var el = $(id);
+                if (el && document.activeElement !== el) el.value = v;
+            }
+            fill('mq_host',   d.host || '');
+            fill('mq_serial', d.serial || '');
+            fill('mq_user',   d.user || 'bblp');
+            fill('mq_port',   d.port || 8883);
+            fill('mq_cid',    d.client_id || '');
+            /* 访问码出于安全不回传，输入框留空即"不修改" */
         }, true);
     }
 
@@ -2272,17 +2394,17 @@
 
         /* ★ 先用默认值把界面画出来，不等接口。
            接口慢的时候整页也不会停在"加载中…"。 */
-        renderAccess([1, 2, 3, 4], DEFAULT_COLORS, 0);
-        updateHardware({ channels: [1, 2, 3, 4], engaged: [], limits: [], motor_direction: 0, conflicts: 0 });
+        renderAccess([1, 2, 3, 4, 5, 6, 7, 8], DEFAULT_COLORS, 0);
+        updateHardware({ channels: [1, 2, 3, 4, 5, 6, 7, 8], engaged: [], limits: [], motor_direction: 0, conflicts: 0 });
         updateAssist({ enabled: 1, speed_pct: 60, ms: 1500 });
         updateRetract({
             wait_ms: 5000, cont_ms: 6000,
             creep_ms: 2000, gap_ms: 1000, creep_max: 3
         });
         updateSensors({ sensors: {
-            enabled: 15, al: 0, extruder: 0, ch: [],
+            enabled: 255, al: 0, extruder: 0, ch: [],
             /* 占位：真值等 /status 回来（这三个是 2026-10-14 新增的门禁字段） */
-            job: 0, stage: 0, cur: -1, buf: [1, 1, 1, 1]
+            job: 0, stage: 0, cur: -1, buf: [1, 1, 1, 1, 1, 1, 1, 1]
         } });
 
         /* 日志列默认显示；上次点过"收起"的话恢复成收起状态 */
@@ -2297,6 +2419,14 @@
         $('btn_mqtt_save').onclick = saveMqtt;
         $('btn_access_save').onclick = saveAccess;
         $('btn_cur_channel_save').onclick = saveCurrentChannel;
+        /* 颜色选择弹窗（2026-10-26） */
+        $('color_pop_close').onclick = closeColorPop;
+        $('color_pop_custom_apply').onclick = function () {
+            pickColor($('color_pop_custom').value);
+        };
+        $('color_pop').onclick = function (e) {
+            if (e.target === this) closeColorPop();
+        };
         $('btn_jog_save').onclick = saveJog;
         $('btn_pullback_save').onclick = savePullback;
         $('btn_creep_save').onclick = saveCreep;

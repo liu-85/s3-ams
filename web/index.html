@@ -5,7 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#2f6fed">
 <title>ESP-AMS 控制台</title>
-<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232f6fed'/%3E%3Ctext x='16' y='22' font-size='17' font-family='Arial' font-weight='bold' fill='white' text-anchor='middle'%3EA%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
 </head>
 <body>
 
@@ -52,6 +53,7 @@
       <section class="page" id="page_status">
         <div class="card">
           <h2>运行状态 <span class="sub" id="st_head"></span></h2>
+          <div class="kv-grid">
           <div class="kv"><span>IP 地址</span><b id="s_ip">-</b></div>
           <div class="kv"><span>WiFi</span><b id="s_wifi">-</b></div>
           <div class="kv"><span>信号强度</span><b id="s_rssi">-</b></div>
@@ -60,6 +62,7 @@
           <div class="kv"><span>配置热点</span><b id="s_ap">-</b></div>
           <div class="kv"><span>当前料盘</span><b id="s_cur">-</b></div>
           <div class="kv"><span>固件版本</span><b id="s_ver">-</b></div>
+          </div>
           <div class="row">
             <button class="ghost" style="flex:1" id="btn_ap">打开配置热点</button>
             <button class="ghost" id="btn_stop">紧急停止</button>
@@ -69,11 +72,13 @@
 
         <div class="card">
           <h2>换料动作 <span class="sub">AMS 状态机</span></h2>
+          <div class="kv-grid">
           <div class="kv"><span>当前状态</span><b id="a_state">-</b></div>
           <div class="kv"><span>正在操作</span><b id="a_material">-</b></div>
           <div class="kv"><span>换料统计</span><b id="a_exchange">-</b></div>
           <div class="kv"><span>离合仲裁</span><b id="a_arb">-</b></div>
           <div class="kv"><span>最近错误</span><b id="a_lasterr">-</b></div>
+          </div>
           <div class="row">
             <button class="ghost" id="btn_diag_reset" style="flex:1">重置统计</button>
             <button class="ghost" id="btn_meters_reset" style="flex:1">清零计米</button>
@@ -90,6 +95,7 @@
       <section class="page" id="page_diag">
         <div class="card">
           <h2>上电诊断 <span class="sub">「接上负载就一直重启」查这里</span></h2>
+          <div class="kv-grid">
           <div class="kv"><span>本次复位原因</span><b id="d_cause">-</b></div>
           <div class="kv"><span>原因说明</span><b id="d_cause_desc">-</b></div>
           <div class="kv"><span>启动次数</span><b id="d_boots">-</b></div>
@@ -98,6 +104,7 @@
           <div class="kv"><span>历史最低</span><b id="d_mem_min">-</b></div>
           <div class="kv"><span>运行分区</span><b id="d_part">-</b></div>
           <div class="kv"><span>编译时间</span><b id="d_build">-</b></div>
+          </div>
           <div id="d_pins"></div>
           <div class="row">
             <button class="ghost" style="flex:1" id="btn_bootclear">重置启动计数</button>
@@ -156,17 +163,114 @@
         <div class="card">
           <h2>打印机 MQTT 配置 <span class="sub" id="mqtt_head"></span></h2>
           <div class="kv"><span>配置是否已保存</span><b id="mqtt_saved">-</b></div>
-          <div id="mqtt_form"><div class="tip">加载中…</div></div>
+          <div id="mqtt_form">
+            <div class="row"><input id="mq_host" placeholder="打印机 IP，如 192.168.2.50" autocomplete="off"></div>
+            <div class="row"><input id="mq_pass" type="password" placeholder="访问码（8 位，打印机 设置→网络→访问码）" autocomplete="off"></div>
+            <div class="row"><input id="mq_serial" placeholder="序列号（打印机设置里可见）" autocomplete="off"></div>
+            <div class="row"><input id="mq_user" placeholder="用户名（默认 bblp）" value="bblp" autocomplete="off"></div>
+            <div class="row"><input id="mq_port" type="number" placeholder="端口" value="8883" autocomplete="off"></div>
+            <div class="row"><input id="mq_cid" placeholder="客户端 ID（留空自动生成）" autocomplete="off"></div>
+          </div>
           <div class="row">
             <button class="primary" style="flex:1" id="btn_mqtt_save">保存并连接</button>
           </div>
           <div class="tip">
+            <b>本固件走 RS-485 直连打印机（BambuBus）</b>：下面的 MQTT 参数会
+            <b>保存到设备</b>（掉电保留），供以后切 MQTT 模式或留档用；
+            <b>当前固件不会用它去连打印机</b>。
+            <div class="hr"></div>
             访问码在打印机上找：<b>设置 → 网络 → 访问码</b>（8 位）。
             出于安全考虑，设备<b>不会把已保存的访问码回传到网页</b> ——
             输入框留空就表示不修改。
             <div class="hr"></div>
             连接用的是 TLS（端口 8883）。拓竹用的是自签证书，官方做法就是跳过校验；
             跳过的只是"证明对端真的是拓竹打印机"，<b>传输过程一样是加密的</b>。
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>和打印机的通信方式 <span class="sub">四选一，改完重启生效</span></h2>
+          <div class="row">
+            <select id="comm_mode_sel" style="flex:1">
+              <option value="2">自动（先试 RS-485，不连就切 MQTT）—— 推荐</option>
+              <option value="3">RS-485 + WiFi 同时（调试：能实时看 485 报文）</option>
+              <option value="1">RS-485（BambuBus 直连，扮演真 AMS；保留 WiFi）</option>
+              <option value="0">MQTT（连打印机 Broker，解析 G-code 信号）</option>
+            </select>
+            <button id="btn_comm_save" style="flex:0 0 96px">保存</button>
+          </div>
+          <div class="row" style="margin-top:8px">
+            <label style="flex:1;display:flex;align-items:center;gap:8px;cursor:pointer">
+              <input type="checkbox" id="wifi_on_chk" style="width:20px;height:20px">
+              <span>WiFi 上电就启动 <span class="sub">（关掉后微动 6/7/8 恢复可读，但网页打不开）</span></span>
+            </label>
+            <button id="btn_wifi_save" style="flex:0 0 96px">保存</button>
+          </div>
+          <div class="row" style="margin-top:8px">
+            <label style="flex:1;display:flex;align-items:center;gap:8px;cursor:pointer">
+              <input type="checkbox" id="act485_chk" style="width:20px;height:20px">
+              <span>485 运动执行 <span class="sub">（打开后，打印机点进料/退料会真的驱动本机电机；立即生效）</span></span>
+            </label>
+            <button id="btn_act485_save" style="flex:0 0 96px">保存</button>
+          </div>
+          <div class="row" style="margin-top:8px">
+            <select id="ams_ver_sel" style="flex:1">
+              <option value="16778839">01.00.06.87 —— 推荐（A1 固件 01.08.01.00 验证过）</option>
+              <option value="1585">00.00.06.49 —— BMCU370 真机抓包</option>
+              <option value="1509949440">90.00.00.00 —— Tianshu 原值（新版固件会弹窗，别用）</option>
+            </select>
+            <button id="btn_ams_ver_save" style="flex:0 0 96px">保存</button>
+          </div>
+          <div class="kv"><span>上报版本</span><b id="ams_ver_now">-</b></div>
+          <div class="kv"><span>当前生效</span><b id="comm_now">-</b></div>
+          <div class="kv"><span>WiFi 状态</span><b id="comm_wifi">-</b></div>
+          <div class="kv"><span>485 总线</span><b id="comm_bus">-</b></div>
+          <div class="tip">
+            <b>AMS 版本号（上面的下拉框）</b>：这是固件在总线上<b>报给打印机的
+            「AMS 固件版本」</b>。打印机会拿它跟自己的白名单比对，对不上就把你
+            这台当成<b>不认识的 AMS 设备</b>，直接弹窗
+            「当前固件仅支持 AMS / AMS 2 Pro / AMS HT，最多可连接 4 台」
+            <code>[0500-40A5]</code>。改完<b>立即生效</b>，不用重启；
+            如果换台打印机还弹，就换一个值再试。
+            <div class="hr"></div>
+            <b>三条通路互斥，改完要重启才生效。</b>原因很简单：它们都能表达            「打印机要换料」，同时开着就是两份指令抢同一个状态机 —— 一条说送料、
+            另一条说退料，电机听谁的？所以切换只写配置，由重启决定这次起哪一条。
+            <div class="hr"></div>
+            <b>WiFi 上电就启动（默认开）</b>：开着 → 网页随时能看 485 报文，
+            但 WiFi 占用 ADC2，<b>微动 6/7/8（GPIO11/12/13）读不到</b>；
+            关掉 → 那三路立刻恢复正常，但<b>重启后网页打不开</b>
+            （要改回来只能重新烧录）。<b>所以顺序是：先开着调通 485，
+            最后再关。</b>
+            <div class="hr"></div>
+            <b>自动（推荐）</b>：开机先起 RS-485；<b>WiFi 上电开关开着时</b>
+            两者同时跑（不启 MQTT）；<b>关着时</b>才走原来的逻辑 ——
+            <b>2 分钟内</b>收到打印机任何一帧 → 保持 485 不开 WiFi；收不到 →
+            关掉 485、开 WiFi 走 MQTT。<b>只在开机判定一次</b>，运行期不来回切。
+            <div class="hr"></div>
+            <b>RS-485 + WiFi 同时（调试专用）</b>：WiFi 开机就起来，485 照常跑，
+            <b>不启 MQTT</b>。专门用来解决一个现场问题 —— <b>自动模式下开机
+            2 分钟没有 WiFi</b>，而打印机的总线枚举（广播 / 点名 / 握手）
+            <b>只在上电那一小会儿做</b>，等网页能连上时全过程早就结束了。
+            选这个模式重启，就能一边看网页一边看 485 的实时握手。
+            代价是微动 6/7/8（ADC2）读不到 —— <b>排查完请切回「自动」</b>。
+            <div class="hr"></div>
+            <b>原始报文在哪看</b>：下面「485 总线」那一行的
+            <b>「原始报文」</b>链接，或直接访问
+            <code>/bus485raw</code>。它吐的是<b>从上电第一帧开始</b>的双向记录
+            （毫秒时间戳 + RX/TX + 十六进制），所以<b>就算 WiFi 是两分钟后才
+            起来的，「自动」模式下那 2 分钟的握手也照样能回看</b>。
+            <div class="hr"></div>
+            <b>RS-485</b>：挂在打印机的 485 总线上，由打印机自己下发
+            「选中第几号槽 / 送料 / 退料」（不需要后处理脚本）。
+            <b>保留 WiFi</b>，网页随时能访问 —— 调试时选这个；代价是微动 6/7/8 降级。
+            <div class="hr"></div>
+            <b>MQTT</b>：我们主动连打印机的 MQTT Broker，靠解析 G-code 信令判断
+            要换哪一路（需要切片后处理脚本把颜色映射到槽号）。
+            <div class="hr"></div>
+            <b>485 本次的边界</b>：能应答注册 / 心跳 / 耗材信息（打印机界面里
+            能看到 <b>AMS-A + AMS-B 共 8 个槽</b>，颜色和温度都取自本页配置），
+            但收到运动指令只把原始帧写进日志、<b>不驱动电机</b> —— 字段含义要拿
+            真机抓帧确认后才放开，照别人的逆向结论硬套会把料退错方向。
           </div>
         </div>
       </section>
@@ -217,6 +321,65 @@
           </div>
         </div>
 
+        <div class="card">
+          <h2>微动开关 <span class="sub" id="sg_sub">每路 2 只：开始位 / 停止位（合占 1 个 ADC 口）</span></h2>
+          <div class="kv"><span>挤出机到位</span><b id="sg_extruder">-</b></div>
+          <div class="kv"><span>信号来源</span><b id="sg_src">-</b></div>
+          <div id="sensor_list"></div>
+          <div class="row">
+            <button class="ghost" style="flex:1" id="btn_src_toggle">切换到位信号来源</button>
+          </div>
+          <div class="tip">
+            <b>★ 本版接线（2026-10-22 起）：每路只用 1 个 ADC 口读两只微动</b><br>
+            开始位微动（常开）串 <b>4.7K</b>、停止位微动（常闭）串 <b>10K</b>，
+            两只并在同一个 GPIO 上，靠读电压分三档：
+            <b>≈220mV</b> = 开始位压下（缓冲器空，要补料）·
+            <b>≈600mV</b> = 中间（保持上一拍）·
+            <b>≈3300mV</b> = 停止位顶开（满了，停）。
+            <div class="hr"></div>
+            旧的「三只微动」接法（含第三只「自吸微动」）只剩 ESP32-C3 还在用；
+            <b>「自吸上料」功能已整套删除</b>，现在每路只有下面这两只。
+            <div class="hr"></div>
+            两只微动各自的作用：
+            <div class="hr"></div>
+            <b>停止送料</b>：触发 → 立刻停电机。料到位 / 料尽 / 机构顶到头都会触发它。<br>
+            <b>开始送料</b>：触发 → 按常规速度送料，直到停止送料微动触发或超时。
+            <div class="hr"></div>
+            <b>开关怎么对应：</b>「缓冲送料」这一个开关管<b>停止送料 + 开始送料</b>
+            这两只。
+            <div class="hr"></div>
+            <b>打印中 / 流量校准阶段（缓冲器闭环）：</b><br>
+            · 开了「缓冲送料」的通道 → 送与停<b>由缓冲器微动决定</b>
+              （开始送料微动触发就补料，停止送料微动触发就停），
+              <b>不再按时间间隔盲目送料</b>。<br>
+            · 微动连续 <b>15 秒</b>一点动作都没有 → 判定微动没反馈，
+              <b>自动退回</b>原来的「按时间间隔辅助送料」，先把这场打印跑完；
+              微动一恢复动作就自动回到缓冲闭环。
+              <div class="hr"></div>
+            <b>微动触发的两道门禁：</b><br>
+            · <b>没有打印任务时不动作</b>（空闲 / 打完 / 失败）——
+              开机震动、放料时手碰到微动，都不会让电机自己转起来。<br>
+            · <b>只有「当前通道」算数</b> —— 打印时打印机只用一路，
+              其他路的微动触发了也不动作。<br>
+            上面「门禁」那一行会实时显示这两道门的状态。
+            <div class="hr"></div>
+            <b>换料时不看微动：</b><br>
+            换料的送料<b>只认打印机的「耗材已到挤出机」信号</b>，
+            途中<b>不执行</b>「停止送料微动触发就停」。原因是缓冲器阻力比挤出机小，
+            料会先在缓冲器里堆住把微动顶住 —— 按它停料就到不了挤出机，
+            打印机随后就报故障。手动「送料」按钮仍然按微动停（那是给你调试
+            缓冲区用的动作）。
+            <div class="hr"></div>
+            <span class="dim">
+              · 开关关掉 → 这一路退回<b>降级模式</b>（按时间 / 闭环推进送料，
+                时长由固件里的 AMS_NO_LIMIT_LOAD_MS / RETRACT_MS 决定）。
+            </span>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 7. 参数设置（独立页，调试分组） ============ -->
+      <section class="page" id="page_params">
         <div class="card">
           <h2>手动点动 <span class="sub" id="jog_scope">所有通道统一</span></h2>
           <div class="row">
@@ -519,151 +682,6 @@
             范围 150~300℃，未设置时默认 250。
           </div>
         </div>
-      </section>
-
-      <!-- ============ 7. 微动开关 ============ -->
-      <section class="page" id="page_sensors">
-        <div class="card">
-          <h2>和打印机的通信方式 <span class="sub">四选一，改完重启生效</span></h2>
-          <div class="row">
-            <select id="comm_mode_sel" style="flex:1">
-              <option value="2">自动（先试 RS-485，不连就切 MQTT）—— 推荐</option>
-              <option value="3">RS-485 + WiFi 同时（调试：能实时看 485 报文）</option>
-              <option value="1">RS-485（BambuBus 直连，扮演真 AMS；保留 WiFi）</option>
-              <option value="0">MQTT（连打印机 Broker，解析 G-code 信号）</option>
-            </select>
-            <button id="btn_comm_save" style="flex:0 0 96px">保存</button>
-          </div>
-          <div class="row" style="margin-top:8px">
-            <label style="flex:1;display:flex;align-items:center;gap:8px;cursor:pointer">
-              <input type="checkbox" id="wifi_on_chk" style="width:20px;height:20px">
-              <span>WiFi 上电就启动 <span class="sub">（关掉后微动 6/7/8 恢复可读，但网页打不开）</span></span>
-            </label>
-            <button id="btn_wifi_save" style="flex:0 0 96px">保存</button>
-          </div>
-          <div class="row" style="margin-top:8px">
-            <label style="flex:1;display:flex;align-items:center;gap:8px;cursor:pointer">
-              <input type="checkbox" id="act485_chk" style="width:20px;height:20px">
-              <span>485 运动执行 <span class="sub">（打开后，打印机点进料/退料会真的驱动本机电机；立即生效）</span></span>
-            </label>
-            <button id="btn_act485_save" style="flex:0 0 96px">保存</button>
-          </div>
-          <div class="row" style="margin-top:8px">
-            <select id="ams_ver_sel" style="flex:1">
-              <option value="16778839">01.00.06.87 —— 推荐（A1 固件 01.08.01.00 验证过）</option>
-              <option value="1585">00.00.06.49 —— BMCU370 真机抓包</option>
-              <option value="1509949440">90.00.00.00 —— Tianshu 原值（新版固件会弹窗，别用）</option>
-            </select>
-            <button id="btn_ams_ver_save" style="flex:0 0 96px">保存</button>
-          </div>
-          <div class="kv"><span>上报版本</span><b id="ams_ver_now">-</b></div>
-          <div class="kv"><span>当前生效</span><b id="comm_now">-</b></div>
-          <div class="kv"><span>WiFi 状态</span><b id="comm_wifi">-</b></div>
-          <div class="kv"><span>485 总线</span><b id="comm_bus">-</b></div>
-          <div class="tip">
-            <b>AMS 版本号（上面的下拉框）</b>：这是固件在总线上<b>报给打印机的
-            「AMS 固件版本」</b>。打印机会拿它跟自己的白名单比对，对不上就把你
-            这台当成<b>不认识的 AMS 设备</b>，直接弹窗
-            「当前固件仅支持 AMS / AMS 2 Pro / AMS HT，最多可连接 4 台」
-            <code>[0500-40A5]</code>。改完<b>立即生效</b>，不用重启；
-            如果换台打印机还弹，就换一个值再试。
-            <div class="hr"></div>
-            <b>三条通路互斥，改完要重启才生效。</b>原因很简单：它们都能表达            「打印机要换料」，同时开着就是两份指令抢同一个状态机 —— 一条说送料、
-            另一条说退料，电机听谁的？所以切换只写配置，由重启决定这次起哪一条。
-            <div class="hr"></div>
-            <b>WiFi 上电就启动（默认开）</b>：开着 → 网页随时能看 485 报文，
-            但 WiFi 占用 ADC2，<b>微动 6/7/8（GPIO11/12/13）读不到</b>；
-            关掉 → 那三路立刻恢复正常，但<b>重启后网页打不开</b>
-            （要改回来只能重新烧录）。<b>所以顺序是：先开着调通 485，
-            最后再关。</b>
-            <div class="hr"></div>
-            <b>自动（推荐）</b>：开机先起 RS-485；<b>WiFi 上电开关开着时</b>
-            两者同时跑（不启 MQTT）；<b>关着时</b>才走原来的逻辑 ——
-            <b>2 分钟内</b>收到打印机任何一帧 → 保持 485 不开 WiFi；收不到 →
-            关掉 485、开 WiFi 走 MQTT。<b>只在开机判定一次</b>，运行期不来回切。
-            <div class="hr"></div>
-            <b>RS-485 + WiFi 同时（调试专用）</b>：WiFi 开机就起来，485 照常跑，
-            <b>不启 MQTT</b>。专门用来解决一个现场问题 —— <b>自动模式下开机
-            2 分钟没有 WiFi</b>，而打印机的总线枚举（广播 / 点名 / 握手）
-            <b>只在上电那一小会儿做</b>，等网页能连上时全过程早就结束了。
-            选这个模式重启，就能一边看网页一边看 485 的实时握手。
-            代价是微动 6/7/8（ADC2）读不到 —— <b>排查完请切回「自动」</b>。
-            <div class="hr"></div>
-            <b>原始报文在哪看</b>：下面「485 总线」那一行的
-            <b>「原始报文」</b>链接，或直接访问
-            <code>/bus485raw</code>。它吐的是<b>从上电第一帧开始</b>的双向记录
-            （毫秒时间戳 + RX/TX + 十六进制），所以<b>就算 WiFi 是两分钟后才
-            起来的，「自动」模式下那 2 分钟的握手也照样能回看</b>。
-            <div class="hr"></div>
-            <b>RS-485</b>：挂在打印机的 485 总线上，由打印机自己下发
-            「选中第几号槽 / 送料 / 退料」（不需要后处理脚本）。
-            <b>保留 WiFi</b>，网页随时能访问 —— 调试时选这个；代价是微动 6/7/8 降级。
-            <div class="hr"></div>
-            <b>MQTT</b>：我们主动连打印机的 MQTT Broker，靠解析 G-code 信令判断
-            要换哪一路（需要切片后处理脚本把颜色映射到槽号）。
-            <div class="hr"></div>
-            <b>485 本次的边界</b>：能应答注册 / 心跳 / 耗材信息（打印机界面里
-            能看到 <b>AMS-A + AMS-B 共 8 个槽</b>，颜色和温度都取自本页配置），
-            但收到运动指令只把原始帧写进日志、<b>不驱动电机</b> —— 字段含义要拿
-            真机抓帧确认后才放开，照别人的逆向结论硬套会把料退错方向。
-          </div>
-        </div>
-
-        <div class="card">
-          <h2>微动开关 <span class="sub" id="sg_sub">每路 2 只：开始位 / 停止位（合占 1 个 ADC 口）</span></h2>
-          <div class="kv"><span>挤出机到位</span><b id="sg_extruder">-</b></div>
-          <div class="kv"><span>信号来源</span><b id="sg_src">-</b></div>
-          <div id="sensor_list"></div>
-          <div class="row">
-            <button class="ghost" style="flex:1" id="btn_src_toggle">切换到位信号来源</button>
-          </div>
-          <div class="tip">
-            <b>★ 本版接线（2026-10-22 起）：每路只用 1 个 ADC 口读两只微动</b><br>
-            开始位微动（常开）串 <b>4.7K</b>、停止位微动（常闭）串 <b>10K</b>，
-            两只并在同一个 GPIO 上，靠读电压分三档：
-            <b>≈220mV</b> = 开始位压下（缓冲器空，要补料）·
-            <b>≈600mV</b> = 中间（保持上一拍）·
-            <b>≈3300mV</b> = 停止位顶开（满了，停）。
-            <div class="hr"></div>
-            旧的「三只微动」接法（含第三只「自吸微动」）只剩 ESP32-C3 还在用；
-            <b>「自吸上料」功能已整套删除</b>，现在每路只有下面这两只。
-            <div class="hr"></div>
-            两只微动各自的作用：
-            <div class="hr"></div>
-            <b>停止送料</b>：触发 → 立刻停电机。料到位 / 料尽 / 机构顶到头都会触发它。<br>
-            <b>开始送料</b>：触发 → 按常规速度送料，直到停止送料微动触发或超时。
-            <div class="hr"></div>
-            <b>开关怎么对应：</b>「缓冲送料」这一个开关管<b>停止送料 + 开始送料</b>
-            这两只。
-            <div class="hr"></div>
-            <b>打印中 / 流量校准阶段（缓冲器闭环）：</b><br>
-            · 开了「缓冲送料」的通道 → 送与停<b>由缓冲器微动决定</b>
-              （开始送料微动触发就补料，停止送料微动触发就停），
-              <b>不再按时间间隔盲目送料</b>。<br>
-            · 微动连续 <b>15 秒</b>一点动作都没有 → 判定微动没反馈，
-              <b>自动退回</b>原来的「按时间间隔辅助送料」，先把这场打印跑完；
-              微动一恢复动作就自动回到缓冲闭环。
-              <div class="hr"></div>
-            <b>微动触发的两道门禁：</b><br>
-            · <b>没有打印任务时不动作</b>（空闲 / 打完 / 失败）——
-              开机震动、放料时手碰到微动，都不会让电机自己转起来。<br>
-            · <b>只有「当前通道」算数</b> —— 打印时打印机只用一路，
-              其他路的微动触发了也不动作。<br>
-            上面「门禁」那一行会实时显示这两道门的状态。
-            <div class="hr"></div>
-            <b>换料时不看微动：</b><br>
-            换料的送料<b>只认打印机的「耗材已到挤出机」信号</b>，
-            途中<b>不执行</b>「停止送料微动触发就停」。原因是缓冲器阻力比挤出机小，
-            料会先在缓冲器里堆住把微动顶住 —— 按它停料就到不了挤出机，
-            打印机随后就报故障。手动「送料」按钮仍然按微动停（那是给你调试
-            缓冲区用的动作）。
-            <div class="hr"></div>
-            <span class="dim">
-              · 开关关掉 → 这一路退回<b>降级模式</b>（按时间 / 闭环推进送料，
-                时长由固件里的 AMS_NO_LIMIT_LOAD_MS / RETRACT_MS 决定）。
-            </span>
-          </div>
-        </div>
 
         <div class="card">
           <h2>蠕动送料参数 <span class="sub">换料收尾用</span></h2>
@@ -692,6 +710,9 @@
           </div>
         </div>
       </section>
+
+      <!-- 微动开关 → 已并入硬件调试页；通信方式 → 已并入网络配置页；蠕动参数 → 已并入参数数值菜单。
+           原独立「微动开关」页已移除 -->
 
       <!-- ============ 8. 系统升级 ============ -->
       <section class="page" id="page_ota">
@@ -744,6 +765,25 @@
 <div class="toast" id="toast"></div>
 <div class="overlay" id="overlay"><div class="loader"></div></div>
 
-<script src="/app.js"></script>
+<!-- 颜色选择弹窗（2026-10-26：点色块弹出选色） -->
+<div class="color-pop" id="color_pop">
+  <div class="color-pop-box">
+    <div class="color-pop-head">
+      <b>选择颜色</b>
+      <button class="ghost" id="color_pop_close">关闭</button>
+    </div>
+    <div class="cp-sec">预设颜色</div>
+    <div class="cp-grid" id="color_pop_preset"></div>
+    <div class="cp-sec">其他颜色</div>
+    <div class="cp-grid" id="color_pop_more"></div>
+    <div class="cp-sec">自定义颜色</div>
+    <div class="cp-custom">
+      <input type="color" id="color_pop_custom">
+      <button class="primary" id="color_pop_custom_apply" style="flex:1">使用此颜色</button>
+    </div>
+  </div>
+</div>
+
+<script src="app.js"></script>
 </body>
 </html>

@@ -190,6 +190,17 @@ bool amcu_jog_info(int *ch, int *dir, int *ms_left)
     return s_jog_active;
 }
 
+/* v1.1.19：取消当前点动（WEB「紧急停止」用）。
+ * 只清 s_jog_active 不够 —— 电机和离合还得真停，否则下一轮 pump 又会驱动。 */
+void amcu_jog_stop(void)
+{
+    if (!s_jog_active) return;
+    s_jog_active = false;
+    AMCU_drive_stop();
+    clutch_release_all();
+    log_i("点动已取消（急停）");
+}
+
 // 退料状态（兼容原逻辑）
 bool is_need_pull_back = false;
 int now_filament_num_need_pull_back = 255;

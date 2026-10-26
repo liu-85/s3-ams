@@ -123,6 +123,17 @@ html, body {
 }
 
 .menu { display: flex; flex-direction: column; gap: 2px; }
+/* 导航分组标题（布局优化）：由 app.js 的 GROUPS 渲染，把菜单按功能分区 */
+.menu-group {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: .6px;
+    color: var(--text-faint);
+    padding: 12px 10px 4px;
+    margin-top: 4px;
+    border-top: 1px solid var(--border);
+}
+.menu-group:first-child { border-top: 0; padding-top: 2px; margin-top: 0; }
 .menu a {
     display: flex;
     align-items: center;
@@ -233,6 +244,22 @@ html, body {
 .kv:last-of-type { border-bottom: 0; }
 .kv > span { flex: 0 0 108px; color: var(--text-dim); }
 .kv > b { flex: 1 1 auto; font-weight: 600; word-break: break-word; min-width: 0; }
+
+/* 监控指标双列网格（布局优化）：运行状态 / 上电诊断 / 换料动作 卡片用。
+ * 只在 HTML 里显式加了 .kv-grid 的地方启用，动态生成的 kv 不受影响。 */
+.kv-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    column-gap: 24px;
+}
+.kv-grid .kv { border-bottom: 0; padding: 7px 0; }
+.kv-grid .kv > span { flex-basis: 84px; }
+
+/* 8 通道两列布局（布局优化）：硬件调试点动 / 微动开关 用。
+ * 左右各一列（ch-col）：左侧通道 1-4，右侧通道 5-8，由 JS 分半填充。 */
+.ch-grid { display: flex; gap: 24px; align-items: flex-start; }
+.ch-col { flex: 1 1 0; min-width: 0; }
+.ch-item { min-width: 0; }
 
 .ok   { color: var(--ok); }
 .warn { color: var(--warn); }
@@ -424,6 +451,50 @@ details.tip[open] > summary { margin-bottom: 7px; color: var(--text); }
 }
 .acc-row .cur { font-size: 11px; color: var(--ok); }
 
+/* 颜色选择弹窗（2026-10-26：点色块弹出选色） */
+.color-pop {
+    position: fixed; inset: 0;
+    background: rgba(15, 20, 30, .45);
+    display: none;
+    align-items: center; justify-content: center;
+    z-index: 120;
+    padding: 16px;
+}
+.color-pop-box {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    width: min(420px, 100%);
+    max-height: 84vh;
+    overflow: auto;
+    padding: 16px;
+}
+.color-pop-head {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 4px;
+    font-size: 15px;
+}
+.cp-sec { font-size: 13px; color: var(--text-dim); margin: 12px 0 8px; }
+.cp-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; }
+.cp-swatch {
+    aspect-ratio: 1; border-radius: 50%;
+    border: 2px solid var(--border);
+    cursor: pointer;
+    transition: transform .12s;
+}
+.cp-swatch:hover { transform: scale(1.12); }
+.cp-custom { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
+.cp-custom input[type=color] {
+    width: 56px; height: 38px;
+    border: 1px solid var(--border); border-radius: 7px;
+    padding: 0; cursor: pointer; flex: 0 0 56px;
+}
+@media (max-width: 760px) {
+    .cp-grid { grid-template-columns: repeat(5, 1fr); }
+    .color-pop-box { padding: 14px; }
+}
+
 /* ==========================================================================
    日志面板 —— 桌面下是**右侧固定一列**
    ==========================================================================
@@ -592,7 +663,11 @@ body.logoff .only-logoff { display: inline-block; }
     }
     .scrim.show { display: block; }
     .kv > span { flex-basis: 88px; font-size: 13px; }
+    .kv-grid { grid-template-columns: 1fr; }
+    .ch-grid { flex-direction: column; gap: 0; }
     .acc-head, .acc-row { grid-template-columns: 1fr 80px 40px; }
     .logbox { margin: 0 10px 10px; }
     .content { padding: 10px; }
+    /* 移动端输入字号提到 16px：iOS 聚焦会自动放大 <16px 的输入框 */
+    input, select, textarea { font-size: 16px; }
 }

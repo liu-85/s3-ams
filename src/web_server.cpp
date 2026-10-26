@@ -51,6 +51,50 @@ static bool s_ap_mode = false;
 static int s_net_mode = 2;  // 0=STA, 1=AP, 2=离线
 static uint32_t s_boot_time = 0;
 
+/* ---- MQTT 配置（v1.1.19）----
+ * 本固件走 RS-485 直连打印机（BambuBus），MQTT 参数**只保存备用**，
+ * 不真正去连 Broker。存 NVS 命名空间 "s3ams-mqtt"，掉电保留。 */
+static char s_mq_host[64]   = "";
+static char s_mq_serial[32] = "";
+static char s_mq_user[32]   = "bblp";
+static char s_mq_pass[40]   = "";
+static char s_mq_cid[40]    = "";
+static int  s_mq_port       = 8883;
+static bool s_mq_configured = false;
+
+static void mqtt_cfg_load(void)
+{
+    Preferences p;
+    if (!p.begin("s3ams-mqtt", true)) return;
+    String host   = p.getString("host", "");
+    String serial = p.getString("serial", "");
+    String user   = p.getString("user", "bblp");
+    String pass   = p.getString("pass", "");
+    String cid    = p.getString("cid", "");
+    s_mq_port = p.getInt("port", 8883);
+    p.end();
+    snprintf(s_mq_host,   sizeof(s_mq_host),   "%s", host.c_str());
+    snprintf(s_mq_serial, sizeof(s_mq_serial), "%s", serial.c_str());
+    snprintf(s_mq_user,   sizeof(s_mq_user),   "%s", user.c_str());
+    snprintf(s_mq_pass,   sizeof(s_mq_pass),   "%s", pass.c_str());
+    snprintf(s_mq_cid,    sizeof(s_mq_cid),    "%s", cid.c_str());
+    s_mq_configured = (s_mq_host[0] != '\0');
+}
+
+static void mqtt_cfg_save(void)
+{
+    Preferences p;
+    if (!p.begin("s3ams-mqtt", false)) return;
+    p.putString("host", s_mq_host);
+    p.putString("serial", s_mq_serial);
+    p.putString("user", s_mq_user);
+    p.putString("pass", s_mq_pass);
+    p.putString("cid", s_mq_cid);
+    p.putInt("port", s_mq_port);
+    p.end();
+    s_mq_configured = (s_mq_host[0] != '\0');
+}
+
 /* ==========================================================================
  * 日志环形缓冲（行式：48 行 × 每行 160 字符，带单调递增 seq）
  *
@@ -166,7 +210,7 @@ void web_log_install_hook(void)
 }
 
 /* App 版本 */
-static const char *APP_VERSION = "1.1.18-s3ams";
+static const char *APP_VERSION = "1.1.19-s3ams";
 
 /* 单 IO 双微动：每路一个 ADC 脚（开始位/停止位共用同一脚，电阻编码） */
 static const int BOARD_SENSOR_PINS[BOARD_CHANNEL_COUNT] = BOARD_PIN_SENSOR_ARRAY;
@@ -222,6 +266,38 @@ static bool json_get_double(const String &body, const char *key, double *out)
     }
     if (idx == start || (idx == start + 1 && body[start] == '-')) return false;
     *out = body.substring(start, idx).toDouble();
+    return true;
+}
+
+/* 取字符串字段：{"key":"value"} → out（截断到 maxlen-1，处理 \" 和 \\ 转义） */
+static bool json_get_str(const String &body, const char *key, char *out, size_t maxlen)
+{
+    if (!out || maxlen == 0) return false;
+    String k = String("\"") + key + "\"";
+    int idx = body.indexOf(k);
+    if (idx < 0) return false;
+    idx = body.indexOf(':', idx + k.length());
+    if (idx < 0) return false;
+    idx++;
+    while (idx < (int)body.length() &&
+           (body[idx] == ' ' || body[idx] == '\t' || body[idx] == '\n' || body[idx] == '\r')) {
+        idx++;
+    }
+    if (idx >= (int)body.length() || body[idx] != '"') return false;
+    idx++;
+    size_t n = 0;
+    while (idx < (int)body.length() && body[idx] != '"') {
+        char c = body[idx];
+        if (c == '\\' && idx + 1 < (int)body.length()) {
+            idx++;
+            c = body[idx];
+            if (c == 'n') c = '\n';
+            else if (c == 't') c = '\t';
+        }
+        if (n + 1 < maxlen) out[n++] = c;
+        idx++;
+    }
+    out[n] = '\0';
     return true;
 }
 
@@ -360,7 +436,7 @@ static void handle_status(void)
     json += "\"rssi\":" + String(s_wifi_connected ? WiFi.RSSI() : 0) + ",";
     json += "\"mac\":\"" + WiFi.macAddress() + "\",";
     json += "\"mqtt_rx\":0,";
-    json += "\"mqtt_configured\":false,";
+    json += "\"mqtt_configured\":" + String(s_mq_configured ? "true" : "false") + ",";
     json += "\"mqtt_last_error\":\"\",";
     json += "\"ap_ssid\":\"" + (s_ap_mode ? String(AP_SSID_PREFIX) : "") + "\",";
     json += "\"ap_clients\":" + String(s_ap_mode ? WiFi.softAPgetStationNum() : 0) + ",";
@@ -1189,12 +1265,90 @@ static void handle_pullback_set(void)
     server.send(200, "application/json", msg);
 }
 
+/* /get_mqtt_info（GET）：回传已保存的 MQTT 参数（出于安全不回传访问码） */
+static void handle_get_mqtt_info(void)
+{
+    String json = String("{\"host\":\"") + s_mq_host +
+        "\",\"serial\":\"" + s_mq_serial +
+        "\",\"user\":\"" + s_mq_user +
+        "\",\"port\":" + String(s_mq_port) +
+        ",\"client_id\":\"" + s_mq_cid + "\"}";
+    server.send(200, "application/json", json);
+}
+
+/* /mqtt_connect（POST）：保存 MQTT 参数到 NVS。
+ * 本固件走 RS-485 直连打印机，这里**只保存**，不真正连 MQTT Broker。 */
+static void handle_mqtt_connect(void)
+{
+    if (!server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"ok\":false,\"err\":\"no body\"}");
+        return;
+    }
+    String body = server.arg("plain");
+    json_get_str(body, "host",      s_mq_host,   sizeof(s_mq_host));
+    json_get_str(body, "serial",    s_mq_serial, sizeof(s_mq_serial));
+    json_get_str(body, "user",      s_mq_user,   sizeof(s_mq_user));
+    json_get_str(body, "client_id", s_mq_cid,    sizeof(s_mq_cid));
+    /* 访问码：留空 = 不修改 */
+    char pw[40];
+    if (json_get_str(body, "password", pw, sizeof(pw)) && pw[0] != '\0') {
+        snprintf(s_mq_pass, sizeof(s_mq_pass), "%s", pw);
+    }
+    long port = 0;
+    if (json_get_int(body, "port", &port) && port > 0 && port < 65536) {
+        s_mq_port = (int)port;
+    }
+    mqtt_cfg_save();
+    log_i("MQTT 配置已保存: host=%s port=%d（本固件走 RS-485，不连接）",
+          s_mq_host, s_mq_port);
+    server.send(200, "application/json",
+        "{\"ok\":true,\"info\":\"MQTT 参数已保存（本固件走 RS-485 直连，不会用它连接）\"}");
+}
+
+/* /stop（POST）：紧急停止 —— 停电机 + 断离合 + 取消点动 */
+static void handle_stop(void)
+{
+    amcu_jog_stop();          /* 先取消点动（它会停电机 + 断离合） */
+    AMCU_drive_stop();        /* 再兜底停一次 */
+    clutch_release_all();
+    log_w("★ 收到「紧急停止」：电机已停、离合已全断");
+    server.send(200, "application/json",
+        "{\"ok\":true,\"info\":\"已紧急停止（电机停、离合全断）\"}");
+}
+
+/* /ap_set（POST）：{on:0|1} 开关配置热点 */
+static void handle_ap_set(void)
+{
+    if (!server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"ok\":false,\"err\":\"no body\"}");
+        return;
+    }
+    String body = server.arg("plain");
+    long on = 0;
+    json_get_int(body, "on", &on);
+    if (on) {
+        wifi_start_ap();
+        server.send(200, "application/json", "{\"ok\":true,\"info\":\"配置热点已打开\"}");
+    } else {
+        wifi_stop_ap();
+        server.send(200, "application/json", "{\"ok\":true,\"info\":\"配置热点已关闭\"}");
+    }
+}
+
+/* 本固件不支持的可选动作：明确回 ok:false，避免 404 让前端弹「请求失败」 */
+static void handle_unsupported(void)
+{
+    server.send(200, "application/json",
+        "{\"ok\":false,\"info\":\"本固件（RS-485 直连）不支持该操作\"}");
+}
+
 /* ==========================================================================
  * 启动
  * ========================================================================== */
 void web_server_start(void)
 {
     s_boot_time = millis();
+    mqtt_cfg_load();   /* v1.1.19：读回已保存的 MQTT 参数（只用于显示/保存） */
 
     wifi_init();
 
@@ -1225,6 +1379,16 @@ void web_server_start(void)
     server.on("/color_set", HTTP_POST, handle_ok);
     server.on("/act485_set", HTTP_POST, handle_act485_set);
     server.on("/bus485raw", HTTP_GET, handle_bus485raw);
+    /* v1.1.19：新控制台（模板版）需要的接口。
+       能真实现的真实现，其余明确回「不支持」，避免 404 让前端弹「请求失败」。 */
+    server.on("/get_mqtt_info", HTTP_GET, handle_get_mqtt_info);
+    server.on("/mqtt_connect", HTTP_POST, handle_mqtt_connect);
+    server.on("/stop", HTTP_POST, handle_stop);
+    server.on("/ap_set", HTTP_POST, handle_ap_set);
+    server.on("/boot_clear", HTTP_GET, handle_unsupported);
+    server.on("/creep_set", HTTP_POST, handle_unsupported);
+    server.on("/assist_test", HTTP_POST, handle_unsupported);
+    server.on("/extruder_src_set", HTTP_POST, handle_unsupported);
     server.onNotFound(handle_not_found);
 
     server.begin();
