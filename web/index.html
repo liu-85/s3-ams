@@ -626,7 +626,12 @@
           <div class="row" style="margin-top:10px;align-items:center">
             <button class="primary" style="flex:1" id="btn_retract_save">保存退料参数</button>
           </div>
-          <div class="tip">
+          <div class="tip warn">
+            <b>⚠️ 本卡参数在当前固件（RS-485 直连）里未实现</b>：保存按钮后端是空占位，
+            <b>改了不生效</b>。要调<b>自动换料退料时长</b>，请用上面的「<b>退料时间</b>」卡片。
+            <div class="hr"></div>
+            （以下为 C3 / MQTT 方案的原始说明，仅作参考）
+            <div class="hr"></div>
             <b>顺序是「先连续、后蠕动」</b>：打印机报 ams_status=260（切完刀、挤出机已跑回冲刷区、
             该我们收线了）之后，<b>立刻全速连续拉料</b>，最长「连续退料」毫秒；期间每 250ms
             查一次挤出机 MQTT 信号（hw_switch_state），一报"挤出机已空"就停，再多拉 0.5 秒收尾。
@@ -723,8 +728,6 @@
           <div class="tip ok">
             ★ 这版是<b>真正的双分区 OTA</b>：新固件写进备用分区，校验通过才切换，
             写一半断电也不影响启动；新固件第一次启动如果崩溃，引导程序会<b>自动回滚</b>。
-            MicroPython 那版因为只有一个应用分区，只能升级「应用与界面」，
-            整机固件必须插 USB。
           </div>
           <div class="row">
             <input type="file" id="ota_file" accept=".bin">
@@ -735,8 +738,9 @@
           <div class="progress" id="ota_prog" style="display:none"><i></i></div>
           <div id="ota_box"></div>
           <div class="tip warn" id="ota_tip">
-            要传的是 <code>idf.py build</code> 出来的 <code>esp-ams-s3.bin</code>
-            （或 <code>build/esp-ams-s3.bin</code>）。
+            要传的是 <b>PlatformIO 编译出来的 <code>firmware.bin</code></b>
+            （<code>.pio/build/s3ams/firmware.bin</code>，或发布包
+            <code>release/vX.Y.Z/firmware.bin</code>）。
             传错文件不会造成损坏 —— 设备会检查首字节是不是 <code>0xE9</code>，
             不是就直接中止，分区一个字节都不动。
           </div>

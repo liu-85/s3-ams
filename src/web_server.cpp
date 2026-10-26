@@ -95,6 +95,54 @@ static void mqtt_cfg_save(void)
     s_mq_configured = (s_mq_host[0] != '\0');
 }
 
+/* ---- 通道映射 / 颜色（v1.1.20）----
+ * access_list[i] = 料盘位 i 对应的打印机通道（1..8，身份映射为默认）；
+ * color_list[i]  = 该料盘位的颜色（RGB，0xRRGGBB）。
+ * 存 NVS "s3ams-access"，掉电保留。
+ * ★ 之前固件**完全不存**这两个数组，导致网页「通道设置」选完颜色
+ *   两秒就被 /status 轮询重建回默认色 —— 本次补上持久化。 */
+static int      s_access_list[16];
+static uint32_t s_color_list[16];
+static const uint32_t k_default_colors[8] = {
+    0xd94f4f, 0x3f9d4f, 0x3f6fd9, 0xd9a93f,
+    0x7a4fd9, 0x2fb8a5, 0xe57ad9, 0xd98a3f
+};
+
+static void access_cfg_reset(void)
+{
+    for (int i = 0; i < 16; i++) {
+        s_access_list[i] = (i < BOARD_CHANNEL_COUNT) ? (i + 1) : 0;
+        s_color_list[i]  = (i < 8) ? k_default_colors[i] : 0x888888;
+    }
+}
+
+static void access_cfg_load(void)
+{
+    access_cfg_reset();
+    Preferences p;
+    if (!p.begin("s3ams-access", true)) return;
+    if (p.getBytesLength("al") == sizeof(s_access_list)) {
+        p.getBytes("al", s_access_list, sizeof(s_access_list));
+    }
+    if (p.getBytesLength("cl") == sizeof(s_color_list)) {
+        p.getBytes("cl", s_color_list, sizeof(s_color_list));
+    }
+    p.end();
+    /* 合法性兜底：通道号必须在 1..16 */
+    for (int i = 0; i < 16; i++) {
+        if (s_access_list[i] < 1 || s_access_list[i] > 16) s_access_list[i] = i + 1;
+    }
+}
+
+static void access_cfg_save(void)
+{
+    Preferences p;
+    if (!p.begin("s3ams-access", false)) return;
+    p.putBytes("al", s_access_list, sizeof(s_access_list));
+    p.putBytes("cl", s_color_list, sizeof(s_color_list));
+    p.end();
+}
+
 /* ==========================================================================
  * 日志环形缓冲（行式：48 行 × 每行 160 字符，带单调递增 seq）
  *
@@ -210,7 +258,7 @@ void web_log_install_hook(void)
 }
 
 /* App 版本 */
-static const char *APP_VERSION = "1.1.19-s3ams";
+static const char *APP_VERSION = "1.1.20-s3ams";
 
 /* 单 IO 双微动：每路一个 ADC 脚（开始位/停止位共用同一脚，电阻编码） */
 static const int BOARD_SENSOR_PINS[BOARD_CHANNEL_COUNT] = BOARD_PIN_SENSOR_ARRAY;
@@ -299,6 +347,40 @@ static bool json_get_str(const String &body, const char *key, char *out, size_t 
     }
     out[n] = '\0';
     return true;
+}
+
+/* 取整数数组：{"key":[1,2,3]} → out[]，返回元素个数（最多 maxn） */
+static int json_get_int_array(const String &body, const char *key, long *out, int maxn)
+{
+    if (!out || maxn <= 0) return 0;
+    String k = String("\"") + key + "\"";
+    int idx = body.indexOf(k);
+    if (idx < 0) return 0;
+    idx = body.indexOf('[', idx + k.length());
+    if (idx < 0) return 0;
+    int end = body.indexOf(']', idx);
+    if (end < 0) return 0;
+    int n = 0;
+    int i = idx + 1;
+    while (i < end && n < maxn) {
+        while (i < end && (body[i] == ' ' || body[i] == ',' ||
+                           body[i] == '\t' || body[i] == '\n' || body[i] == '\r')) {
+            i++;
+        }
+        if (i >= end) break;
+        bool neg = false;
+        if (body[i] == '-') { neg = true; i++; }
+        long v = 0;
+        bool any = false;
+        while (i < end && isDigit((unsigned char)body[i])) {
+            v = v * 10 + (body[i] - '0');
+            i++;
+            any = true;
+        }
+        if (any) out[n++] = neg ? -v : v;
+        else i++;
+    }
+    return n;
 }
 
 /* ==========================================================================
@@ -465,6 +547,19 @@ static void handle_status(void)
     json += "\"jog_speed_pct\":" + String(jog_speed_pct) + ",";
     json += "\"pullback_sec\":" + String(settings_get_pullback_timeout_common()) + ",";
     json += "\"current_access\":" + String((cur >= 0) ? (cur + 1) : 0) + ",";
+    /* v1.1.20：通道映射 + 颜色（网页「通道设置」用；之前完全没输出） */
+    json += "\"access_list\":[";
+    for (int ai = 0; ai < BOARD_CHANNEL_COUNT; ai++) {
+        if (ai) json += ",";
+        json += String(s_access_list[ai]);
+    }
+    json += "],";
+    json += "\"color_list\":[";
+    for (int ai = 0; ai < BOARD_CHANNEL_COUNT; ai++) {
+        if (ai) json += ",";
+        json += String((unsigned long)s_color_list[ai]);
+    }
+    json += "],";
     json += "\"mem_free\":" + String(esp_get_free_heap_size()) + ",";
     /* 主循环任务栈的历史最小剩余字节（v1.1.7 加）：
        8KB 栈时 /log 请求会把栈用穿（Stack canary panic），
@@ -1335,6 +1430,34 @@ static void handle_ap_set(void)
     }
 }
 
+/* /access_set（POST）：保存通道映射 + 颜色（v1.1.20 真实现）
+ * 前端 body: {access_list:[1..8], color_list:[0xRRGGBB, ...]} */
+static void handle_access_set(void)
+{
+    if (!server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"ok\":false,\"err\":\"no body\"}");
+        return;
+    }
+    String body = server.arg("plain");
+    long al[16], cl[16];
+    int na = json_get_int_array(body, "access_list", al, 16);
+    int nc = json_get_int_array(body, "color_list", cl, 16);
+    if (na <= 0 && nc <= 0) {
+        server.send(400, "application/json",
+            "{\"ok\":false,\"err\":\"缺少 access_list / color_list\"}");
+        return;
+    }
+    for (int i = 0; i < 16 && i < na; i++) {
+        if (al[i] >= 1 && al[i] <= 16) s_access_list[i] = (int)al[i];
+    }
+    for (int i = 0; i < 16 && i < nc; i++) {
+        s_color_list[i] = (uint32_t)(cl[i] & 0xFFFFFF);
+    }
+    access_cfg_save();
+    log_i("通道设置已保存: access=%d 项 color=%d 项", na, nc);
+    server.send(200, "application/json", "{\"ok\":true,\"info\":\"通道与颜色已保存\"}");
+}
+
 /* 本固件不支持的可选动作：明确回 ok:false，避免 404 让前端弹「请求失败」 */
 static void handle_unsupported(void)
 {
@@ -1348,7 +1471,8 @@ static void handle_unsupported(void)
 void web_server_start(void)
 {
     s_boot_time = millis();
-    mqtt_cfg_load();   /* v1.1.19：读回已保存的 MQTT 参数（只用于显示/保存） */
+    mqtt_cfg_load();     /* v1.1.19：读回已保存的 MQTT 参数（只用于显示/保存） */
+    access_cfg_load();   /* v1.1.20：读回通道映射 + 颜色 */
 
     wifi_init();
 
@@ -1375,7 +1499,7 @@ void web_server_start(void)
     server.on("/assist_set", HTTP_POST, handle_ok);
     server.on("/retract_set", HTTP_POST, handle_ok);
     server.on("/temper_set", HTTP_POST, handle_ok);
-    server.on("/access_set", HTTP_POST, handle_ok);
+    server.on("/access_set", HTTP_POST, handle_access_set);
     server.on("/color_set", HTTP_POST, handle_ok);
     server.on("/act485_set", HTTP_POST, handle_act485_set);
     server.on("/bus485raw", HTTP_GET, handle_bus485raw);

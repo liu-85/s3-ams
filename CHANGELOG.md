@@ -6,6 +6,37 @@ RELEASE.md 在 `release/vX.Y.Z/`。
 
 ---
 
+## v1.1.20 —— 修通道颜色设置不生效 + 说明全部折叠 + 文档补 IO 定义
+
+**2026-10-26**
+
+**现象**：通道设置选完颜色、弹窗关闭后，颜色**两秒内变回原色**。
+
+**根因（两处叠加）**：
+
+1. 前端 `applyStatus` 在固件不返回 `access_list` 时走 `else if (!accessFromDevice)`，
+   该分支**从不置 `accessFromDevice=true`** → 每 2 秒轮询都重建整块为默认色。
+2. 固件**根本不存** `access_list`/`color_list`，`/access_set` 是 `handle_ok` 空占位。
+
+**修复**：
+
+- 前端：默认映射只画一次；设备数据真变才重建；只有「使用中」变时走 `updateCurrentOnly()`。
+- 固件：新增 `s_access_list[16]`/`s_color_list[16]`，存 NVS `s3ams-access`；
+  `/status` 输出两数组；`/access_set` 改为 `handle_access_set()` 真保存；
+  新增 `json_get_int_array()` 解析 JSON 数组。
+
+**说明折叠**：
+
+- `collapseTips()` 显式 `det.open=false`；微动页动态说明每次重绘后也 `collapseTips()`。
+- OTA 说明修正：`esp-ams-s3.bin`（ESP-IDF 遗留）→ **`firmware.bin`**（PlatformIO）；
+  去掉「MicroPython 版」段落。
+- 「退料参数」卡片加提示：本卡当前固件未实现，调退料时长用「退料时间」卡片。
+
+**文档**：`docs/HARDWARE.md` 新增 1.4 完整 GPIO 速查（按 GPIO 号）、
+1.5 临时直连微动配对表，并标注 ADC2 陷阱。
+
+---
+
 ## v1.1.19 —— WEB 控制台改版 + 网络配置补齐 MQTT 设置
 
 **2026-10-26**

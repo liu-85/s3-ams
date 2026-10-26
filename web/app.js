@@ -267,6 +267,7 @@
                 }
                 var det = document.createElement('details');
                 det.className = d.className;
+                det.open = false;   /* 一律默认折叠（现场要求） */
                 var sum = document.createElement('summary');
                 sum.textContent = (d.className.indexOf('warn') >= 0)
                     ? TIP_SUMMARY_WARN : TIP_SUMMARY;
@@ -454,11 +455,10 @@
              * ★ 必须走 tipSet()：这段说明已经被 collapseTips() 包成
              *   <details><summary>…</summary><div class="tipin"> 了，
              *   直接 el.innerHTML= 会把 summary 一起冲掉 → 以后再也展不开。 */
-            var chip = board.name.indexOf('C3') >= 0 ? 'c3' : 's3';
             tipSet($('ota_tip'),
-                '要传的是 <code>idf.py build</code> 出来的 ' +
-                '<code>esp-ams-' + chip + '.bin</code>' +
-                '（或 <code>build/esp-ams-' + chip + '.bin</code>）。' +
+                '要传的是 <b>PlatformIO 编译出来的 <code>firmware.bin</code></b>' +
+                '（<code>.pio/build/s3ams/firmware.bin</code>，或发布包 ' +
+                '<code>release/vX.Y.Z/firmware.bin</code>）。' +
                 '传错文件不会造成损坏 —— 设备会检查首字节是不是 <code>0xE9</code>，' +
                 '不是就直接中止，分区一个字节都不动。');
         }
@@ -480,17 +480,27 @@
                 '</details>';
         }
 
-        /* ---- 通道设置 ---- */
+        /* ---- 通道设置 ----
+         * ★ v1.1.20 修：固件不返回 access_list 时（本固件早期就是），
+         *   原来走 else-if 分支会**每 2 秒把整块重建成默认色**，
+         *   把用户刚在弹窗里选的颜色冲掉 —— 现象就是"选完一关弹窗，两秒后变回原色"。
+         *   现在：默认映射只画一次；之后只在设备数据真变时重建；
+         *   只有「使用中」标记变时走 updateCurrentOnly（它不动颜色）。 */
         var al = d.access_list || [], cl = d.color_list || [];
-        if (al.length) {
-            var sig = al.join(',') + '|' + cl.join(',') + '|' + cur;
-            if (!accessFromDevice || sig !== lastAccessSig) {
-                if (!accessFromDevice) { renderAccess(al, cl, cur); accessFromDevice = true; }
-                else { updateCurrentOnly(al, cur); }
-                lastAccessSig = sig;
-            }
-        } else if (!accessFromDevice) {
-            renderAccess([1, 2, 3, 4, 5, 6, 7, 8], DEFAULT_COLORS, cur);
+        if (!al.length) {
+            al = [1, 2, 3, 4, 5, 6, 7, 8];
+            if (!cl.length) cl = DEFAULT_COLORS;
+        }
+        var sig = al.join(',') + '|' + cl.join(',');
+        if (!accessFromDevice) {
+            renderAccess(al, cl, cur);
+            accessFromDevice = true;
+            lastAccessSig = sig;
+        } else if (sig !== lastAccessSig) {
+            renderAccess(al, cl, cur);
+            lastAccessSig = sig;
+        } else {
+            updateCurrentOnly(al, cur);
         }
         /* 同步「当前通道」下拉框（只在用户没正在操作时更新） */
         var curSel = $('cur_channel_sel');
@@ -1216,6 +1226,8 @@
             }
 
             $('sensor_list').innerHTML = html;
+            /* 动态生成的说明块也要折叠（boot 时的 collapseTips 只处理了静态 DOM） */
+            collapseTips($('sensor_list'));
 
             var btns = $('sensor_list').getElementsByClassName('sensor-toggle');
             for (var b = 0; b < btns.length; b++) {
