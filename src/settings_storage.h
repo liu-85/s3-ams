@@ -31,7 +31,13 @@ struct SettingsData {
 #define DEFAULT_PULLBACK_TIMEOUT    4
 #define DEFAULT_SLEEP_TIMEOUT_MIN   15
 #define DEFAULT_SCREEN_ALWAYS_ON    0
-#define DEFAULT_AMS_COUNT         4
+/* ★ v1.1.21：AMS 台数上限 2（AMS-A + AMS-B，共 8 料位）。
+ *
+ * 本板 8 个物理通道 ÷ 每台 4 料位 = 2 台。原来写 4 会让打印机看到
+ * AMS-C / AMS-D 两台"幽灵 AMS"（没有任何物理通道），耗材页出现
+ * 重复卡片。改成 2 后 0x05 注册、0x402 序列号、0x103 版本都只报 A/B。 */
+#define MAX_AMS_COUNT             2
+#define DEFAULT_AMS_COUNT         2
 
 // 外部变量（供其他模块访问）
 extern int PULLBACK_TIMEOUT[16];

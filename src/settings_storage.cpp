@@ -72,7 +72,9 @@ void settings_storage_init() {
 
     SCREEN_ALWAYS_ON = (data.screen_always_on != 0);
 
-    if (data.ams_count >= 1 && data.ams_count <= 4) {
+    /* ★ v1.1.21：NVS 里可能还存着旧值 4（幽灵 AMS-C/D 的来源）。
+       上限收到 MAX_AMS_COUNT(2)，旧值不合法 → 回落默认 2。 */
+    if (data.ams_count >= 1 && data.ams_count <= MAX_AMS_COUNT) {
         AMS_COUNT = data.ams_count;
     } else {
         AMS_COUNT = DEFAULT_AMS_COUNT;

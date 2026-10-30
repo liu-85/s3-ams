@@ -6,7 +6,48 @@ RELEASE.md 在 `release/vX.Y.Z/`。
 
 ---
 
+## v1.1.21 —— 只保留 AMS-A / AMS-B（修耗材页重复 AMS）
+
+**2026-10-30**
+
+**症状**：打印机耗材页显示 `AMS(4)`，但列表里出现 AMS-A 1 个、AMS-B 3 个、
+AMS-C 3 个、AMS-D 2 个，共 9 张卡片，其中大量是重复的空卡。
+
+**根因（四个叠加）**：
+
+1. `DEFAULT_AMS_COUNT = 4`，但本板 8 通道 ÷ 4 料位 = **2 台**，C/D 是幽灵设备
+2. v1.1.16 把 **全部 4×4 = 16 个料位**设成 `online`，`send_for_Fxx()` 的 0x05
+   注册循环条件正是 `statu == online` → 幽灵 C/D 也被注册
+3. `0x402` 序列号包越界时 `AMS_num = 0` **照样应答**（其他长包都是 return），
+   打印机问台 2/3/4… 时收到"台 0 的序列号"→ 可能认为又发现一台
+4. 版本包只有 **21 字节**，台号只写 `[20]`；esp32s3-485 是 22 字节 + `[20]`/`[21]`
+   都写（BMCU370 读 `[20]`、Tianshu 读 `[21]`）
+
+**改动**：
+
+- `settings_storage.h`：`MAX_AMS_COUNT = 2`、`DEFAULT_AMS_COUNT = 2`
+- `settings_storage.cpp`：NVS 旧值 4 不合法 → 回落默认 2
+- `BambuBus_init()`：`statu = (a < AMS_COUNT) ? online : offline`（只有真 2 台在线）
+- `send_for_long_packge_version()`：
+  - `0x402` 越界 `return`，`datas[33]` 前先查 `data_length > 33`
+  - `0x103` 包 21 → **22 字节**，`[20]`/`[21]` 都写台号
+- `send_for_Fxx()`：`0x06` 握手 `buf[5] >= AMS_COUNT` 直接 `return`
+
+**没改（有意保留）**：
+
+- `use_flag`（Dxx 应答 `[19]`）语义错位 —— 送料中报 `0x02`、使用中报 `0x04`、
+  空料位强制 `0x02`。这套从 Tianshu 继承，A1 进料已实测跑通，改它风险大于收益。
+  详见 `docs/PROTOCOL-485.md` 4.1 节。
+- `0x06` 的 `res_for_06_num` 台号锁死 —— 当初为修"第二台不出现"加的，
+  本次只加越界保护。若仍重复，下一步动它。
+
+**文档**：`docs/PROTOCOL-485.md` 新增 4.1 `use_flag` 语义对照、
+4.2 `[41]` 2bit 料位位域、4.3 HMS 错误码不在 485 上、5.4 AMS 台数规则。
+
+---
+
 ## v1.1.20 —— 修通道颜色设置不生效 + 说明全部折叠 + 文档补 IO 定义
+
 
 **2026-10-26**
 

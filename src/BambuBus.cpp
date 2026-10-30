@@ -609,25 +609,24 @@ void BambuBus_init()
         data_save.filament[3][3].color_B = 0x20;
     }
 
-    for (auto &i : data_save.filament)
+    for (int a = 0; a < 4; a++)
     {
-        for (auto &j : i)
+        for (int j = 0; j < 4; j++)
         {
-            /* ★ v1.1.16：默认 online，和 Tianshu 保持一致。
+            /* ★ v1.1.21：只有前 AMS_COUNT 台（=2）报 online，其余报 offline。
              *
-             * 移植时这里曾按"没有 NFC 探测"改成了 offline，但漏掉了
-             * Tianshu 在 AMCU_init() 末尾的 set_filament_online(i,j,true)
-             * （原注释："但为了确保设备能被正确识别，默认设置所有通道为在线状态"）。
-             * 结果 is_filament_online() 永远 false → AMCU_motion() 的
-             * need_send_out 分支判离线 → log_w("送料被挡") + AMCU_drive_stop()
-             * → **离合不吸合、电机不转**。而退料走 is_need_pull_back，
-             * 不检查 online，所以退料正常 —— 现场症状"进料没吸合、退料正常"。
+             * v1.1.16 曾把全部 4×4 料位一律设 online（照 Tianshu），本意是修
+             * "进料被 is_filament_online() 判离线挡住"。但本板 8 通道 ÷ 4 料位
+             * 只有 2 台 AMS，AMS-C/AMS-D 是没有任何物理通道的幽灵设备 ——
+             * 报 online 后 send_for_Fxx() 的 0x05 注册循环会把它们也注册上去，
+             * 打印机的耗材页就多出 C/D 两组卡片。
              *
-             * 本硬件没有 NFC/RFID，无法真实探测料盘有无耗材。报 offline
-             * 只会让打印机拒绝进料，比报 online 更糟；报 online 后若该通道
-             * 确实没装料，打印机会在进料超时后正常报错，符合预期。 */
-            j.statu = online;
-            j.motion_set = waiting;
+             * 保留 online 的初衷不变（有料位就要能进料），只是限定在真实存在的
+             * 2 台之内。幽灵台报 offline 后，0x05/0x402/0x103/filament 长包
+             * 都会因为 `>= AMS_COUNT` 直接 return，不再应答。 */
+            data_save.filament[a][j].statu =
+                (a < AMS_COUNT) ? online : offline;
+            data_save.filament[a][j].motion_set = waiting;
         }
     }
 
@@ -1146,10 +1145,17 @@ void send_for_Fxx(unsigned char *buf, int length)
     }
     else if (buf[4] == 0x06)
     {
-        uint8_t ams_num = buf[5];
+        uint8_t req_num = buf[5];
+
+        /* ★ v1.1.21：超出本板台数（2 台）的 0x06 握手直接不应答。
+         * 原来无条件回包，打印机问台 2/3/4… 也照样收到应答，
+         * 会被当成"又发现一台 AMS"，耗材页就多出重复卡片。 */
+        if (req_num >= AMS_COUNT) return;
+
+        uint8_t ams_num = req_num;
         if (res_for_06_num == 0xFF)
         {
-            res_for_06_num = ams_num;
+            res_for_06_num = req_num;
         }
         else
         {
@@ -1288,8 +1294,19 @@ void send_for_long_packge_version(unsigned char *buf, int length)
 
     if (printer_data_long.type == 0x402)
     {
-        AMS_num = printer_data_long.datas[33];
-        if (AMS_num >= AMS_COUNT) AMS_num = 0;
+        /* 台号在 payload[33]；包不够长时退回 payload[0]（esp32s3-485 同做法） */
+        if (printer_data_long.data_length > 33)
+            AMS_num = printer_data_long.datas[33];
+        else if (printer_data_long.data_length > 0)
+            AMS_num = printer_data_long.datas[0];
+
+        /* ★ v1.1.21：越界台号**直接不应答**，不再 clamp 到 0。
+         *
+         * 原来 `if (AMS_num >= AMS_COUNT) AMS_num = 0;` 会让台 2/3/4/5… 的查询
+         * 统统拿回"台 0 的序列号"，打印机据此可能认为又发现一台 AMS，
+         * 耗材页就会出现重复的 AMS-A。本工程其他长包（0x21A/0x211/0x05）
+         * 都是 `>= AMS_COUNT` 就 return，只有这里不一致 —— 统一成不应答。 */
+        if (AMS_num >= AMS_COUNT) return;
 
         payload = long_packge_version_serial_number_AMS08;
         payload_len = sizeof(long_packge_version_serial_number_AMS08);
@@ -1302,23 +1319,30 @@ void send_for_long_packge_version(unsigned char *buf, int length)
     {
         /* ★ v1.1.13：版本号改成可配置的真实值，不再用 Tianshu 编造的 90.00.00.00。
          *
-         * 包结构（21 字节）：
+         * 包结构（22 字节）：
          *   [0..3]  版本号 uint32 小端，例如 01.00.06.87 → 57 06 00 01
          *   [4..8]  型号代号 "AMS08"（AMS / AMS 2 Pro / AMS HT 这条线）
          *   [9..19] 补 0
-         *   [20]    台号
+         *   [20]    台号（BMCU370 读这里）
+         *   [21]    台号（Tianshu/旧固件读这里）
+         *
+         * ★ v1.1.21：长度 21 → 22，两个台号位置都写。
+         * 原来只有 21 字节、台号只写 [20]，如果打印机读 [21] 就完全读不到台号
+         * → 多台 AMS 台号全是 0 → 耗材页出现重复设备。
+         * esp32s3-485 的 build_ver() 就是 22 字节 + 两处都写。
          *
          * 打印机会同时校验「版本号是否在白名单」和「型号代号」，两者任一
          * 对不上都可能弹「当前固件仅支持 AMS / AMS 2 Pro / AMS HT」。 */
-        static unsigned char ver_pkt[21];
+        static unsigned char ver_pkt[22];
         uint32_t v = s_ams_fw_ver;
         ver_pkt[0] = (unsigned char)(v & 0xFF);
         ver_pkt[1] = (unsigned char)((v >> 8) & 0xFF);
         ver_pkt[2] = (unsigned char)((v >> 16) & 0xFF);
         ver_pkt[3] = (unsigned char)((v >> 24) & 0xFF);
         memcpy(ver_pkt + 4, "AMS08", 5);
-        memset(ver_pkt + 9, 0x00, 11);
+        memset(ver_pkt + 9, 0x00, 13);   /* [9..21] 清零 */
         ver_pkt[20] = AMS_num;
+        ver_pkt[21] = AMS_num;
 
         payload = ver_pkt;
         payload_len = sizeof(ver_pkt);
