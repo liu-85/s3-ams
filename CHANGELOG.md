@@ -6,6 +6,57 @@ RELEASE.md 在 `release/vX.Y.Z/`。
 
 ---
 
+## v1.1.23 —— 修流量校准阶段微动不送料
+
+**2026-10-31**
+
+**症状**：流量校准阶段，送料微动压下（WEB 上显示"开始位(空) 触发"）但电机不转、
+不送料。v1.1.14（微动直连、不看状态机）测试正常。
+
+**根因（两处叠加）**：
+
+1. **准入太严** —— `check_buffer_status()` 用 `is_channel_printing()` 做准入，
+   它只认 `on_use` / `before_on_use` / `stop_on_use`。流量校准时打印机会持续
+   从 AMS 抽料，但状态机 `motion` 可能一直停在 `idle`（帧没匹配上）
+   → 整段 `return`，微动触发完全没有电机动作。
+
+2. **刚送就被停** —— 即使放行，`AMCU_run()` 的执行顺序是
+   `check_buffer_status()` → `AMCU_motion()`。前者刚吸合离合、驱动电机，
+   后者 `get_filament_motion()` 把 `idle` 映射成 `waiting`，
+   `case waiting:` 里一句 `AMCU_drive_stop()` 立刻把电机停掉。
+   现场表现就是"微动触发了，电机不动/只抖一下"。
+
+3. 附带：`AMCU_buffer_assist_feed()` 里 `s_buffer_feed_decision = 1` 只在
+   `AMCU_drive_channel()` 返回 true 时置位 —— 离合**已吸合**（走 else 分支）
+   或正在等吸合时都不置位，导致上面第 2 条的判据失效。
+
+**改动**：
+
+- `BambuBus.cpp`：`_filament_ext` 增加 `last_statu` / `last_statu_ms`，
+  在 `process_motion_state_machine()` 每次收到状态帧时记录
+- `BambuBus.cpp`：新增 `is_channel_in_use()`（含 `send_out`）、
+  `is_channel_active_recently(ch, 10s)`（看 statu 是否 0x03/0x07/0x09/0x0F）、
+  `get_channel_last_statu()`
+- `AMCU.cpp` `check_buffer_status()`：准入改为
+  `is_channel_in_use(cur) || is_channel_active_recently(cur, 10000)`，
+  并加限流诊断日志（每 3 秒最多一条，只在"有触发但被挡"时打）
+- `AMCU.cpp` `AMCU_motion()` `case waiting`：`s_buffer_feed_decision[svc] == 1`
+  时不停电机
+- `AMCU.cpp` `AMCU_motion()` 兜底 `else` 分支：缓冲送料中只清跟随状态、
+  不停电机
+- `AMCU.cpp` `AMCU_buffer_assist_feed()`：`start_trig` 一进来就置
+  `s_buffer_feed_decision = 1`
+- `web_server.cpp`：`/status` 的 `feed` 段增加 `statu`（最近一次 statu 位掩码）
+  和 `active`（10s 内是否判为在用）
+
+**"其他通道不读"的限制不变** —— 仍然只认 `cur` 一路。
+
+**诊断用法**：流量校准中若微动还是不动，看 WEB 右侧日志有没有
+`缓冲被挡：cur=N ... last_statu=0xXX`；或看 `/status` 的 `feed.statu`。
+`0x00/0x01` = 打印机没把这一路当在用，`0x03/0x07/0x09/0x0F` = 在用。
+
+---
+
 ## v1.1.22 —— 修 v1.1.21 引入的 `[0500-40A3]` AMS A 通信异常
 
 **2026-10-31**

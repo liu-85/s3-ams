@@ -540,9 +540,14 @@ void AMCU_buffer_assist_feed(int channel)
 
     if (start_trig) {
         /* 需要补料：吸合离合 + 进料 */
+        /* ★ v1.1.23：先把决策置 1，再谈电机。
+         * 原来只在 AMCU_drive_channel() 返回 true 时才置 1 —— 离合**已经吸合**
+         * （走下面的 else 分支）或正在等吸合时都不置 1，于是
+         * AMCU_motion() 的 case waiting 看到 decision==0 就把电机停了，
+         * 现场表现就是"微动压下了，电机不转"。 */
+        s_buffer_feed_decision[channel] = 1;
         if (!clutch_is_engaged(channel + 1)) {
             if (AMCU_drive_channel(channel + 1, MOTOR_DIR_FEED, MOTOR_SPEED_FULL)) {
-                s_buffer_feed_decision[channel] = 1;
                 s_buffer_last_feedback[channel] = now;
             }
         } else {
@@ -800,7 +805,41 @@ void check_buffer_status() {
     int cur = get_now_filament_num();
     if (cur < 0 || cur >= BOARD_CHANNEL_COUNT) return;   /* 本板只有 8 个物理通道 */
 
-    if (!is_channel_printing(cur)) return;               /* 必须正在打印（on_use 等） */
+    /* ★★★ v1.1.23：准入放宽 —— 三道判据任一成立就允许缓冲微动 ★★★
+     *
+     * 现场（2026-10-31）：**流量校准阶段微动压下不送料**，
+     * 而 v1.1.14（微动直连、不看状态机）测试正常。
+     *
+     * 根因：is_channel_printing() 只认 on_use / before_on_use / stop_on_use。
+     * 流量校准时打印机持续从 AMS 抽料，但状态机可能一直停在 idle
+     * （帧没匹配上），于是这里直接 return → 微动触发完全没有电机动作。
+     *
+     * 判据（任一成立即可）：
+     *   ① motion 处于使用态（含 send_out）
+     *   ② 最近 10 秒内打印机对该通道报过 0x03/0x07/0x09/0x0F（"在用"）
+     *
+     * "其他通道不读"的限制保持不变 —— 仍然只认 cur。 */
+    const bool active = is_channel_in_use(cur) ||
+                        is_channel_active_recently(cur, 10000);
+    if (!active)
+    {
+        /* 限流诊断：每 3 秒最多一条，只在"有微动触发但被挡"时打，
+           方便下次遇到"微动没反应"直接看出卡在哪一关。 */
+        static uint32_t s_last_gate_log = 0;
+        const uint32_t now_ms = millis();
+        const bool start_trig = sensor_triggered(cur, SENSOR_START);
+        const bool stop_trig  = sensor_triggered(cur, SENSOR_STOP);
+        if ((start_trig || stop_trig) && (now_ms - s_last_gate_log > 3000))
+        {
+            s_last_gate_log = now_ms;
+            log_w("缓冲被挡：cur=%d 微动(开始=%d 停止=%d) 该通道不在使用态"
+                  "（motion 非 send_out/on_use 等，且 10s 内 statu 非 0x03/07/09/0F，"
+                  "last_statu=0x%02X）",
+                  cur, start_trig ? 1 : 0, stop_trig ? 1 : 0,
+                  get_channel_last_statu(cur));
+        }
+        return;
+    }
     if (!sensor_channel_enabled(cur)) return;            /* 该通道必须开了缓冲送料 */
 
     /* ★ v1.1.12：before_on_use 由 AMCU_motion() 的 follow_feed_pump()
@@ -1033,7 +1072,11 @@ void AMCU_motion() {
         }
         return;
     } else {
-        follow_feed_reset_ex(true);
+        /* v1.1.23：缓冲微动正在送料时，只清跟随状态、别停电机
+           （follow_feed_reset_ex(true) 会 motor_stop()，把刚送起来的料掐掉） */
+        const bool buffer_feeding =
+            (svc >= 0 && svc < BOARD_CHANNEL_COUNT && s_buffer_feed_decision[svc] == 1);
+        follow_feed_reset_ex(!buffer_feeding);
     }
 
     switch (act) {
@@ -1083,8 +1126,25 @@ void AMCU_motion() {
            打印机在退料途中切换当前料位时 cur 会变成别的通道，
            那个通道的 act 是 waiting → 这里 AMCU_drive_stop() 会把
            正在反转的退料电机掐掉，表现为"退料只转了一下就停"。 */
-        if (!is_need_pull_back) {
-            AMCU_drive_stop();
+        /* ★★★ v1.1.23：缓冲微动正在送料时也不能停 ★★★
+         *
+         * 现场（2026-10-31）：流量校准阶段微动压下、状态机 motion 还是 idle
+         * → get_filament_motion() 映射成 waiting → 走到这里 AMCU_drive_stop()，
+         * 把 check_buffer_status() 在同一轮循环里**刚驱动起来**的送料电机
+         * 立刻停掉。表现就是"微动触发了，但电机不动/只抖一下"。
+         *
+         * 执行顺序（AMCU_run）：
+         *     check_buffer_status();   ← 这里吸合离合 + 电机转
+         *     AMCU_motion();           ← case waiting: drive_stop() 立刻掐掉
+         *
+         * 所以这里必须让位给缓冲逻辑：该通道 s_buffer_feed_decision == 1
+         * 就说明"微动要求补料"，不能停。 */
+        {
+            const bool buffer_feeding =
+                (svc >= 0 && svc < BOARD_CHANNEL_COUNT && s_buffer_feed_decision[svc] == 1);
+            if (!is_need_pull_back && !buffer_feeding) {
+                AMCU_drive_stop();
+            }
         }
         RGB_BLUE;
         break;

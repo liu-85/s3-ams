@@ -258,7 +258,7 @@ void web_log_install_hook(void)
 }
 
 /* App 版本 */
-static const char *APP_VERSION = "1.1.22-s3ams";
+static const char *APP_VERSION = "1.1.23-s3ams";
 
 /* 单 IO 双微动：每路一个 ADC 脚（开始位/停止位共用同一脚，电阻编码） */
 static const int BOARD_SENSOR_PINS[BOARD_CHANNEL_COUNT] = BOARD_PIN_SENSOR_ARRAY;
@@ -640,6 +640,11 @@ static void handle_status(void)
         else if (is_channel_on_use(dn))          phase = "on_use";
         else if (is_channel_stop_on_use(dn))     phase = "stop_on_use";
         json += "\"phase\":\"" + String(phase) + "\",";
+        /* v1.1.23：最近一次收到的 statu 位掩码。流量校准阶段"微动没反应"时
+           看它就知道打印机到底把这一路当成什么状态（0x0F=使用中、0x03=送料、
+           0x09=进入使用、0x00/0x01=空闲）。 */
+        json += "\"statu\":" + String((unsigned)get_channel_last_statu(dn)) + ",";
+        json += "\"active\":" + String(is_channel_active_recently(dn, 10000) ? 1 : 0) + ",";
         json += "\"follow\":" + String(amcu_follow_feed_active() ? 1 : 0);
         json += "},";
     }

@@ -76,6 +76,18 @@ extern void send_uart(const unsigned char *data, uint16_t length);
  * 用于 AMCU 在打印阶段启用缓冲器微动辅助送料。 */
 extern bool is_channel_printing(int num);
 
+/* v1.1.23：比 is_channel_printing() 宽一级，多认 send_out（送料中）。
+ * 缓冲微动（check_buffer_status）用它做准入 —— 流量校准阶段打印机会
+ * 长时间停在 send_out，用 is_channel_printing() 会把微动整段挡掉。 */
+extern bool is_channel_in_use(int num);
+
+/* v1.1.23：该通道最近 window_ms 内是否被打印机当成"在用"（看 statu 位掩码，
+ * 不看 motion）。流量校准阶段状态机会停在 idle，只能靠它判断。 */
+extern bool is_channel_active_recently(int num, uint32_t window_ms);
+
+/* v1.1.23：诊断用，最近一次收到的 statu（0 = 还没收到过） */
+extern uint8_t get_channel_last_statu(int num);
+
 /* 打印阶段细分查询（v1.1.12）。
  *
  * 为什么需要：map_internal_to_api() 把 before_on_use / on_use / stop_on_use

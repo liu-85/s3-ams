@@ -117,6 +117,16 @@ struct _filament_ext
     uint32_t last_time_ticks = 0;
     bool is_sendout_onuse_timing = false;
     uint32_t sendout_onuse_start_ticks = 0;
+
+    /* ★ v1.1.23：最近一次收到的 statu 位掩码 + 时间戳（ms）。
+     *
+     * 为什么要单独存：流量校准阶段打印机会持续从 AMS 抽料，但状态机可能
+     * 一直停在 idle（帧没匹配上 on_use/before_on_use），于是
+     * is_channel_printing() 为 false → 缓冲微动被整段挡掉、微动压下不送料。
+     * 存下 statu 就能判断"打印机最近是否把这一路当成在用"，
+     * 同时 /status 里可以直接看到它，排查"微动没反应"不用再靠抓包。 */
+    uint8_t  last_statu    = 0;
+    uint32_t last_statu_ms = 0;
 };
 
 static _filament_ext filament_ext[4][4];
@@ -309,6 +319,10 @@ static bool process_motion_state_machine(
     _filament *fil = &data_save.filament[ams_num][filament_channel];
 
     ext->last_time_ticks = (uint32_t)get_time64();
+
+    /* v1.1.23：记下这一路最近一次收到的 statu，供缓冲微动的准入判定和 /status 诊断用 */
+    ext->last_statu    = statu_flags;
+    ext->last_statu_ms = (uint32_t)get_time64();
 
     uint8_t loaded = get_loaded_filament(ams_num);
     bool allow_any = (loaded == 0xFF) || (loaded == filament_channel);
@@ -1457,6 +1471,59 @@ bool is_channel_printing(int num)
     return (m == _filament_motion_internal::on_use ||
             m == _filament_motion_internal::before_on_use ||
             m == _filament_motion_internal::stop_on_use);
+}
+
+/* ★ v1.1.23：缓冲微动用的"该通道正在被打印机使用"判定。
+ *
+ * 比 is_channel_printing() 多认一个 send_out（送料中）。
+ *
+ * 现场（2026-10-31）：流量校准阶段微动压下不送料，而 v1.1.14（微动直连、
+ * 不看状态）是正常的。查下来是 check_buffer_status() 用 is_channel_printing()
+ * 做准入，而它只认 on_use / before_on_use / stop_on_use —— **不含 send_out**。
+ * 流量校准时打印机一直在从 AMS 抽料，但状态机停在 send_out（或尚未转到
+ * on_use），于是整段 return，微动触发也白搭。
+ *
+ * 缓冲送料的本意就是"缓冲器空了就补"，只要该通道正在被打印机使用
+ * （送料中 / 进入使用 / 使用中 / 停止使用）就该生效。 */
+bool is_channel_in_use(int num)
+{
+    if (num < 0 || num >= 16) return false;
+    switch (filament_ext[num / 4][num % 4].motion)
+    {
+    case _filament_motion_internal::send_out:
+    case _filament_motion_internal::before_on_use:
+    case _filament_motion_internal::on_use:
+    case _filament_motion_internal::stop_on_use:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* ★ v1.1.23：该通道"最近是否被打印机当成在用"—— 看 statu 位掩码，不看 motion。
+ *
+ * 流量校准阶段打印机持续从 AMS 抽料，但状态机可能一直停在 idle
+ * （帧没匹配上 on_use/before_on_use），这时 is_channel_in_use() 也是 false。
+ * 只要最近 window_ms 内打印机对该通道报过 0x03/0x07/0x09/0x0F 之一，
+ * 就认为它"在用"，缓冲微动应该生效。 */
+bool is_channel_active_recently(int num, uint32_t window_ms)
+{
+    if (num < 0 || num >= 16) return false;
+    const _filament_ext *ext = &filament_ext[num / 4][num % 4];
+    if (ext->last_statu_ms == 0) return false;
+
+    const uint8_t s = ext->last_statu;
+    const bool in_use = (s == 0x03) || (s == 0x07) || (s == 0x09) || (s == 0x0F);
+    if (!in_use) return false;
+
+    return ((uint32_t)get_time64() - ext->last_statu_ms) < window_ms;
+}
+
+/* 供 /status 诊断：该通道最近一次收到的 statu（0 表示还没收到过） */
+uint8_t get_channel_last_statu(int num)
+{
+    if (num < 0 || num >= 16) return 0;
+    return filament_ext[num / 4][num % 4].last_statu;
 }
 
 /* 打印阶段细分查询（v1.1.12）—— 见 BambuBus.h 注释 */
