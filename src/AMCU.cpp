@@ -982,7 +982,14 @@ void AMCU_init() {
     RGB_BLUE;
 
     BambuBus_init();
-    delay(500);
+    /* ★ v1.1.28：这 500ms 也不能让 485 失联。
+     * 原来直接 delay(500)，期间打印机发来的帧一个都不处理 ——
+     * 虽然 500ms 通常短于打印机的重试周期，但和后面 WiFi 那 25 秒叠加起来
+     * 就是"上电就报 40A3"的直接原因。这里改成边等边收。 */
+    for (int i = 0; i < 50; i++) {
+        BambuBus_run();
+        delay(10);
+    }
 
     for (int i = 0; i < 4; i++) {
         for (int j = 0; j < 4; j++) {

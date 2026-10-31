@@ -258,7 +258,7 @@ void web_log_install_hook(void)
 }
 
 /* App 版本 */
-static const char *APP_VERSION = "1.1.27-s3ams";
+static const char *APP_VERSION = "1.1.28-s3ams";
 
 /* 单 IO 双微动：每路一个 ADC 脚（开始位/停止位共用同一脚，电阻编码） */
 static const int BOARD_SENSOR_PINS[BOARD_CHANNEL_COUNT] = BOARD_PIN_SENSOR_ARRAY;
@@ -397,15 +397,47 @@ static int json_get_int_array(const String &body, const char *key, long *out, in
  *   3. WiFi.begin(ssid, pass) 连路由器
  *   4. 成功 → 保持 AP 关闭；失败 → 重新打开 AP（否则手机连不回来）
  * ========================================================================== */
+/* ★★★ v1.1.28：WiFi 等待期间必须继续服务 485 ★★★
+ *
+ * 现场（2026-10-31）：间歇性 [0500-40A3] AMS(或AMSlite) A 通信异常，
+ * 反复出现、换哪个版本都可能中招，和改了哪一行代码无关。
+ *
+ * 根因：setup() 的顺序是
+ *     AMCU_init();        ← 485 在这里初始化好
+ *     web_server_start(); ← wifi_init() → wifi_try_connect() **阻塞等 WiFi**
+ *     loop();             ← 到这一步才开始跑 AMCU_run() → BambuBus_run()
+ *
+ * 而 wifi_try_connect() 里的等待上限是 WIFI_TIMEOUT_MS = **25000ms**：
+ *     while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_TIMEOUT_MS)
+ *         delay(200);
+ * 这期间主循环一次都没跑 → 485 一个字节都不处理、一个应答都不发 →
+ * 打印机等不到 AMS-A 的应答 → 直接报 [0500-40A3]。
+ *
+ * 为什么表现为"间歇"：WiFi 1~3 秒连上时，落在打印机重试窗口内，看着正常；
+ * 连得慢（信号弱 / DHCP 慢 / 路由器刚上电）就必然超时。这也解释了
+ * "同一份固件有时正常有时报错"、"刷完重启就报、再重启又好"。
+ *
+ * 修法：把所有"等待类"延时都换成这个 —— 每 5ms 跑一次 BambuBus_run()，
+ * 485 全程在线。BambuBus_run() 只做收发与状态机记账、不驱动电机，
+ * 开机阶段调用是安全的。 */
+static void wifi_wait(uint32_t ms)
+{
+    const uint32_t start = millis();
+    while (millis() - start < ms) {
+        BambuBus_run();   /* ★ 485 必须一直在应答 */
+        delay(5);
+    }
+}
+
 static void wifi_stop_ap(void)
 {
     /* ★ 对标 esp-ams-s3 stop_sta_reconnect：真把射频切走让给 STA，
        不能只 softAPdisconnect —— 单射频下 AP 还占着 STA 就 NO_AP_FOUND */
     if (s_ap_mode) {
         WiFi.softAPdisconnect();
-        delay(200);
+        wifi_wait(200);        /* v1.1.28：原来是裸 delay，485 会失联 */
         WiFi.mode(WIFI_OFF);   /* 让射频完全下线，再切 STA */
-        delay(200);
+        wifi_wait(200);
         s_ap_mode = false;
     }
 }
@@ -430,33 +462,41 @@ static bool wifi_try_connect(const char *ssid, const char *pass, bool provision)
 
     if (provision) {
         wifi_stop_ap();
-        delay(300);
+        wifi_wait(300);        /* v1.1.28：原来是裸 delay */
     }
 
     esp_wifi_set_ps(WIFI_PS_NONE);
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(false);
     WiFi.disconnect();
-    delay(200);
+    wifi_wait(200);            /* v1.1.28：原来是裸 delay */
     WiFi.begin(ssid, pass);
 
     uint32_t start = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_TIMEOUT_MS) {
-        delay(200);
+        /* ★★★ v1.1.28 关键修复 ★★★
+         * 这里原来只有 delay(200) —— 最长 25 秒完全不处理 485，
+         * 打印机等不到应答就报 [0500-40A3]。改成 wifi_wait()，
+         * 每 200ms 里都在跑 BambuBus_run()。 */
+        wifi_wait(200);
     }
     if (WiFi.status() == WL_CONNECTED) {
         s_wifi_connected = true;
         s_ap_mode = false;
         s_net_mode = 0;
-        log_i("WiFi 已连接: %s / IP %s (PS=NONE, AP 已关)",
-              ssid, WiFi.localIP().toString().c_str());
+        /* v1.1.28：把耗时打出来 —— 这个数就是"485 曾失联多久"。
+         * >3000ms 说明 WiFi 慢是 40A3 的直接诱因（现在已在等待期间服务 485，
+         * 不会因此丢应答，但保留这个数便于判断路由器状态）。 */
+        log_i("WiFi 已连接: %s / IP %s (PS=NONE, AP 已关, 连接耗时 %ums)",
+              ssid, WiFi.localIP().toString().c_str(),
+              (unsigned)(millis() - start));
         return true;
     }
 
     log_w("WiFi 连接失败（SSID=%s, status=%d）", ssid, (int)WiFi.status());
     if (provision) {
         log_i("配网失败，重新打开配置热点");
-        delay(300);
+        wifi_wait(300);        /* v1.1.28：原来是裸 delay */
         wifi_start_ap();
     }
     return false;
@@ -499,6 +539,11 @@ static void handle_app_js(void)
 {
     server.send_P(200, "application/javascript; charset=utf-8", WEB_APP_JS);
 }
+
+/* ★ v1.1.28：主循环最大阻塞间隔（在 main.cpp 里统计）
+ * 用来判断 40A3 是不是"主循环卡住导致 485 丢字节"造成的。 */
+extern uint32_t amcu_loop_max_gap_ms(void);
+extern void amcu_loop_gap_reset(void);
 
 static void handle_status(void)
 {
@@ -605,7 +650,8 @@ static void handle_status(void)
                 ",\"tx_402\":" + String((unsigned long)t402) +
                 ",\"tx_103\":" + String((unsigned long)t103) +
                 ",\"tx_06\":" + String((unsigned long)t06) +
-                ",\"last_rx_age_ms\":" + String(age) + "}";
+                ",\"last_rx_age_ms\":" + String(age) +
+                ",\"loop_max_gap_ms\":" + String((unsigned long)amcu_loop_max_gap_ms()) + "}";
     }
     json += "},";
 
@@ -1229,7 +1275,8 @@ static void handle_diag_reset(void)
     clutch_reset_conflict_count();
     amcu_clutch_reset_diag();
     bambubus_485_stats_reset();   /* v1.1.25：485 计数也清零，便于改接线后对照 */
-    server.send(200, "application/json", "{\"ok\":true,\"info\":\"已清除离合冲突/仲裁计数与 485 链路计数\"}");
+    amcu_loop_gap_reset();        /* v1.1.28：主循环最大间隔也重新统计 */
+    server.send(200, "application/json", "{\"ok\":true,\"info\":\"已清除离合冲突/仲裁计数、485 链路计数与主循环间隔\"}");
 }
 
 /* 清零全部料位的计米。

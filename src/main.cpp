@@ -60,6 +60,20 @@ static void watchdog_feed() {
     esp_task_wdt_reset();
 }
 
+/* ★ v1.1.28：主循环最大阻塞时间诊断
+ *
+ * 485 是逐字节轮询的（BambuBus_UART_Poll 在主循环里），主循环任何一次
+ * 卡顿都会让 UART FIFO 积压、溢出、丢字节 → CRC 错 → 丢帧 →
+ * 打印机报 [0500-40A3]。所以"主循环最大间隔"是判断通信异常的关键指标：
+ *   loop_max_gap < 20ms  → 主循环健康，40A3 与固件时序无关（查硬件）
+ *   loop_max_gap > 100ms → 有东西在卡主循环（Web 大响应 / OTA / 日志刷屏）
+ * 用 /diag_reset 清零后重新统计。 */
+static uint32_t s_loop_max_gap_ms = 0;
+static uint32_t s_loop_last_ms = 0;
+
+uint32_t amcu_loop_max_gap_ms(void) { return s_loop_max_gap_ms; }
+void amcu_loop_gap_reset(void) { s_loop_max_gap_ms = 0; s_loop_last_ms = 0; }
+
 // Web 服务器已在 web_server.h 中声明
 
 void setup() {
@@ -95,6 +109,16 @@ void setup() {
 void loop() {
     static unsigned long last_wdt = 0;
 
+    /* v1.1.28：记录主循环最大间隔（诊断 485 丢帧用，见上面注释） */
+    {
+        const uint32_t now_ms = millis();
+        if (s_loop_last_ms != 0) {
+            const uint32_t gap = now_ms - s_loop_last_ms;
+            if (gap > s_loop_max_gap_ms) s_loop_max_gap_ms = gap;
+        }
+        s_loop_last_ms = now_ms;
+    }
+
     watchdog_feed();
 
     // 核心业务逻辑（含 BambuBus / 缓冲器微动 / AMCU_motion）
@@ -109,5 +133,14 @@ void loop() {
         watchdog_feed();
     }
 
-    delay(10);  // 小延迟，让出 CPU 给其他任务（WiFi/Web）
+    /* ★ v1.1.28：10ms → 2ms
+     *
+     * 485 是 1.2288 Mbps ≈ 154 字节/ms。原来每轮 delay(10)，
+     * 意味着每 10ms 才把 UART FIFO 排空一次（FIFO 只有 256 字节）——
+     * 打印机一旦连发两帧就可能溢出丢字节，CRC 错 → 丢帧 →
+     * 表现成 [0500-40A3] 通信异常。
+     *
+     * 2ms 时单轮最多积压 ~300 字节，仍在 FIFO 容量内；同时 2ms 的
+     * vTaskDelay 足够把 CPU 让给 WiFi/Web 任务，不影响吞吐。 */
+    delay(2);
 }
