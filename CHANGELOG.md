@@ -6,6 +6,40 @@ RELEASE.md 在 `release/vX.Y.Z/`。
 
 ---
 
+## v1.1.27 —— 修「退料时又送料」+ 缓冲送料超时 WEB 可调
+
+**2026-10-31**
+
+现场：**打印结束、退料过程中开始微动一触发，又把料送进挤出机了。**
+
+**根因：`statu == 0x09` 在 485 协议里是歧义的**，必须结合 motion_flag：
+
+| statu | motion_flag | 含义 | 该送料吗 |
+|---|---|---|---|
+| 0x09 | 0xA5 | before_on_use（准备使用） | ✅ |
+| 0x09 | 0x3F | before_pull_back（**准备退料**） | ❌ |
+
+`is_channel_active_recently()` 只看 statu 就判"在用" → 退料准备阶段准入放行 →
+缓冲器因料刚退走而空 → 开始微动触发 → 又送料。
+
+`if (is_need_pull_back) return;` 也挡不住：退料 3 秒超时后该标志就被清了，
+但打印机可能还在退料流程里（motion 仍是 pull_back）。
+
+**修法**：
+1. `is_channel_active_recently()` 排除 `before_pull_back` / `pull_back`
+2. 新增 `is_channel_pulling_back()`，`check_buffer_status()` 准入前显式让出
+3. `buffer_feed_holds_motor()` 同步排除（退料不许被缓冲送料顶掉）
+
+**新增缓冲送料超时 WEB 可调**：`POST /feed_timeout_set {"sec":n}`，
+默认 30 秒，范围 5~120，NVS `s3ams-feed` 的 `feed_timeout`。
+按实测正常补料 7~15 秒，30 秒留一倍余量。到点强制停并打日志，
+之后要等微动松开才重新计时（不是每 30 秒重试一次）。
+
+改动：`src/BambuBus.cpp` / `.h` / `src/AMCU.cpp` / `src/settings_storage.h` /
+`.cpp` / `src/web_server.cpp` / `web/index.html` / `web/app.js` / `src/web_files.h`
+
+---
+
 ## v1.1.26 —— 修「停印后电机一直转」+ 电流剖析 + 送料 PWM 可调
 
 **2026-10-31**

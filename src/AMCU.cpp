@@ -27,19 +27,17 @@
 #define LED_BLINK_INTERVAL 500
 #define BUFFER_FEED_TIMEOUT_MS 15000  /* 缓冲送料无反馈超时（15秒回退停止） */
 
-/* ★ v1.1.25：缓冲送料**连续**运行时长的硬上限（30 秒）。
+/* ★ v1.1.25：缓冲送料**连续**运行时长的硬上限。
  *
- * 为什么必须加：v1.1.23 让 AMCU_motion() 的 case waiting 在
- * s_buffer_feed_decision==1 时不再 drive_stop()，本意是别把刚送起来的
- * 料掐掉。但如果微动卡在"一直触发"（常闭接反、线短接到 GND、焊接后
- * 引脚被拉死），decision 就永远是 1，而 start_trig 分支每轮都刷新
- * s_buffer_last_feedback → BUFFER_FEED_TIMEOUT_MS(15s) 永远不到 →
- * **电机会一直转不停**。
- *
- * 电机长时间堵转/空转的后果不只是发热：大电流会让 3.3V/5V 电源纹波变大，
- * 485 收发器最容易受影响 —— 表现就是打印机报 [0500-40A3] 通信异常。
- * 所以这里加一道与"无反馈超时"独立的、按**连续运行时长**计的兜底。 */
-#define BUFFER_FEED_MAX_MS 30000
+ * ★ v1.1.27：改成 WEB 可调（`settings_get_feed_timeout()`，默认 30 秒，范围 5~120）。
+ * 这里的宏只是文档性的默认值，实际一律走配置。 */
+#define BUFFER_FEED_MAX_MS_DEFAULT 30000
+
+/* 当前生效的连续送料上限（毫秒） */
+static inline uint32_t buffer_feed_max_ms(void)
+{
+    return (uint32_t)settings_get_feed_timeout() * 1000u;
+}
 
 // ============================
 //  全局变量
@@ -578,8 +576,10 @@ static bool buffer_feed_holds_motor(int ch)
     if (s_buffer_feed_start[ch] == 0) return false;
 
     const uint32_t now = millis();
-    if (now - s_buffer_feed_start[ch] > BUFFER_FEED_MAX_MS) return false;
+    if (now - s_buffer_feed_start[ch] > buffer_feed_max_ms()) return false;
     if (now - s_buffer_last_feedback[ch] > BUFFER_FEED_TIMEOUT_MS) return false;
+    /* v1.1.27：退料阶段绝不能占着电机（否则退料会被缓冲送料顶掉） */
+    if (is_channel_pulling_back(ch)) return false;
     if (!is_channel_in_use(ch) && !is_channel_active_recently(ch, BUFFER_IN_USE_WINDOW_MS))
         return false;
     return true;
@@ -625,19 +625,19 @@ void AMCU_buffer_assist_feed(int channel)
 
     uint32_t now = millis();
 
-    /* ★ v1.1.25：连续送料时长兜底（见 BUFFER_FEED_MAX_MS 注释）。
+    /* ★ v1.1.25：连续送料时长兜底（见 buffer_feed_max_ms() 注释）。
      * 微动卡死时 decision 永远是 1、start_trig 每轮刷新 feedback 时间戳，
      * 15 秒的"无反馈超时"永远不触发 → 电机无限转 → 电源纹波 → 485 误码。
      * 这里按"从 decision 置 1 开始算的连续时长"硬性截断。 */
     if (s_buffer_feed_decision[channel] == 1 && s_buffer_feed_start[channel] != 0 &&
-        (now - s_buffer_feed_start[channel]) > BUFFER_FEED_MAX_MS)
+        (now - s_buffer_feed_start[channel]) > buffer_feed_max_ms())
     {
         AMCU_drive_stop();
         s_buffer_feed_decision[channel] = 0;
         s_buffer_feed_start[channel] = 0;
         log_w("缓冲送料超时强制停：通道%d 连续送料超过 %d 秒（微动可能卡在触发态，"
               "检查该路微动是否常闭接反/短接到 GND）", channel + 1,
-              (int)(BUFFER_FEED_MAX_MS / 1000));
+              (int)settings_get_feed_timeout());
         return;
     }
 
@@ -912,6 +912,19 @@ void check_buffer_status() {
      * 所以改成只认"当前使用通道"一个，其他通道的微动状态根本不读。 */
     int cur = get_now_filament_num();
     if (cur < 0 || cur >= BOARD_CHANNEL_COUNT) return;   /* 本板只有 8 个物理通道 */
+
+    /* ★★★ v1.1.27：退料阶段（准备退料 / 正在退料）整段让出 ★★★
+     *
+     * 现场（2026-10-31）：**打印结束、退料过程中开始微动一触发，
+     * 又把料送进挤出机了**。
+     *
+     * 只靠上面那句 `if (is_need_pull_back) return;` 挡不住：
+     * 退料 3 秒超时后 is_need_pull_back 就被清了，但打印机可能还在退料
+     * 流程里（motion 仍是 before_pull_back / pull_back）。这时缓冲器因为
+     * 料刚退走而空了 → 开始微动触发 → 这里放行 → 又送料。
+     *
+     * 所以判据要落到 motion 上，而不是那个 3 秒就失效的布尔量。 */
+    if (is_channel_pulling_back(cur)) return;
 
     /* ★★★ v1.1.23：准入放宽 —— 三道判据任一成立就允许缓冲微动 ★★★
      *

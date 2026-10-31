@@ -85,6 +85,11 @@ extern bool is_channel_in_use(int num);
  * 不看 motion）。流量校准阶段状态机会停在 idle，只能靠它判断。 */
 extern bool is_channel_active_recently(int num, uint32_t window_ms);
 
+/* ★ v1.1.27：该通道是否处于退料阶段（before_pull_back / pull_back）。
+ * 缓冲补料必须整段让出 —— 退料 3 秒超时后 is_need_pull_back 已清，
+ * 但打印机可能还在退料流程里，此时送料会把刚退出来的料又塞回挤出机。 */
+extern bool is_channel_pulling_back(int num);
+
 /* v1.1.23：诊断用，最近一次收到的 statu（0 = 还没收到过） */
 extern uint8_t get_channel_last_statu(int num);
 

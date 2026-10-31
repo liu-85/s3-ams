@@ -258,7 +258,7 @@ void web_log_install_hook(void)
 }
 
 /* App 版本 */
-static const char *APP_VERSION = "1.1.26-s3ams";
+static const char *APP_VERSION = "1.1.27-s3ams";
 
 /* 单 IO 双微动：每路一个 ADC 脚（开始位/停止位共用同一脚，电阻编码） */
 static const int BOARD_SENSOR_PINS[BOARD_CHANNEL_COUNT] = BOARD_PIN_SENSOR_ARRAY;
@@ -548,6 +548,8 @@ static void handle_status(void)
     json += "\"pullback_sec\":" + String(settings_get_pullback_timeout_common()) + ",";
     /* v1.1.26：自动送料 PWM（WEB「参数设置」可调，范围 40~100） */
     json += "\"feed_pwm\":" + String(settings_get_feed_pwm()) + ",";
+    /* v1.1.27：缓冲送料连续运行上限（秒，5~120） */
+    json += "\"feed_timeout\":" + String(settings_get_feed_timeout()) + ",";
     json += "\"current_access\":" + String((cur >= 0) ? (cur + 1) : 0) + ",";
     /* v1.1.20：通道映射 + 颜色（网页「通道设置」用；之前完全没输出） */
     json += "\"access_list\":[";
@@ -1450,6 +1452,37 @@ static void handle_ams_ver_set(void)
  * 前端 post('/pullback_set', {sec: 4})，单位秒，范围 3~30。
  * 本硬件是单电机 + 8 离合，全局一个值，这里统一写 16 路并持久化。
  * 改完立即生效（下一次退料就用新值），不用重启。 */
+/* ★ v1.1.27：/feed_timeout_set {"sec":n} —— 缓冲送料连续运行上限
+ *
+ * 现场要解决的问题：打印中「开始微动」一直压着（停止微动不触发 / 微动卡死），
+ * 缓冲逻辑会一直送料，电机长时间空转，料被顶进挤出机。
+ * 到点强制停，等微动松开或停止位触发后重新计时。
+ *
+ * 默认 30 秒（实测正常补料一次 7~15 秒，留一倍余量），范围 5~120。 */
+static void handle_feed_timeout_set(void)
+{
+    if (!server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"ok\":false,\"err\":\"no body\"}");
+        return;
+    }
+    String body = server.arg("plain");
+    long sec = 0;
+    if (!json_get_int(body, "sec", &sec)) {
+        server.send(400, "application/json", "{\"ok\":false,\"err\":\"缺少 sec\"}");
+        return;
+    }
+    int saved = settings_set_feed_timeout((int)sec);
+    if (saved < 0) {
+        server.send(200, "application/json",
+            "{\"ok\":false,\"info\":\"送料超时需在 5~120 秒之间\"}");
+        return;
+    }
+    char msg[112];
+    snprintf(msg, sizeof(msg),
+             "{\"ok\":true,\"sec\":%d,\"info\":\"缓冲送料超时已保存\"}", saved);
+    server.send(200, "application/json", msg);
+}
+
 /* ★ v1.1.26：/feed_pwm_set {"pct":n} —— 自动送料（微动缓冲送料）的电机 PWM
  *
  * 现场为什么要可调：本硬件电机 PWM 低于 80 起不来，但不同电机/减速箱、
@@ -1642,6 +1675,7 @@ void web_server_start(void)
     server.on("/ams_ver_set", HTTP_POST, handle_ams_ver_set);
     server.on("/pullback_set", HTTP_POST, handle_pullback_set);
     server.on("/feed_pwm_set", HTTP_POST, handle_feed_pwm_set);   /* v1.1.26 */
+    server.on("/feed_timeout_set", HTTP_POST, handle_feed_timeout_set);  /* v1.1.27 */
     server.on("/assist_set", HTTP_POST, handle_ok);
     server.on("/retract_set", HTTP_POST, handle_ok);
     server.on("/temper_set", HTTP_POST, handle_ok);

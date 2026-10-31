@@ -50,6 +50,18 @@ struct SettingsData {
 #define FEED_PWM_MIN              40
 #define FEED_PWM_MAX              100
 
+/* ★ v1.1.27：缓冲送料连续运行上限（秒），WEB 可调。
+ *
+ * 现场：打印中"开始微动"一直压着（停止微动不触发 / 微动卡死），
+ * 缓冲逻辑会一直送料，电机长时间空转 → 发热 + 电源纹波 + 料被顶进挤出机。
+ * 这里给一个硬性上限，到点强制停，等微动松开（或停止位触发）后重新计时。
+ *
+ * 默认 30 秒：实测正常补料一次 7~15 秒（见 2026-10-31 电流日志），
+ * 30 秒留了一倍余量，不会误杀正常补料。 */
+#define DEFAULT_FEED_TIMEOUT_SEC  30
+#define FEED_TIMEOUT_SEC_MIN      5
+#define FEED_TIMEOUT_SEC_MAX      120
+
 // 外部变量（供其他模块访问）
 extern int PULLBACK_TIMEOUT[16];
 extern int SLEEP_TIMEOUT_MIN;
@@ -57,6 +69,7 @@ extern bool SCREEN_ALWAYS_ON;
 extern int CHANNEL_MODE[16];
 extern int AMS_COUNT;
 extern int FEED_PWM;   /* v1.1.26：自动送料 PWM 百分比（40~100） */
+extern int FEED_TIMEOUT_SEC;  /* v1.1.27：缓冲送料连续运行上限（秒，5~120） */
 
 // 初始化设置存储（在setup中调用）
 void settings_storage_init();
@@ -87,3 +100,9 @@ int settings_get_pullback_timeout_common(void);
  *   get: 当前生效值（启动时已从 NVS 载入） */
 int settings_set_feed_pwm(int pct);
 int settings_get_feed_pwm(void);
+
+/* ★ v1.1.27：缓冲送料连续运行上限（秒）
+ *   set: 5~120 合法，返回实际保存值；越界返回 -1 且不改动
+ *   get: 当前生效值 */
+int settings_set_feed_timeout(int sec);
+int settings_get_feed_timeout(void);

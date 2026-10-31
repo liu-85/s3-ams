@@ -524,6 +524,10 @@
         if (typeof d.feed_pwm === 'number' && d.feed_pwm > 0) {
             syncFeedPwmInput(d.feed_pwm);
         }
+        /* ---- 缓冲送料超时（v1.1.27） ---- */
+        if (typeof d.feed_timeout === 'number' && d.feed_timeout > 0) {
+            syncFeedTimeoutInput(d.feed_timeout);
+        }
 
         /* ---- 硬件 ---- */
         updateHardware(d.hardware);
@@ -1746,6 +1750,31 @@
         });
     }
 
+    /* ---- 缓冲送料超时（v1.1.27）---- */
+    function syncFeedTimeoutInput(sec) {
+        var el = $('feed_timeout');
+        if (el && document.activeElement !== el) {
+            var s = String(sec);
+            if (el.value !== s) el.value = s;
+        }
+    }
+
+    function saveFeedTimeout() {
+        var v = parseInt(val('feed_timeout'), 10);
+        if (isNaN(v)) {
+            toast('请填送料超时秒数', 'bad');
+            return;
+        }
+        if (v < 5 || v > 120) {
+            toast('送料超时请在 5~120 秒之间', 'bad');
+            return;
+        }
+        post('/feed_timeout_set', { sec: v }, function (d) {
+            if (d && typeof d.sec === 'number') syncFeedTimeoutInput(d.sec);
+            toast((d && d.info) || '已保存', (d && d.ok) ? 'ok' : 'bad');
+        });
+    }
+
     /* =======================================================================
        蠕动参数
        ======================================================================= */
@@ -2500,6 +2529,7 @@
         $('btn_jog_save').onclick = saveJog;
         $('btn_pullback_save').onclick = savePullback;
         $('btn_feed_pwm_save').onclick = saveFeedPwm;
+        $('btn_feed_timeout_save').onclick = saveFeedTimeout;
         $('btn_creep_save').onclick = saveCreep;
         $('btn_assist_toggle').onclick = toggleAssist;
         $('btn_assist_hold').onclick = toggleAssistHold;

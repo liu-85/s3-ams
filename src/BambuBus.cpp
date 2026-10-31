@@ -1533,18 +1533,52 @@ bool is_channel_in_use(int num)
  * 流量校准阶段打印机持续从 AMS 抽料，但状态机可能一直停在 idle
  * （帧没匹配上 on_use/before_on_use），这时 is_channel_in_use() 也是 false。
  * 只要最近 window_ms 内打印机对该通道报过 0x03/0x07/0x09/0x0F 之一，
- * 就认为它"在用"，缓冲微动应该生效。 */
+ * 就认为它"在用"，缓冲微动应该生效。
+ *
+ * ★★★ v1.1.27：退料阶段必须排除 ★★★
+ *
+ * 现场（2026-10-31）：**打印结束、退料过程中，开始微动一触发就又把料
+ * 送进挤出机了**。
+ *
+ * 根因就在这个函数：`statu == 0x09` 有两种完全相反的含义 ——
+ *     0x09 + motion_flag 0xA5 = before_on_use    （准备使用，该送料）
+ *     0x09 + motion_flag 0x3F = before_pull_back （准备退料，绝不能送料）
+ * 这里只看 statu、不看 motion_flag，于是"准备退料"被当成"在用" →
+ * 缓冲准入放行 → 微动一触发就 AMCU_drive_channel(FEED) →
+ * **退料刚退出来的料又被塞回挤出机**。
+ *
+ * 所以只要 motion 已经是 before_pull_back / pull_back，一律不算"在用"。 */
 bool is_channel_active_recently(int num, uint32_t window_ms)
 {
     if (num < 0 || num >= 16) return false;
     const _filament_ext *ext = &filament_ext[num / 4][num % 4];
     if (ext->last_statu_ms == 0) return false;
 
+    /* ★ v1.1.27：退料阶段一律不算"在用"（见上） */
+    if (ext->motion == _filament_motion_internal::before_pull_back ||
+        ext->motion == _filament_motion_internal::pull_back) {
+        return false;
+    }
+
     const uint8_t s = ext->last_statu;
     const bool in_use = (s == 0x03) || (s == 0x07) || (s == 0x09) || (s == 0x0F);
     if (!in_use) return false;
 
     return ((uint32_t)get_time64() - ext->last_statu_ms) < window_ms;
+}
+
+/* ★ v1.1.27：该通道是否处于"退料阶段"（准备退料 / 正在退料）
+ *
+ * 缓冲补料必须整段让出 —— 不只是 is_need_pull_back 那一瞬间。
+ * 原因：退料 3 秒超时后 is_need_pull_back 就被清了，但打印机可能还在
+ * 退料流程里（motion 仍是 pull_back），此时微动一触发就会把刚退出来的
+ * 料又送回去。 */
+bool is_channel_pulling_back(int num)
+{
+    if (num < 0 || num >= 16) return false;
+    const _filament_motion_internal m = filament_ext[num / 4][num % 4].motion;
+    return (m == _filament_motion_internal::before_pull_back ||
+            m == _filament_motion_internal::pull_back);
 }
 
 /* 供 /status 诊断：该通道最近一次收到的 statu（0 表示还没收到过） */

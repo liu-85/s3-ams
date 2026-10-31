@@ -13,8 +13,11 @@ int AMS_COUNT;
 
 /* ★ v1.1.26：自动送料 PWM（独立 NVS 命名空间，见 settings_storage.h 注释） */
 int FEED_PWM = DEFAULT_FEED_PWM;
+/* ★ v1.1.27：缓冲送料连续运行上限（秒），同一个命名空间 */
+int FEED_TIMEOUT_SEC = DEFAULT_FEED_TIMEOUT_SEC;
 #define FEED_PWM_NVS_NS  "s3ams-feed"
 #define FEED_PWM_NVS_KEY "feed_pwm"
+#define FEED_TIMEOUT_NVS_KEY "feed_timeout"
 
 static Preferences s_settings_prefs;
 #define SETTINGS_KEY "settings"
@@ -37,10 +40,14 @@ static void feed_pwm_load(void) {
     Preferences p;
     if (p.begin(FEED_PWM_NVS_NS, true)) {
         int v = p.getInt(FEED_PWM_NVS_KEY, DEFAULT_FEED_PWM);
+        int t = p.getInt(FEED_TIMEOUT_NVS_KEY, DEFAULT_FEED_TIMEOUT_SEC);
         p.end();
         FEED_PWM = (v >= FEED_PWM_MIN && v <= FEED_PWM_MAX) ? v : DEFAULT_FEED_PWM;
+        FEED_TIMEOUT_SEC = (t >= FEED_TIMEOUT_SEC_MIN && t <= FEED_TIMEOUT_SEC_MAX)
+                           ? t : DEFAULT_FEED_TIMEOUT_SEC;
     } else {
         FEED_PWM = DEFAULT_FEED_PWM;
+        FEED_TIMEOUT_SEC = DEFAULT_FEED_TIMEOUT_SEC;
     }
 }
 
@@ -57,6 +64,22 @@ int settings_set_feed_pwm(int pct) {
 
 int settings_get_feed_pwm(void) {
     return FEED_PWM;
+}
+
+/* ★ v1.1.27：缓冲送料连续运行上限（秒） */
+int settings_set_feed_timeout(int sec) {
+    if (sec < FEED_TIMEOUT_SEC_MIN || sec > FEED_TIMEOUT_SEC_MAX) return -1;
+    FEED_TIMEOUT_SEC = sec;
+    Preferences p;
+    if (p.begin(FEED_PWM_NVS_NS, false)) {
+        p.putInt(FEED_TIMEOUT_NVS_KEY, sec);
+        p.end();
+    }
+    return sec;
+}
+
+int settings_get_feed_timeout(void) {
+    return FEED_TIMEOUT_SEC;
 }
 
 void settings_storage_init() {
