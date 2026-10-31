@@ -6,6 +6,49 @@ RELEASE.md 在 `release/vX.Y.Z/`。
 
 ---
 
+## v1.1.26 —— 修「停印后电机一直转」+ 电流剖析 + 送料 PWM 可调
+
+**2026-10-31**
+
+现场：**"都停止打印了，电机还是一直在转"**。
+
+**根因（v1.1.23 埋的）**：v1.1.23 让 `AMCU_motion()` 在
+`s_buffer_feed_decision==1` 时不停电机，但 `decision` **只在
+`AMCU_buffer_assist_feed()` 内部被清零**。一旦准入失败（打印机不发了 /
+该通道不在用 / cur 切走），那个函数再也不会被调用 → decision 永远停在 1 →
+电机无限转。**需要清理的时候，恰恰是清理函数不会被调用的时候。**
+
+**修法三层**：
+1. 判据收紧 —— 新增 `buffer_feed_holds_motor(ch)`：decision 之外还要看
+   有起点、未超 30s 硬上限、15s 内有反馈、该通道仍"在用"，五条全满足才让位
+2. 独立看门狗 —— `buffer_feed_watchdog()` 放在 `AMCU_run()` 最前面，
+   不受任何 early-return 影响；清掉脏 decision，并在电机确实被这一路占着时停机
+3. 窗口统一 —— `BUFFER_IN_USE_WINDOW_MS=5000`，准入与让位必须用同一个值
+   （否则"准入开着、让位关了"，电机只抖一下）
+
+**效果**：停止打印后最多 5 秒电机自动停。
+
+**移除微动日志**：删掉每 3 秒一条的「缓冲被挡：…」（现场嫌吵）。
+排查改用 `/sensor_raw` 或 `/status` 的 `feed.statu` / `feed.active`。
+
+**新增电机电流剖析**：每次连续运行 ≥0.5s 停止时打印
+`电流统计: 进料 PWM=100% 时长=3200ms 启动峰值=1980mA 稳态均值=420mA 稳态峰值=505mA 全程最大=1980mA`
+- 启动峰值用**原始值**（`current_sense_raw_ma()` 新增）—— IIR(shift=3) 时间常数
+  约 80ms，会把 50~200ms 的启动尖峰削掉一大截，按滤波值定阈值会定得太低 → 误跳
+- 稳态均值/峰值用**滤波值**，不被噪声带偏
+- 网页「电机电流采样」卡片显示「最近一次运行」；`/status` 的 `current.last`
+- 跟随送料的 250ms 脉冲不计（否则日志被刷爆）
+
+**新增自动送料 PWM 可调**：`POST /feed_pwm_set {"pct":n}`，范围 40~100，默认 100，
+立即生效并写 NVS `s3ams-feed`（独立命名空间，避免改动 SettingsData 导致老配置校验和失效）。
+网页「参数设置」页新增卡片。实测 PWM 低于 80 电机起不来，填 40~79 会提示。
+
+改动：`src/AMCU.cpp` / `src/motor.h` / `src/motor.cpp` / `src/current_sense.h` /
+`src/current_sense.cpp` / `src/settings_storage.h` / `src/settings_storage.cpp` /
+`src/web_server.cpp` / `web/index.html` / `web/app.js` / `src/web_files.h`
+
+---
+
 ## v1.1.25 —— 485 链路诊断 + 缓冲送料超时兜底
 
 **2026-10-31**

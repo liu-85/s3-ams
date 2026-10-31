@@ -520,6 +520,11 @@
             syncPullbackInput(d.pullback_sec);
         }
 
+        /* ---- 自动送料 PWM（v1.1.26） ---- */
+        if (typeof d.feed_pwm === 'number' && d.feed_pwm > 0) {
+            syncFeedPwmInput(d.feed_pwm);
+        }
+
         /* ---- 硬件 ---- */
         updateHardware(d.hardware);
 
@@ -945,6 +950,27 @@
             if ($('cur_stall_ma'))  $('cur_stall_ma').value = c.stall_ma;
             if ($('cur_stall_ms'))  $('cur_stall_ms').value = c.stall_ms;
             if ($('cur_blank_ms'))  $('cur_blank_ms').value = c.blank_ms;
+        }
+
+        /* v1.1.26：最近一次运行的电流剖析 —— 标定堵转阈值的实测依据
+         *   启动峰值 = 起动电流（稳态的 3~8 倍，用来定「起步屏蔽」够不够）
+         *   稳态均值 = 正常送料的典型电流（这就是"正常值"）
+         *   稳态峰值 = 正常波动上限；堵转时会明显超过它 */
+        var lastBox = $('current_last');
+        if (lastBox) {
+            var L = c.last;
+            if (L && L.valid) {
+                lastBox.innerHTML =
+                    '<b>最近一次运行</b> ' +
+                    (L.dir === 1 ? '进料' : '退料') + ' · PWM ' + L.pct + '% · ' +
+                    (L.ms / 1000).toFixed(1) + ' 秒<br>' +
+                    '<span class="dim">启动峰值</span> <b>' + fmtMa(L.start_peak) + '</b>' +
+                    '　<span class="dim">稳态均值</span> <b>' + fmtMa(L.run_avg) + '</b>' +
+                    '　<span class="dim">稳态峰值</span> <b>' + fmtMa(L.run_peak) + '</b>';
+            } else {
+                lastBox.innerHTML = '<span class="dim">最近一次运行：还没有有效样本' +
+                    '（连续运行 ≥ 0.5 秒才会统计，跟随送料的 250ms 脉冲不计）</span>';
+            }
         }
     }
 
@@ -1684,6 +1710,38 @@
         }
         post('/pullback_set', { sec: v }, function (d) {
             if (d && typeof d.sec === 'number') syncPullbackInput(d.sec);
+            toast((d && d.info) || '已保存', (d && d.ok) ? 'ok' : 'bad');
+        });
+    }
+
+    /* =======================================================================
+       自动送料 PWM（微动缓冲送料速度，v1.1.26 新增）
+       ======================================================================= */
+    function syncFeedPwmInput(pct) {
+        var el = $('feed_pwm');
+        /* 正在输入时不覆盖（/status 每 2 秒来一次） */
+        if (el && document.activeElement !== el) {
+            var s = String(pct);
+            if (el.value !== s) el.value = s;
+        }
+    }
+
+    function saveFeedPwm() {
+        var v = parseInt(val('feed_pwm'), 10);
+        if (isNaN(v)) {
+            toast('请填送料 PWM', 'bad');
+            return;
+        }
+        if (v < 40 || v > 100) {
+            toast('送料 PWM 请在 40~100 之间（实测低于 80 电机起不来）', 'bad');
+            return;
+        }
+        if (v < 80) {
+            /* 低于 80 大概率带不动，但不硬拦 —— 轻载/空转场景可能有用 */
+            toast('提示：低于 80% 电机可能起不来', 'bad');
+        }
+        post('/feed_pwm_set', { pct: v }, function (d) {
+            if (d && typeof d.pct === 'number') syncFeedPwmInput(d.pct);
             toast((d && d.info) || '已保存', (d && d.ok) ? 'ok' : 'bad');
         });
     }
@@ -2441,6 +2499,7 @@
         };
         $('btn_jog_save').onclick = saveJog;
         $('btn_pullback_save').onclick = savePullback;
+        $('btn_feed_pwm_save').onclick = saveFeedPwm;
         $('btn_creep_save').onclick = saveCreep;
         $('btn_assist_toggle').onclick = toggleAssist;
         $('btn_assist_hold').onclick = toggleAssistHold;

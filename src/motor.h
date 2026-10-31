@@ -48,4 +48,33 @@ int motor_get_speed_pct(void);
 /* 把百分比换算成 LEDC 的 duty 原值（0~255） */
 uint32_t motor_pct_to_duty(int pct);
 
+/* ==========================================================================
+ * v1.1.26：单次运行电流剖析（启动值 / 稳态值 / 峰值）
+ * ==========================================================================
+ * 目的：标定堵转阈值。一次运行结束后给出
+ *   启动峰值（前 blank_ms，起动电流是稳态的 3~8 倍）
+ *   稳态均值 + 稳态峰值（正常送料时的典型值）
+ *   全程最大（接近堵转时这里会明显抬高）
+ * 依据：堵转阈值建议取「稳态均值 × 2」，且明显低于启动峰值。
+ *
+ * 采样：20ms 周期 esp_timer，调 current_sense_ma()（已 IIR 滤波）。
+ * 只有 duration_ms >= MOTOR_PROFILE_MIN_MS 的运行才写日志，避免
+ * 跟随送料（250ms 脉冲）把日志刷爆。 */
+typedef struct {
+    bool        valid;          /* 至少完成过一次有效统计 */
+    motor_dir_t dir;            /* 这次运行的方向 */
+    int         pct;            /* 这次运行的 PWM 百分比 */
+    uint32_t    duration_ms;    /* 运行时长 */
+    int         start_peak_ma;  /* 启动段（前 blank_ms）峰值 */
+    int         run_avg_ma;     /* 稳态段均值 */
+    int         run_peak_ma;    /* 稳态段峰值 */
+    int         max_ma;         /* 全程最大 */
+} motor_current_stat_t;
+
+/* 取最近一次运行的电流统计（返回 false 表示还没有有效样本） */
+bool motor_get_current_stat(motor_current_stat_t *out);
+
+/* 清空统计（/current_clear 或换电机后重新标定用） */
+void motor_reset_current_stat(void);
+
 #endif /* MOTOR_H */

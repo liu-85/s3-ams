@@ -258,7 +258,7 @@ void web_log_install_hook(void)
 }
 
 /* App 版本 */
-static const char *APP_VERSION = "1.1.25-s3ams";
+static const char *APP_VERSION = "1.1.26-s3ams";
 
 /* 单 IO 双微动：每路一个 ADC 脚（开始位/停止位共用同一脚，电阻编码） */
 static const int BOARD_SENSOR_PINS[BOARD_CHANNEL_COUNT] = BOARD_PIN_SENSOR_ARRAY;
@@ -546,6 +546,8 @@ static void handle_status(void)
     json += "\"jog_ms\":" + String(jog_time_ms) + ",";
     json += "\"jog_speed_pct\":" + String(jog_speed_pct) + ",";
     json += "\"pullback_sec\":" + String(settings_get_pullback_timeout_common()) + ",";
+    /* v1.1.26：自动送料 PWM（WEB「参数设置」可调，范围 40~100） */
+    json += "\"feed_pwm\":" + String(settings_get_feed_pwm()) + ",";
     json += "\"current_access\":" + String((cur >= 0) ? (cur + 1) : 0) + ",";
     /* v1.1.20：通道映射 + 颜色（网页「通道设置」用；之前完全没输出） */
     json += "\"access_list\":[";
@@ -699,6 +701,26 @@ static void handle_status(void)
         json += "\"stall_ma\":" + String(current_sense_stall_ma()) + ",";
         json += "\"stall_ms\":" + String(current_sense_stall_ms()) + ",";
         json += "\"blank_ms\":" + String(current_sense_blank_ms());
+        /* ★ v1.1.26：最近一次电机运行的电流剖析 —— 标定堵转阈值用
+         *   start_peak = 启动段(前 800ms)峰值，正常是稳态的 3~8 倍
+         *   run_avg    = 稳态均值，正常送料时的典型值
+         *   run_peak   = 稳态峰值，堵转时这里会明显抬高
+         *   max        = 全程最大
+         * 判读：堵转阈值建议取 run_peak 的 2 倍左右，且明显低于 start_peak。 */
+        motor_current_stat_t st;
+        if (motor_get_current_stat(&st)) {
+            json += ",\"last\":{\"valid\":true";
+            json += ",\"dir\":" + String((int)st.dir);
+            json += ",\"pct\":" + String(st.pct);
+            json += ",\"ms\":" + String((unsigned long)st.duration_ms);
+            json += ",\"start_peak\":" + String(st.start_peak_ma);
+            json += ",\"run_avg\":" + String(st.run_avg_ma);
+            json += ",\"run_peak\":" + String(st.run_peak_ma);
+            json += ",\"max\":" + String(st.max_ma);
+            json += "}";
+        } else {
+            json += ",\"last\":{\"valid\":false}";
+        }
     } else {
         json += "\"ready\":false";
     }
@@ -1428,6 +1450,36 @@ static void handle_ams_ver_set(void)
  * 前端 post('/pullback_set', {sec: 4})，单位秒，范围 3~30。
  * 本硬件是单电机 + 8 离合，全局一个值，这里统一写 16 路并持久化。
  * 改完立即生效（下一次退料就用新值），不用重启。 */
+/* ★ v1.1.26：/feed_pwm_set {"pct":n} —— 自动送料（微动缓冲送料）的电机 PWM
+ *
+ * 现场为什么要可调：本硬件电机 PWM 低于 80 起不来，但不同电机/减速箱、
+ * 不同耗材阻力下的"合适速度"不一样。满速送料容易把缓冲器顶得过满
+ * （顶到停止位后压轮打滑），太慢又跟不上打印机拉料。
+ * 范围 40~100，默认 100。改完立即生效并写 NVS。 */
+static void handle_feed_pwm_set(void)
+{
+    if (!server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"ok\":false,\"err\":\"no body\"}");
+        return;
+    }
+    String body = server.arg("plain");
+    long pct = 0;
+    if (!json_get_int(body, "pct", &pct)) {
+        server.send(400, "application/json", "{\"ok\":false,\"err\":\"缺少 pct\"}");
+        return;
+    }
+    int saved = settings_set_feed_pwm((int)pct);
+    if (saved < 0) {
+        server.send(200, "application/json",
+            "{\"ok\":false,\"info\":\"送料 PWM 需在 40~100 之间（实测低于 80 电机起不来）\"}");
+        return;
+    }
+    char msg[96];
+    snprintf(msg, sizeof(msg),
+             "{\"ok\":true,\"pct\":%d,\"info\":\"自动送料 PWM 已保存\"}", saved);
+    server.send(200, "application/json", msg);
+}
+
 static void handle_pullback_set(void)
 {
     if (!server.hasArg("plain")) {
@@ -1589,6 +1641,7 @@ void web_server_start(void)
     server.on("/comm_set", HTTP_POST, handle_comm_set);
     server.on("/ams_ver_set", HTTP_POST, handle_ams_ver_set);
     server.on("/pullback_set", HTTP_POST, handle_pullback_set);
+    server.on("/feed_pwm_set", HTTP_POST, handle_feed_pwm_set);   /* v1.1.26 */
     server.on("/assist_set", HTTP_POST, handle_ok);
     server.on("/retract_set", HTTP_POST, handle_ok);
     server.on("/temper_set", HTTP_POST, handle_ok);

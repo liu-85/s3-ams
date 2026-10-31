@@ -14,6 +14,7 @@
 #include "ams_log.h"
 #include "motor.h"
 #include "board_pins.h"
+#include "current_sense.h"
 
 #include <driver/ledc.h>
 #include <esp_timer.h>
@@ -40,6 +41,134 @@ static motor_dir_t s_dir = MOTOR_DIR_STOP;
 static int         s_speed_pct = MOTOR_SPEED_FULL;
 static uint32_t    s_dead_time_ms = MOTOR_DEFAULT_DEAD_MS;
 static int64_t     s_dir_started_us = 0;
+
+/* ==========================================================================
+ * v1.1.26：单次运行电流剖析
+ * ==========================================================================
+ * 目的：给"堵转阈值"提供实测依据。一次运行结束后打印
+ *   启动峰值 / 稳态均值 / 稳态峰值 / 全程最大
+ * 现场用法：
+ *   1) 正常送料一次 → 记下"稳态均值"和"稳态峰值"
+ *   2) 人为堵住料（手捏住耗材）→ 记下"稳态峰值"
+ *   3) 堵转阈值取 (2) 的 70% 左右，且明显高于 (1) 的稳态峰值
+ *
+ * 采样周期 20ms：起动电流峰值通常持续 50~200ms，20ms 能捕捉到。
+ * 只对 duration_ms >= MOTOR_PROFILE_MIN_MS 的运行打日志 —— 跟随送料是
+ * 250ms 脉冲，不打印，避免把网页日志刷爆。 */
+#define MOTOR_PROFILE_PERIOD_US   20000   /* 20ms 采样一次 */
+#define MOTOR_PROFILE_MIN_MS      500     /* 短于此的运行不打日志 */
+#define MOTOR_PROFILE_START_MS    800     /* 启动段时长（与堵转保护的 blank_ms 同量级） */
+
+typedef struct {
+    bool     active;        /* 正在统计 */
+    motor_dir_t dir;
+    int      pct;
+    int64_t  start_us;
+    int      start_peak_ma;
+    int      max_ma;
+    int64_t  run_sum_ma;
+    uint32_t run_n;
+    int      run_peak_ma;
+} motor_profile_run_t;
+
+static motor_profile_run_t s_prof = {0};
+static motor_current_stat_t s_last_stat = {0};
+static esp_timer_handle_t s_prof_timer = NULL;
+
+/* 20ms 采样：分「启动段」和「稳态段」两段统计
+ *
+ * 峰值用**原始值**（current_sense_raw_ma），稳态均值用**滤波值**：
+ *   - 启动电流尖峰只持续 50~200ms，IIR(shift=3) 时间常数约 80ms，
+ *     用滤波值会把峰值削掉一大截 → 堵转阈值会被定得过低 → 误跳闸
+ *   - 稳态均值要的是"典型值"，用滤波值才不被噪声带偏 */
+static void motor_profile_cb(void *arg)
+{
+    (void)arg;
+    if (!s_prof.active) return;
+
+    const int ma_raw  = current_sense_raw_ma();   /* 峰值用 */
+    const int ma_filt = current_sense_ma();       /* 均值/稳态峰值用 */
+
+    if (ma_raw > s_prof.max_ma) s_prof.max_ma = ma_raw;
+
+    const int64_t elapsed_us = esp_timer_get_time() - s_prof.start_us;
+    const int64_t start_us_limit = (int64_t)MOTOR_PROFILE_START_MS * 1000;
+
+    if (elapsed_us < start_us_limit) {
+        if (ma_raw > s_prof.start_peak_ma) s_prof.start_peak_ma = ma_raw;
+    } else if (ma_filt >= 0) {          /* -1 = 采样不可用，别污染均值 */
+        s_prof.run_sum_ma += ma_filt;
+        s_prof.run_n++;
+        if (ma_filt > s_prof.run_peak_ma) s_prof.run_peak_ma = ma_filt;
+    }
+}
+
+static void motor_profile_start(motor_dir_t dir, int pct)
+{
+    if (s_prof_timer == NULL) {
+        const esp_timer_create_args_t args = {
+            .callback = motor_profile_cb,
+            .arg      = NULL,
+            .name     = "motor_profile",
+        };
+        if (esp_timer_create(&args, &s_prof_timer) != ESP_OK) {
+            s_prof_timer = NULL;
+            return;
+        }
+        esp_timer_start_periodic(s_prof_timer, MOTOR_PROFILE_PERIOD_US);
+    }
+
+    s_prof.active        = true;
+    s_prof.dir           = dir;
+    s_prof.pct           = pct;
+    s_prof.start_us      = esp_timer_get_time();
+    s_prof.start_peak_ma = 0;
+    s_prof.max_ma        = 0;
+    s_prof.run_sum_ma    = 0;
+    s_prof.run_n         = 0;
+    s_prof.run_peak_ma   = 0;
+}
+
+static void motor_profile_stop(void)
+{
+    if (!s_prof.active) return;
+    s_prof.active = false;
+
+    const uint32_t dur_ms = (uint32_t)((esp_timer_get_time() - s_prof.start_us) / 1000);
+    const int run_avg = (s_prof.run_n > 0) ? (int)(s_prof.run_sum_ma / (int64_t)s_prof.run_n) : 0;
+
+    /* 太短的运行（跟随送料的 250ms 脉冲）既不写日志、也不覆盖 /status 的
+       "最近一次统计" —— 否则网页上永远只看到一串 250ms 的碎片数据。 */
+    if (dur_ms < MOTOR_PROFILE_MIN_MS) return;
+
+    s_last_stat.valid         = true;
+    s_last_stat.dir           = s_prof.dir;
+    s_last_stat.pct           = s_prof.pct;
+    s_last_stat.duration_ms   = dur_ms;
+    s_last_stat.start_peak_ma = s_prof.start_peak_ma;
+    s_last_stat.run_avg_ma    = run_avg;
+    s_last_stat.run_peak_ma   = s_prof.run_peak_ma;
+    s_last_stat.max_ma        = s_prof.max_ma;
+
+    log_i("电流统计: %s PWM=%d%% 时长=%lums 启动峰值=%dmA "
+          "稳态均值=%dmA 稳态峰值=%dmA 全程最大=%dmA",
+          (s_prof.dir == MOTOR_DIR_FEED) ? "进料" : "退料",
+          s_prof.pct, (unsigned long)dur_ms,
+          s_prof.start_peak_ma, run_avg, s_prof.run_peak_ma, s_prof.max_ma);
+}
+
+bool motor_get_current_stat(motor_current_stat_t *out)
+{
+    if (out == NULL || !s_last_stat.valid) return false;
+    *out = s_last_stat;
+    return true;
+}
+
+void motor_reset_current_stat(void)
+{
+    s_last_stat.valid = false;
+    s_prof.active = false;
+}
 
 /* ==========================================================================
  * 内部函数
@@ -148,6 +277,7 @@ void motor_stop(void)
         return;
     }
     motor_apply(0, 0);
+    motor_profile_stop();   /* v1.1.26：收尾电流统计（会打印一条日志） */
     s_dir = MOTOR_DIR_STOP;
     s_dir_started_us = 0;
 }
@@ -187,6 +317,9 @@ bool motor_set_dir_speed(motor_dir_t dir, int speed_pct)
     } else {
         motor_apply(0, speed_pct);
     }
+
+    /* v1.1.26：开始/重启一次电流统计（换向或换速都算新的一段） */
+    motor_profile_start(dir, speed_pct);
 
     if (!same_dir || s_dir_started_us == 0) {
         s_dir_started_us = esp_timer_get_time();

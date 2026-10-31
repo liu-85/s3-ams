@@ -11,6 +11,11 @@ bool SCREEN_ALWAYS_ON;
 int CHANNEL_MODE[16];
 int AMS_COUNT;
 
+/* ★ v1.1.26：自动送料 PWM（独立 NVS 命名空间，见 settings_storage.h 注释） */
+int FEED_PWM = DEFAULT_FEED_PWM;
+#define FEED_PWM_NVS_NS  "s3ams-feed"
+#define FEED_PWM_NVS_KEY "feed_pwm"
+
 static Preferences s_settings_prefs;
 #define SETTINGS_KEY "settings"
 
@@ -27,7 +32,38 @@ static uint32_t calculate_checksum(const SettingsData* data) {
     return checksum;
 }
 
+/* ★ v1.1.26：自动送料 PWM 的读写（独立命名空间，不参与 SettingsData 校验） */
+static void feed_pwm_load(void) {
+    Preferences p;
+    if (p.begin(FEED_PWM_NVS_NS, true)) {
+        int v = p.getInt(FEED_PWM_NVS_KEY, DEFAULT_FEED_PWM);
+        p.end();
+        FEED_PWM = (v >= FEED_PWM_MIN && v <= FEED_PWM_MAX) ? v : DEFAULT_FEED_PWM;
+    } else {
+        FEED_PWM = DEFAULT_FEED_PWM;
+    }
+}
+
+int settings_set_feed_pwm(int pct) {
+    if (pct < FEED_PWM_MIN || pct > FEED_PWM_MAX) return -1;
+    FEED_PWM = pct;
+    Preferences p;
+    if (p.begin(FEED_PWM_NVS_NS, false)) {
+        p.putInt(FEED_PWM_NVS_KEY, pct);
+        p.end();
+    }
+    return pct;
+}
+
+int settings_get_feed_pwm(void) {
+    return FEED_PWM;
+}
+
 void settings_storage_init() {
+    /* 独立命名空间，必须最先加载 —— 下面 !valid 分支会 return，
+       放在那里就永远轮不到它了。 */
+    feed_pwm_load();
+
     SettingsData data;
 
     s_settings_prefs.begin("s3ams", true);  // 只读

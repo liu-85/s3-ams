@@ -52,6 +52,15 @@ bool current_sense_enabled(void);
 int current_sense_mv(void);
 int current_sense_ma(void);
 
+/* ★ v1.1.26：**未滤波**的原始瞬时值（10ms 单次 ADC 读数）
+ *
+ * 为什么要单独给：滤波是 IIR(shift=3)，时间常数约 80ms，会把
+ * 「启动电流尖峰」（只持续 50~200ms）削掉一大截。标定「启动峰值 /
+ * 堵转阈值」必须看原始值，否则会低估启动电流、把阈值定得太低 → 误跳。
+ * 代价是有 ADC 噪声，所以只适合看峰值，不适合做稳态判定。 */
+int current_sense_raw_mv(void);
+int current_sense_raw_ma(void);
+
 /* 1s 滑动窗口峰值 */
 int current_sense_peak_mv(void);
 int current_sense_peak_ma(void);

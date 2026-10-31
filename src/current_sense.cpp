@@ -236,6 +236,9 @@ bool current_sense_enabled(void) { return s_ready; }
 
 int current_sense_mv(void)  { return s_ready ? s_mv_filt : -1; }
 int current_sense_ma(void)  { return s_ready ? mv_to_ma(s_mv_filt) : -1; }
+/* v1.1.26：原始值（未滤波）—— 标定启动峰值用 */
+int current_sense_raw_mv(void) { return s_ready ? s_mv_raw : -1; }
+int current_sense_raw_ma(void) { return s_ready ? mv_to_ma(s_mv_raw) : -1; }
 int current_sense_peak_mv(void) { return s_ready ? s_peak_mv : -1; }
 int current_sense_peak_ma(void) { return s_ready ? mv_to_ma(s_peak_mv) : -1; }
 

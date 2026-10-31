@@ -544,6 +544,77 @@ void AMCU_drive_stop()
 // ============================
 //  缓冲器辅助送料（打印时由微动驱动）
 // ============================
+
+/* ★ v1.1.26：「在用」判定的统一窗口。
+ *
+ * 两处必须用同一个值，否则会出现「准入还开着、但让位已经关了」的撕裂：
+ * 电机刚被 assist_feed 驱动，下一行 AMCU_motion() 又把它停掉 → 只抖一下。
+ * 5 秒：打印机状态帧周期约 1 秒，容 4 帧丢失；停止打印后 5 秒内必停电机。 */
+#define BUFFER_IN_USE_WINDOW_MS 5000
+
+/* ★ v1.1.26：缓冲送料此刻是否真的"该占着电机"
+ *
+ * 这是修「停止打印后电机一直转」的关键。
+ *
+ * v1.1.23 为了让"微动压下了电机不被立刻停掉"，让 AMCU_motion() 在
+ * s_buffer_feed_decision[ch] == 1 时不再 AMCU_drive_stop()。
+ * 但 decision 只在 AMCU_buffer_assist_feed() 内部被清零 ——
+ * 一旦准入失败（打印机不发了 / 该通道不在用 / cur 切走了），
+ * 那个函数就再也不会被调用 → decision 永远停在 1 →
+ * AMCU_motion() 永远不停电机 → **电机无限转**。
+ *
+ * 现场（2026-10-31）："都停止打印了，电机还是一直在转"。
+ *
+ * 所以"让位"不能只看 decision 的值，还要看它是否**还新鲜、还该占着**：
+ *   ① 有起点（不是脏值）
+ *   ② 连续运行没超过硬上限
+ *   ③ 15 秒内有过反馈
+ *   ④ 该通道此刻仍被打印机当成在用
+ * 四条全满足才允许它压着电机不让停。 */
+static bool buffer_feed_holds_motor(int ch)
+{
+    if (ch < 0 || ch >= BOARD_CHANNEL_COUNT) return false;
+    if (s_buffer_feed_decision[ch] != 1) return false;
+    if (s_buffer_feed_start[ch] == 0) return false;
+
+    const uint32_t now = millis();
+    if (now - s_buffer_feed_start[ch] > BUFFER_FEED_MAX_MS) return false;
+    if (now - s_buffer_last_feedback[ch] > BUFFER_FEED_TIMEOUT_MS) return false;
+    if (!is_channel_in_use(ch) && !is_channel_active_recently(ch, BUFFER_IN_USE_WINDOW_MS))
+        return false;
+    return true;
+}
+
+/* ★ v1.1.26：缓冲送料看门狗 —— 每轮无条件执行，不受任何 early-return 影响
+ *
+ * 为什么必须独立成一个函数、且放在 AMCU_run() 最前面：
+ * 原来的清理逻辑全在 AMCU_buffer_assist_feed() 里，而那个函数本身会被
+ * 准入条件挡掉 —— 「需要清理的时候恰恰是它不会被调用的时候」，
+ * 这就是 decision 卡死、电机无限转的根本原因。
+ *
+ * 这里做两件事：
+ *   1) 把不该再占电机的 decision 清掉
+ *   2) 如果电机正被这一路占着，主动停机（只停自己占的，不误伤别的动作） */
+static void buffer_feed_watchdog(void)
+{
+    const int cur = get_now_filament_num();
+
+    for (int ch = 0; ch < BOARD_CHANNEL_COUNT; ch++) {
+        if (s_buffer_feed_decision[ch] != 1) continue;
+        if (buffer_feed_holds_motor(ch)) continue;
+
+        s_buffer_feed_decision[ch] = 0;
+        s_buffer_feed_start[ch] = 0;
+
+        /* 只停"确实是这一路在驱动"的电机：ch 就是当前料位，且电机
+           确实挂在 ch+1 上。否则可能把退料/点动/别的通道掐掉。 */
+        if (ch == cur && s_current_channel == ch + 1 && motor_get_dir() != MOTOR_DIR_STOP) {
+            AMCU_drive_stop();
+            log_i("缓冲送料看门狗：通道%d 已不在使用态，停止电机（避免停印后空转）", ch + 1);
+        }
+    }
+}
+
 void AMCU_buffer_assist_feed(int channel)
 {
     if (channel < 0 || channel >= BOARD_CHANNEL_COUNT) return;
@@ -579,12 +650,14 @@ void AMCU_buffer_assist_feed(int channel)
          * 现场表现就是"微动压下了，电机不转"。 */
         if (s_buffer_feed_decision[channel] == 0) s_buffer_feed_start[channel] = now;
         s_buffer_feed_decision[channel] = 1;
+        /* v1.1.26：送料速度改用 WEB 可调的 FEED_PWM（默认 100） */
+        const int feed_pct = settings_get_feed_pwm();
         if (!clutch_is_engaged(channel + 1)) {
-            if (AMCU_drive_channel(channel + 1, MOTOR_DIR_FEED, MOTOR_SPEED_FULL)) {
+            if (AMCU_drive_channel(channel + 1, MOTOR_DIR_FEED, feed_pct)) {
                 s_buffer_last_feedback[channel] = now;
             }
         } else {
-            motor_set_dir(MOTOR_DIR_FEED);
+            motor_set_dir_speed(MOTOR_DIR_FEED, feed_pct);
             s_buffer_last_feedback[channel] = now;
         }
     } else if (stop_trig) {
@@ -855,24 +928,12 @@ void check_buffer_status() {
      *
      * "其他通道不读"的限制保持不变 —— 仍然只认 cur。 */
     const bool active = is_channel_in_use(cur) ||
-                        is_channel_active_recently(cur, 10000);
+                        is_channel_active_recently(cur, BUFFER_IN_USE_WINDOW_MS);
     if (!active)
     {
-        /* 限流诊断：每 3 秒最多一条，只在"有微动触发但被挡"时打，
-           方便下次遇到"微动没反应"直接看出卡在哪一关。 */
-        static uint32_t s_last_gate_log = 0;
-        const uint32_t now_ms = millis();
-        const bool start_trig = sensor_triggered(cur, SENSOR_START);
-        const bool stop_trig  = sensor_triggered(cur, SENSOR_STOP);
-        if ((start_trig || stop_trig) && (now_ms - s_last_gate_log > 3000))
-        {
-            s_last_gate_log = now_ms;
-            log_w("缓冲被挡：cur=%d 微动(开始=%d 停止=%d) 该通道不在使用态"
-                  "（motion 非 send_out/on_use 等，且 10s 内 statu 非 0x03/07/09/0F，"
-                  "last_statu=0x%02X）",
-                  cur, start_trig ? 1 : 0, stop_trig ? 1 : 0,
-                  get_channel_last_statu(cur));
-        }
+        /* v1.1.26：原来这里有一条"缓冲被挡"的限流日志，现场反馈日志太吵
+           （微动压下不动时每 3 秒一条），已移除。要排查就用 /status 的
+           feed.statu / feed.active，或 /sensor_raw 看原始电平。 */
         return;
     }
     if (!sensor_channel_enabled(cur)) return;            /* 该通道必须开了缓冲送料 */
@@ -921,6 +982,11 @@ void AMCU_init() {
 //  AMCU 主运行逻辑
 // ============================
 void AMCU_run() {
+    /* ★ v1.1.26：缓冲送料看门狗**必须最先跑**，且不受下面任何 early-return 影响。
+     * 它负责清掉"已不该再占电机"的 decision，并在电机确实被这一路占着时停机。
+     * 没有它，停印后 decision 卡在 1 会让电机一直转（现场已复现）。 */
+    buffer_feed_watchdog();
+
     static int now_f = 255;
     int x = get_now_filament_num();
     if (x < 0 || x >= MAX_FILAMENT_NUM) x = 0;  // 防止 0xFF 越界
@@ -1108,9 +1174,10 @@ void AMCU_motion() {
         return;
     } else {
         /* v1.1.23：缓冲微动正在送料时，只清跟随状态、别停电机
-           （follow_feed_reset_ex(true) 会 motor_stop()，把刚送起来的料掐掉） */
-        const bool buffer_feeding =
-            (svc >= 0 && svc < BOARD_CHANNEL_COUNT && s_buffer_feed_decision[svc] == 1);
+           （follow_feed_reset_ex(true) 会 motor_stop()，把刚送起来的料掐掉）
+           ★ v1.1.26：判据从"decision == 1"收紧到 buffer_feed_holds_motor()
+           —— 否则 decision 卡在 1 时这里会永远不停电机（停印后空转）。 */
+        const bool buffer_feeding = buffer_feed_holds_motor(svc);
         follow_feed_reset_ex(!buffer_feeding);
     }
 
@@ -1175,8 +1242,7 @@ void AMCU_motion() {
          * 所以这里必须让位给缓冲逻辑：该通道 s_buffer_feed_decision == 1
          * 就说明"微动要求补料"，不能停。 */
         {
-            const bool buffer_feeding =
-                (svc >= 0 && svc < BOARD_CHANNEL_COUNT && s_buffer_feed_decision[svc] == 1);
+            const bool buffer_feeding = buffer_feed_holds_motor(svc);
             if (!is_need_pull_back && !buffer_feeding) {
                 AMCU_drive_stop();
             }
