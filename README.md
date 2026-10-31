@@ -40,7 +40,7 @@
 | 传感器 | 每通道 2 只微动（开始位 / 停止位），电阻编码合占 1 个 ADC 脚 |
 | 电流 | AT8236 ISEN → GPIO3（ADC1_CH2），10ms 采样 |
 | 485 | 1.2288 Mbps，8E1，TX=GPIO14 / RX=GPIO48 / DE=GPIO39 |
-| 指示 | 板载 **WS2812**（GPIO42，`neopixelWrite` 驱动）：堵转红快闪 / 退料橙呼吸 / 打印中按耗材色呼吸 / 空闲绿低亮 / 等 WiFi 黄慢闪 |
+| 指示 | **无板载状态灯**：GPIO42 是 TXD 指示灯、板载 WS2812 的 GPIO48 被 485 RX 占用（v1.1.30 起灯效已删除，状态看 WEB 控制台） |
 
 完整引脚表、微动分压计算、离合映射见 [docs/HARDWARE.md](docs/HARDWARE.md)。
 
@@ -156,9 +156,12 @@ s3-ams/
 │   └── time64.{h,cpp}        毫秒时钟
 ├── web/                      前端源码（index.html / app.js / style.css）
 ├── tools/                    PC 端工具（见下）
-├── release/vX.Y.Z/           每个版本的 bootloader/partitions/firmware + RELEASE.md
 └── docs/                     本文档
 ```
+
+> **固件不在仓库里**（v1.1.30 起）：每个版本的 `bootloader/partitions/firmware`
+> 和 `RELEASE.md` 统一放 **`D:\DIY\S3-AMS\release\vX.Y.Z\`**（仓库外，不进 git）。
+> `*.bin` 一直被 `.gitignore` 忽略，从未上传过。
 
 代码结构、数据流、状态机详解见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 

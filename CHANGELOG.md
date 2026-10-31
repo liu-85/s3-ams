@@ -1,12 +1,48 @@
 # 版本记录
 
 固件版本号在 `src/web_server.cpp` 的 `APP_VERSION`，形如 `1.1.12-s3ams`。
-每个版本的三件套（`bootloader.bin` / `partitions.bin` / `firmware.bin`）和详细
-RELEASE.md 在 `release/vX.Y.Z/`。
+
+> **v1.1.30 起固件不进仓库**：每个版本的三件套
+> （`bootloader.bin` / `partitions.bin` / `firmware.bin`）和 `RELEASE.md`
+> 统一放 **`D:\DIY\S3-AMS\release\vX.Y.Z\`**（仓库外）。
+> 项目内原来的 `release/` 目录已整体删除，历史版本可从 git 历史找回
+> （`git log --all -- 'release/*'`）。
+
+---
+
+## v1.1.30 —— 删除 WS2812 灯效（本板无可用状态灯）
+
+**2026-10-31**
+
+v1.1.29 我按"板载 WS2812 接 GPIO42"写了一整套灯效，**判断错了**。现场确认：
+
+| 引脚 | 真实用途 |
+|---|---|
+| **GPIO42** | **TXD 指示灯** —— 不是状态灯。v1.1.28 及之前 `gpio_set_level(42)` 一直在乱拨串口指示灯 |
+| **GPIO48** | 板载 WS2812 RGB 数据脚，**但已被 485 RX 占用**（`BOARD_PIN_485_RX`） |
+
+两个引脚都不可用 → 灯效功能整体删除。
+
+- `src/rgb_led.{h,cpp}` **删除**
+- `set_led_state()` 改成**空函数**（只记 `s_led_state`，不碰引脚）。
+  不直接删是因为 `AMCU.cpp` 里有 20 多处 `RGB_RED/GREEN/BLUE` 调用点，
+  动它们风险和收益不成比例；空函数编译器会整段优化掉，零开销。
+- `init_io_pins()` 不再配置任何 LED 引脚
+- `board_pins.h` 的 `BOARD_PIN_LED` 注释掉，写明两个坑
+- `web_server.cpp` 删掉只为灯服务的 `web_get_channel_color()`
+
+**固件存放位置变更**：`s3-ams/release/` → `D:\DIY\S3-AMS\release\`（仓库外）。
+26 个历史 `RELEASE.md` 已一并移到新目录。
+
+v1.1.29 的其余三项照旧有效（退料静默期 / 送料超时锁存 / 双微动失效保护），
+**堵转阈值仍先别设**，刷完重采电流数据再定。
 
 ---
 
 ## v1.1.29 —— 退料静默期 + WS2812 状态灯 + 送料超时锁存 + 双微动失效保护
+
+> ⚠️ **本版的"WS2812 状态灯"部分是错的**（引脚判断错了），已在 v1.1.30 整体删除。
+> 其余三项（退料静默期 / 送料超时锁存 / 双微动失效保护）仍然有效。
 
 **2026-10-31**
 
@@ -513,7 +549,7 @@ if (eng && settled) motor_set_dir_speed(s_pending_dir, s_pending_speed);
 效果：电机比之前晚约 100~160ms 启动，换来离合完全咬合后再带负载。
 **点动时长建议 ≥ 1000ms**（默认值），200ms 下限会被稳定时间占掉大半。
 
-详见 [release/v1.1.17/RELEASE.md](release/v1.1.17/RELEASE.md)
+详见 `D:\DIY\S3-AMS\release\v1.1.17\RELEASE.md`（仓库外）
 
 ---
 
@@ -559,7 +595,7 @@ for (int i = 0; i < BOARD_CHANNEL_COUNT; i++)
 WEB 点「通道 3 进料」时 `jog_ch` 应为 3、`jog_dir` 为 1、`clutch_mask` 应为 `0b100`；
 不一致就说明离合被别处抢走。
 
-详见 [release/v1.1.16/RELEASE.md](release/v1.1.16/RELEASE.md)
+详见 `D:\DIY\S3-AMS\release\v1.1.16\RELEASE.md`（仓库外）
 
 ---
 
@@ -626,7 +662,7 @@ else if (is_channel_printing(svc)) { ... }
 - 堵转保护 —— `stall_ma` 默认 0（不保护）
 - `AMCU_drive_stop()` 每循环刷队列 —— 有 `already_releasing` / `already_off` 幂等保护
 
-详见 [release/v1.1.15/RELEASE.md](release/v1.1.15/RELEASE.md)
+详见 `D:\DIY\S3-AMS\release\v1.1.15\RELEASE.md`（仓库外）
 
 ---
 
@@ -663,7 +699,7 @@ else if (is_channel_printing(svc)) { ... }
 
 切回正式模式：`SENSOR_TEMP_DIGITAL` 改回 0，重编译即可。
 
-详见 [release/v1.1.14/RELEASE.md](release/v1.1.14/RELEASE.md)
+详见 `D:\DIY\S3-AMS\release\v1.1.14\RELEASE.md`（仓库外）
 
 ---
 
@@ -685,7 +721,7 @@ else if (is_channel_printing(svc)) { ... }
 对照：`esp32s3-485` 用的是 `00.00.06.49`（真机抓包），`BMCU-U` 用 `01.00.06.87`，
 Tianshu 与本工程 v1.1.12 及更早用的 `90.00.00.00` 是错的。
 
-详见 [release/v1.1.13/RELEASE.md](release/v1.1.13/RELEASE.md)
+详见 `D:\DIY\S3-AMS\release\v1.1.13\RELEASE.md`（仓库外）
 
 ---
 

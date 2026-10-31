@@ -17,10 +17,6 @@
 #include <Preferences.h>
 #include "current_sense.h"
 #include "settings_storage.h"
-#include "rgb_led.h"
-
-/* ★ v1.1.29：通道颜色（定义在 web_server.cpp 的 s_color_list，WEB 可改） */
-extern uint32_t web_get_channel_color(int ch);
 
 // ============================
 //  硬件参数定义
@@ -316,66 +312,25 @@ static uint8_t s_last_action[MAX_FILAMENT_NUM] = {0};
 static bool s_last_need_pull_back[MAX_FILAMENT_NUM] = {false};
 
 // ============================
-//  RGB LED 控制（板载 WS2812，v1.1.29 改）
+//  状态 LED（★ v1.1.30：已废弃，仅保留接口不报错）
 // ============================
 
-/* 临时提示（由 set_led_state 设置，800ms 内优先于状态机） */
-static led_mode_t s_led_hint = LED_MODE_IDLE;
-static uint32_t   s_led_hint_until = 0;
-
-/* ★ v1.1.29：按全局状态算最终灯效 —— 每轮调用
+/* ★ v1.1.30：本板没有可用的状态灯，set_led_state() 变成空操作。
  *
- * 优先级：
- *   堵转跳闸           → 红快闪
- *   正在退料           → 橙呼吸
- *   800ms 内的临时提示 → 用提示
- *   正在打印           → 当前耗材颜色呼吸
- *   其他               → 绿色低亮常亮
- */
-static void led_state_update(void)
-{
-    const uint32_t now = millis();
-    led_mode_t m;
-
-    if (current_sense_tripped()) {
-        m = LED_MODE_ERROR;
-    } else if (is_need_pull_back) {
-        m = LED_MODE_PULLBACK;
-    } else if (now < s_led_hint_until) {
-        m = s_led_hint;
-    } else {
-        const int cur = get_now_filament_num();
-        const bool printing =
-            (cur >= 0 && cur < BOARD_CHANNEL_COUNT) &&
-            (is_channel_in_use(cur) || is_channel_active_recently(cur, 5000));
-        if (printing) {
-            m = LED_MODE_PRINTING;
-            rgb_led_set_print_color(web_get_channel_color(cur));
-        } else {
-            m = LED_MODE_IDLE;
-        }
-    }
-
-    rgb_led_set_mode(m);
-    rgb_led_tick();
-}
-
+ * 历史：
+ *   v1.1.28 及之前 —— gpio_set_level(GPIO42)，本意是点普通单色 LED。
+ *     现场（2026-10-31）确认：亮起来的是 **TXD 指示灯**，不是状态灯，
+ *     等于一直在乱拨串口指示灯，纯干扰。
+ *   v1.1.29 —— 误以为板载是 WS2812 并接在 GPIO42，写了 rgb_led 模块。
+ *     实测板载 RGB 在 **GPIO48**，而 GPIO48 已经被 485 的 RX 占用
+ *     （`BOARD_PIN_485_RX`），不可能挪给灯用。
+ *
+ * 所以：整块灯效功能删除（rgb_led.{h,cpp} 一并删掉），
+ * set_led_state() 保留为空函数，只为不改动 20 多处 RGB_RED/GREEN/BLUE 调用点。
+ * 设备状态请看 WEB 控制台。 */
 void set_led_state(led_state_t state)
 {
-    s_led_state = state;
-
-    /* ★ v1.1.29：板载灯改成 WS2812 RGB 状态机（rgb_led 模块）。
-     *
-     * 原来的实现只是 gpio_set_level —— 对 WS2812 完全无效（它要 800kHz 编码）。
-     * 现在 set_led_state() 只充当"临时提示"，实际颜色由 led_state_update()
-     * 按全局状态计算，提示在 800ms 内优先。 */
-    switch (state) {
-    case LED_STATE_RED:   s_led_hint = LED_MODE_ERROR;    break;
-    case LED_STATE_GREEN: s_led_hint = LED_MODE_PRINTING; break;
-    case LED_STATE_BLUE:
-    default:              s_led_hint = LED_MODE_IDLE;     break;
-    }
-    s_led_hint_until = millis() + 800;
+    s_led_state = state;   /* 只记状态，不驱动任何引脚 */
 }
 
 #define RGB_RED    set_led_state(LED_STATE_RED)
@@ -894,9 +849,9 @@ bool amcu_follow_feed_active(void) { return s_follow_ch != 0 && s_follow_on; }
 //  初始化 IO 引脚
 // ============================
 void init_io_pins() {
-    /* ★ v1.1.29：板载灯是 WS2812，由 rgb_led 模块用 RMT 驱动（neopixelWrite）。
-     * 这里**不能**再把该引脚设成普通 GPIO 输出 —— 那样 RMT 一接管就会冲突，
-     * 而且普通电平也点不亮 WS2812。引脚配置交给 rgb_led_init()。 */
+    /* ★ v1.1.30：不再配置任何 LED 引脚。
+     * 本板没有可用的状态灯：原来的 GPIO42 实际是 TXD 指示灯（乱拨串口灯），
+     * 板载 RGB 在 GPIO48 而 GPIO48 已归 485 RX 使用。详见 set_led_state()。 */
     if (BOARD_485_ENABLED) {
         gpio_reset_pin((gpio_num_t)BOARD_PIN_485_DE);
         gpio_set_direction((gpio_num_t)BOARD_PIN_485_DE, GPIO_MODE_OUTPUT);
@@ -1108,7 +1063,6 @@ void check_buffer_status() {
 // ============================
 void AMCU_init() {
     init_io_pins();
-    rgb_led_init();       /* v1.1.29：WS2812 状态灯（替代原来的普通 GPIO 电平） */
     sensor_init();
     motor_init();
     clutch_init();
@@ -1151,9 +1105,6 @@ void AMCU_run() {
      * 它负责清掉"已不该再占电机"的 decision，并在电机确实被这一路占着时停机。
      * 没有它，停印后 decision 卡在 1 会让电机一直转（现场已复现）。 */
     buffer_feed_watchdog();
-
-    /* ★ v1.1.29：RGB 状态灯每轮更新（内部 50ms 限流，不拖慢主循环） */
-    led_state_update();
 
     static int now_f = 255;
     int x = get_now_filament_num();

@@ -258,7 +258,7 @@ void web_log_install_hook(void)
 }
 
 /* App 版本 */
-static const char *APP_VERSION = "1.1.29-s3ams";
+static const char *APP_VERSION = "1.1.30-s3ams";
 
 /* 单 IO 双微动：每路一个 ADC 脚（开始位/停止位共用同一脚，电阻编码） */
 static const int BOARD_SENSOR_PINS[BOARD_CHANNEL_COUNT] = BOARD_PIN_SENSOR_ARRAY;
@@ -545,14 +545,8 @@ static void handle_app_js(void)
 extern uint32_t amcu_loop_max_gap_ms(void);
 extern void amcu_loop_gap_reset(void);
 
-/* ★ v1.1.29：把通道颜色暴露给 RGB 灯模块（打印中按耗材颜色呼吸）
- *   ch 越界返回一个柔和的默认绿，保证灯不会变黑。 */
-uint32_t web_get_channel_color(int ch)
-{
-    if (ch < 0 || ch >= 16) return 0x22CC66;
-    const uint32_t c = s_color_list[ch];
-    return (c == 0) ? 0x22CC66 : c;
-}
+/* v1.1.30：v1.1.29 为 RGB 灯加的 web_get_channel_color() 已随灯效一起删除
+ * （本板无可用状态灯：GPIO42 是 TXD 指示灯，板载 RGB 的 GPIO48 被 485 RX 占用）。 */
 
 static void handle_status(void)
 {

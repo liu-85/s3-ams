@@ -7,6 +7,11 @@ build/
 *.elf
 *.hex
 
+# ★ v1.1.30：固件和发布说明不再进仓库
+#   统一放 D:\DIY\S3-AMS\release\vX.Y.Z\（仓库外）
+#   这里再挡一次，防止有人在项目内重建 release/ 又把固件提交上来
+release/
+
 # Web static files stay in web/ (source of truth), web_files.h is generated & committed
 # (keep web_files.h so the firmware builds without running the generator)
 

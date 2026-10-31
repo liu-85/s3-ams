@@ -27,8 +27,12 @@ extern "C" {
 #define LED_BLINK_INTERVAL 500     // LED闪烁间隔
 #define SERVO_COUNT 4              // 伺服电机数量
 
-// ==================== RGB LED 配置（状态指示灯）====================
-// 用板载 LED (GPIO42) 替代原 NeoPixel
+// ==================== 状态 LED（★ v1.1.30 起为空实现）====================
+// 本板没有可用的状态灯：
+//   - 旧的 GPIO42 实际是 **TXD 指示灯**，驱动它等于乱拨串口灯
+//   - 板载 WS2812 RGB 在 **GPIO48**，而 GPIO48 已被 485 RX 占用
+// 所以 set_led_state() 现在只记状态、不驱动任何引脚。
+// 下面这些枚举和 20 多处 RGB_RED/GREEN/BLUE 调用点保留，只为不动大范围代码。
 typedef enum {
     LED_STATE_BLUE = 0,    // 待机/正常
     LED_STATE_GREEN = 1,   // 进料/退料动作中

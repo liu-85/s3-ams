@@ -52,8 +52,14 @@
 #define BOARD_PIN_CLUTCH_7 21
 #define BOARD_PIN_CLUTCH_8 47
 
-/* 状态 LED */
-#define BOARD_PIN_LED 42
+/* 状态 LED —— ★ v1.1.30 起本板没有可用状态灯，此宏已不再使用。
+ *
+ * 踩过的两个坑（2026-10-31 现场确认）：
+ *   1. GPIO42 实际是 **TXD 指示灯**，原来 gpio_set_level(42) 一直在乱拨串口灯；
+ *   2. 板载 WS2812 RGB 的数据脚是 **GPIO48**，而 GPIO48 已被 485 RX
+ *      （BOARD_PIN_485_RX）占用，不可能挪给灯用。
+ * 所以灯效功能整体删除，见 AMCU.h 的 led_state_t 注释。 */
+/* #define BOARD_PIN_LED 42 */
 
 /* ==========================================================================
  * 三、电机电流采样（ISEN / AT8236）
