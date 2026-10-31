@@ -528,6 +528,10 @@
         if (typeof d.feed_timeout === 'number' && d.feed_timeout > 0) {
             syncFeedTimeoutInput(d.feed_timeout);
         }
+        /* ---- 双微动失效保护（v1.1.29，0 = 关闭，所以不能用 > 0 判断） ---- */
+        if (typeof d.idle_timeout === 'number' && d.idle_timeout >= 0) {
+            syncIdleTimeoutInput(d.idle_timeout);
+        }
 
         /* ---- 硬件 ---- */
         updateHardware(d.hardware);
@@ -1775,6 +1779,31 @@
         });
     }
 
+    /* ---- 双微动失效保护（v1.1.29）---- */
+    function syncIdleTimeoutInput(sec) {
+        var el = $('idle_timeout');
+        if (el && document.activeElement !== el) {
+            var s = String(sec);
+            if (el.value !== s) el.value = s;
+        }
+    }
+
+    function saveIdleTimeout() {
+        var v = parseInt(val('idle_timeout'), 10);
+        if (isNaN(v)) {
+            toast('请填双失效保护秒数（0 = 关闭）', 'bad');
+            return;
+        }
+        if (v < 0 || v > 600) {
+            toast('双失效保护请在 0~600 秒之间（0 = 关闭）', 'bad');
+            return;
+        }
+        post('/idle_timeout_set', { sec: v }, function (d) {
+            if (d && typeof d.sec === 'number') syncIdleTimeoutInput(d.sec);
+            toast((d && d.info) || '已保存', (d && d.ok) ? 'ok' : 'bad');
+        });
+    }
+
     /* =======================================================================
        蠕动参数
        ======================================================================= */
@@ -2530,6 +2559,7 @@
         $('btn_pullback_save').onclick = savePullback;
         $('btn_feed_pwm_save').onclick = saveFeedPwm;
         $('btn_feed_timeout_save').onclick = saveFeedTimeout;
+        $('btn_idle_timeout_save').onclick = saveIdleTimeout;
         $('btn_creep_save').onclick = saveCreep;
         $('btn_assist_toggle').onclick = toggleAssist;
         $('btn_assist_hold').onclick = toggleAssistHold;

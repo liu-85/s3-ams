@@ -15,9 +15,12 @@ int AMS_COUNT;
 int FEED_PWM = DEFAULT_FEED_PWM;
 /* ★ v1.1.27：缓冲送料连续运行上限（秒），同一个命名空间 */
 int FEED_TIMEOUT_SEC = DEFAULT_FEED_TIMEOUT_SEC;
+/* ★ v1.1.29：双微动失效停机保护（秒，0=关闭） */
+int IDLE_TIMEOUT_SEC = DEFAULT_IDLE_TIMEOUT_SEC;
 #define FEED_PWM_NVS_NS  "s3ams-feed"
 #define FEED_PWM_NVS_KEY "feed_pwm"
 #define FEED_TIMEOUT_NVS_KEY "feed_timeout"
+#define IDLE_TIMEOUT_NVS_KEY "idle_timeout"
 
 static Preferences s_settings_prefs;
 #define SETTINGS_KEY "settings"
@@ -41,13 +44,17 @@ static void feed_pwm_load(void) {
     if (p.begin(FEED_PWM_NVS_NS, true)) {
         int v = p.getInt(FEED_PWM_NVS_KEY, DEFAULT_FEED_PWM);
         int t = p.getInt(FEED_TIMEOUT_NVS_KEY, DEFAULT_FEED_TIMEOUT_SEC);
+        int i = p.getInt(IDLE_TIMEOUT_NVS_KEY, DEFAULT_IDLE_TIMEOUT_SEC);
         p.end();
         FEED_PWM = (v >= FEED_PWM_MIN && v <= FEED_PWM_MAX) ? v : DEFAULT_FEED_PWM;
         FEED_TIMEOUT_SEC = (t >= FEED_TIMEOUT_SEC_MIN && t <= FEED_TIMEOUT_SEC_MAX)
                            ? t : DEFAULT_FEED_TIMEOUT_SEC;
+        IDLE_TIMEOUT_SEC = (i >= IDLE_TIMEOUT_SEC_MIN && i <= IDLE_TIMEOUT_SEC_MAX)
+                           ? i : DEFAULT_IDLE_TIMEOUT_SEC;
     } else {
         FEED_PWM = DEFAULT_FEED_PWM;
         FEED_TIMEOUT_SEC = DEFAULT_FEED_TIMEOUT_SEC;
+        IDLE_TIMEOUT_SEC = DEFAULT_IDLE_TIMEOUT_SEC;
     }
 }
 
@@ -80,6 +87,22 @@ int settings_set_feed_timeout(int sec) {
 
 int settings_get_feed_timeout(void) {
     return FEED_TIMEOUT_SEC;
+}
+
+/* ★ v1.1.29：双微动失效停机保护（秒，0=关闭） */
+int settings_set_idle_timeout(int sec) {
+    if (sec < IDLE_TIMEOUT_SEC_MIN || sec > IDLE_TIMEOUT_SEC_MAX) return -1;
+    IDLE_TIMEOUT_SEC = sec;
+    Preferences p;
+    if (p.begin(FEED_PWM_NVS_NS, false)) {
+        p.putInt(IDLE_TIMEOUT_NVS_KEY, sec);
+        p.end();
+    }
+    return sec;
+}
+
+int settings_get_idle_timeout(void) {
+    return IDLE_TIMEOUT_SEC;
 }
 
 void settings_storage_init() {

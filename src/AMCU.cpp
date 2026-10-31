@@ -17,6 +17,10 @@
 #include <Preferences.h>
 #include "current_sense.h"
 #include "settings_storage.h"
+#include "rgb_led.h"
+
+/* ★ v1.1.29：通道颜色（定义在 web_server.cpp 的 s_color_list，WEB 可改） */
+extern uint32_t web_get_channel_color(int ch);
 
 // ============================
 //  硬件参数定义
@@ -278,29 +282,100 @@ static uint32_t s_buffer_last_feedback[BOARD_CHANNEL_COUNT] = {0};
 /* v1.1.25：本轮"连续送料"的起点（0 = 当前没在送料），用于连续运行时长兜底 */
 static uint32_t s_buffer_feed_start[BOARD_CHANNEL_COUNT] = {0};
 
+/* ★ v1.1.29：送料超时锁存 —— 超时停料后，必须"微动重新压下"才允许再送
+ *
+ * 现场需求（2026-10-31）：
+ *   "触发开始微动送料后如果停止微动没有触发，设置的超时是停止微动没有触发，
+ *    超过多少秒停止送料，再触发开始微动了就继续送料"
+ *
+ * 原来（v1.1.25~28）超时只是清 decision，下一轮 start_trig 还在就立刻重新计时
+ * 重新送料 → 表现为"每 N 秒重新送一次"，等于没停。
+ * 现在用 latch：超时 → 锁住 → 只有检测到 start_trig 的**上升沿**
+ * （松开再压下）才解锁。 */
+static bool s_feed_latched[BOARD_CHANNEL_COUNT] = {false};
+static bool s_start_trig_last[BOARD_CHANNEL_COUNT] = {false};
+
+/* ★ v1.1.29：两个微动都不触发的持续起点（用于"双失效停机保护"） */
+static uint32_t s_idle_since[BOARD_CHANNEL_COUNT] = {0};
+
+/* ★ v1.1.29：最近一次退料结束的时刻（用于退料静默期）
+ *
+ * 现场（2026-10-31）："打印结束退料时，刚开始会跟随挤出机拉出耗材，
+ * 触发送料微动后又把耗材送进挤出机了"。
+ *
+ * v1.1.27 已经把 motion == pull_back / before_pull_back 的通道挡掉了，
+ * 但退料 3 秒超时后 motion 可能已经切走（打印机发别的帧），而物理上
+ * 料还在往后退 —— 这时微动一触发就又送料。
+ * 所以再加一道"时间"保险：退料结束后 PULLBACK_SILENCE_MS 内，
+ * 缓冲微动一律不响应。只挡微动补料，不挡 485 正式进料（send_out）。 */
+static uint32_t s_pullback_end_ms = 0;
+#define PULLBACK_SILENCE_MS 10000
+
 // last_action 跟踪（简化版）
 static uint8_t s_last_action[MAX_FILAMENT_NUM] = {0};
 static bool s_last_need_pull_back[MAX_FILAMENT_NUM] = {false};
 
 // ============================
-//  RGB LED 控制（板载 LED 替代 NeoPixel）
+//  RGB LED 控制（板载 WS2812，v1.1.29 改）
 // ============================
+
+/* 临时提示（由 set_led_state 设置，800ms 内优先于状态机） */
+static led_mode_t s_led_hint = LED_MODE_IDLE;
+static uint32_t   s_led_hint_until = 0;
+
+/* ★ v1.1.29：按全局状态算最终灯效 —— 每轮调用
+ *
+ * 优先级：
+ *   堵转跳闸           → 红快闪
+ *   正在退料           → 橙呼吸
+ *   800ms 内的临时提示 → 用提示
+ *   正在打印           → 当前耗材颜色呼吸
+ *   其他               → 绿色低亮常亮
+ */
+static void led_state_update(void)
+{
+    const uint32_t now = millis();
+    led_mode_t m;
+
+    if (current_sense_tripped()) {
+        m = LED_MODE_ERROR;
+    } else if (is_need_pull_back) {
+        m = LED_MODE_PULLBACK;
+    } else if (now < s_led_hint_until) {
+        m = s_led_hint;
+    } else {
+        const int cur = get_now_filament_num();
+        const bool printing =
+            (cur >= 0 && cur < BOARD_CHANNEL_COUNT) &&
+            (is_channel_in_use(cur) || is_channel_active_recently(cur, 5000));
+        if (printing) {
+            m = LED_MODE_PRINTING;
+            rgb_led_set_print_color(web_get_channel_color(cur));
+        } else {
+            m = LED_MODE_IDLE;
+        }
+    }
+
+    rgb_led_set_mode(m);
+    rgb_led_tick();
+}
+
 void set_led_state(led_state_t state)
 {
     s_led_state = state;
-    int pin = BOARD_PIN_LED;
-    if (pin < 0) return;
 
+    /* ★ v1.1.29：板载灯改成 WS2812 RGB 状态机（rgb_led 模块）。
+     *
+     * 原来的实现只是 gpio_set_level —— 对 WS2812 完全无效（它要 800kHz 编码）。
+     * 现在 set_led_state() 只充当"临时提示"，实际颜色由 led_state_update()
+     * 按全局状态计算，提示在 800ms 内优先。 */
     switch (state) {
-    case LED_STATE_RED:
-    case LED_STATE_GREEN:
-        gpio_set_level((gpio_num_t)pin, BOARD_LED_ACTIVE_LEVEL);
-        break;
+    case LED_STATE_RED:   s_led_hint = LED_MODE_ERROR;    break;
+    case LED_STATE_GREEN: s_led_hint = LED_MODE_PRINTING; break;
     case LED_STATE_BLUE:
-    default:
-        gpio_set_level((gpio_num_t)pin, 1 - BOARD_LED_ACTIVE_LEVEL);
-        break;
+    default:              s_led_hint = LED_MODE_IDLE;     break;
     }
+    s_led_hint_until = millis() + 800;
 }
 
 #define RGB_RED    set_led_state(LED_STATE_RED)
@@ -625,19 +700,70 @@ void AMCU_buffer_assist_feed(int channel)
 
     uint32_t now = millis();
 
+    /* ★ v1.1.29：记录 start_trig 的上升沿（松开→压下）。
+     * 超时锁存后，只有"重新压下"才允许继续送料 —— 这是用户明确要的语义。 */
+    const bool start_rising = start_trig && !s_start_trig_last[channel];
+    s_start_trig_last[channel] = start_trig;
+
+    /* ★ v1.1.29：双微动失效保护
+     *
+     * 用户需求："打印过程中如果两个都不触发，超过多少秒就停机保护"。
+     * 缓冲器半满时"两个都不触发"是正常中间态，所以这里的超时要给得很长
+     * （默认 60 秒）。真的两个都超过 60 秒不动，基本就是微动线断了/卡死，
+     * 这时候继续送料只会把料顶进挤出机。 */
+    if (!start_trig && !stop_trig) {
+        if (s_idle_since[channel] == 0) s_idle_since[channel] = now;
+        const uint32_t idle_ms = (uint32_t)settings_get_idle_timeout() * 1000u;
+        if (idle_ms > 0 && (now - s_idle_since[channel]) > idle_ms) {
+            if (s_buffer_feed_decision[channel] == 1) {
+                AMCU_drive_stop();
+                s_buffer_feed_decision[channel] = 0;
+                s_buffer_feed_start[channel] = 0;
+            }
+            static uint32_t s_last_idle_log = 0;
+            if (now - s_last_idle_log > 30000) {
+                s_last_idle_log = now;
+                log_w("缓冲器双微动失效：通道%d 开始位/停止位均未触发超过 %d 秒，"
+                      "已停机保护（检查该路微动接线）",
+                      channel + 1, (int)settings_get_idle_timeout());
+            }
+            return;
+        }
+    } else {
+        s_idle_since[channel] = 0;
+    }
+
+    /* ★ v1.1.29：超时锁存 —— 超时停料后必须"微动重新压下"才继续
+     *
+     * 用户需求："触发开始微动送料后如果停止微动没有触发，超过多少秒停止送料，
+     *          再触发开始微动了就继续送料"。
+     * 原来超时只是清 decision，下一轮 start_trig 还在就立刻重新计时再送，
+     * 表现成"每 N 秒重新送一次"，等于没停。 */
+    if (s_feed_latched[channel]) {
+        if (start_rising) {
+            s_feed_latched[channel] = false;   /* 微动重新压下 → 解除锁存 */
+            log_i("缓冲送料：通道%d 微动重新触发，恢复送料", channel + 1);
+        } else {
+            return;                            /* 仍锁存，不送料 */
+        }
+    }
+
     /* ★ v1.1.25：连续送料时长兜底（见 buffer_feed_max_ms() 注释）。
      * 微动卡死时 decision 永远是 1、start_trig 每轮刷新 feedback 时间戳，
      * 15 秒的"无反馈超时"永远不触发 → 电机无限转 → 电源纹波 → 485 误码。
-     * 这里按"从 decision 置 1 开始算的连续时长"硬性截断。 */
+     * 这里按"从 decision 置 1 开始算的连续时长"硬性截断。
+     * ★ v1.1.29：截断后加锁存，等微动重新压下。 */
     if (s_buffer_feed_decision[channel] == 1 && s_buffer_feed_start[channel] != 0 &&
         (now - s_buffer_feed_start[channel]) > buffer_feed_max_ms())
     {
         AMCU_drive_stop();
         s_buffer_feed_decision[channel] = 0;
         s_buffer_feed_start[channel] = 0;
-        log_w("缓冲送料超时强制停：通道%d 连续送料超过 %d 秒（微动可能卡在触发态，"
-              "检查该路微动是否常闭接反/短接到 GND）", channel + 1,
-              (int)settings_get_feed_timeout());
+        s_feed_latched[channel] = true;
+        log_w("缓冲送料超时停料：通道%d 开始位持续触发超过 %d 秒仍未到停止位"
+              "（微动可能卡在触发态/接反/送料跟不上），已停料；"
+              "微动松开再压下才会继续",
+              channel + 1, (int)settings_get_feed_timeout());
         return;
     }
 
@@ -768,10 +894,9 @@ bool amcu_follow_feed_active(void) { return s_follow_ch != 0 && s_follow_on; }
 //  初始化 IO 引脚
 // ============================
 void init_io_pins() {
-    if (BOARD_PIN_LED >= 0) {
-        gpio_reset_pin((gpio_num_t)BOARD_PIN_LED);
-        gpio_set_direction((gpio_num_t)BOARD_PIN_LED, GPIO_MODE_OUTPUT);
-    }
+    /* ★ v1.1.29：板载灯是 WS2812，由 rgb_led 模块用 RMT 驱动（neopixelWrite）。
+     * 这里**不能**再把该引脚设成普通 GPIO 输出 —— 那样 RMT 一接管就会冲突，
+     * 而且普通电平也点不亮 WS2812。引脚配置交给 rgb_led_init()。 */
     if (BOARD_485_ENABLED) {
         gpio_reset_pin((gpio_num_t)BOARD_PIN_485_DE);
         gpio_set_direction((gpio_num_t)BOARD_PIN_485_DE, GPIO_MODE_OUTPUT);
@@ -926,6 +1051,25 @@ void check_buffer_status() {
      * 所以判据要落到 motion 上，而不是那个 3 秒就失效的布尔量。 */
     if (is_channel_pulling_back(cur)) return;
 
+    /* ★★★ v1.1.29：退料静默期 ★★★
+     *
+     * 现场（2026-10-31）："打印结束退料时，刚开始会跟随挤出机拉出耗材，
+     * 触发送料微动后又把耗材送进挤出机了"。
+     *
+     * v1.1.27 已经挡掉 motion 为 before_pull_back / pull_back 的通道，
+     * 但退料 3 秒超时后 motion 可能已经切走（打印机发了别的帧），
+     * 而物理上料还在往后退 —— 这时微动一触发就又送料。
+     *
+     * 所以再加一道**时间**保险：退料结束后 PULLBACK_SILENCE_MS(10 秒) 内，
+     * 缓冲微动一律不响应。
+     * 注意：只挡"微动补料"，不挡 485 的正式进料（send_out 走 AMCU_motion），
+     * 所以换色后要进新料完全不受影响。 */
+    if (s_pullback_end_ms != 0 &&
+        (millis() - s_pullback_end_ms) < PULLBACK_SILENCE_MS)
+    {
+        return;
+    }
+
     /* ★★★ v1.1.23：准入放宽 —— 三道判据任一成立就允许缓冲微动 ★★★
      *
      * 现场（2026-10-31）：**流量校准阶段微动压下不送料**，
@@ -964,6 +1108,7 @@ void check_buffer_status() {
 // ============================
 void AMCU_init() {
     init_io_pins();
+    rgb_led_init();       /* v1.1.29：WS2812 状态灯（替代原来的普通 GPIO 电平） */
     sensor_init();
     motor_init();
     clutch_init();
@@ -1006,6 +1151,9 @@ void AMCU_run() {
      * 它负责清掉"已不该再占电机"的 decision，并在电机确实被这一路占着时停机。
      * 没有它，停印后 decision 卡在 1 会让电机一直转（现场已复现）。 */
     buffer_feed_watchdog();
+
+    /* ★ v1.1.29：RGB 状态灯每轮更新（内部 50ms 限流，不拖慢主循环） */
+    led_state_update();
 
     static int now_f = 255;
     int x = get_now_filament_num();
@@ -1147,6 +1295,9 @@ void AMCU_motion() {
                 set_filament_motion(pull_back_channel, waiting);
             }
             log_i("退料结束: 料位%d 已反转 %d 秒，停电机", pull_back_channel, timeout_seconds);
+            /* ★ v1.1.29：记录退料结束时刻，进入静默期（见 s_pullback_end_ms 注释） */
+            s_pullback_end_ms = millis();
+            if (s_pullback_end_ms == 0) s_pullback_end_ms = 1;  /* 0 是"从未退过料"的哨兵 */
             RGB_BLUE;
         } else {
             int ch = now_filament_num_need_pull_back + 1;

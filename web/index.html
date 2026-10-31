@@ -438,6 +438,11 @@
             <span style="align-self:center" class="dim">秒 超时</span>
             <button class="primary" style="flex:1" id="btn_feed_timeout_save">保存送料超时</button>
           </div>
+          <div class="row" style="margin-top:10px">
+            <input type="number" id="idle_timeout" min="0" max="600" step="10" value="60">
+            <span style="align-self:center" class="dim">秒 双失效保护</span>
+            <button class="primary" style="flex:1" id="btn_idle_timeout_save">保存双失效保护</button>
+          </div>
           <div class="tip">
             <b>上面是速度，下面是保险</b>：微动触发补料时的电机 PWM，默认 <b>100%</b>。
             改完立即生效并写入 NVS，重启不丢。
@@ -450,8 +455,15 @@
             （停止微动不触发 / 微动接反卡在触发态），缓冲逻辑会一直送料，电机空转发热、
             料还会被顶进挤出机。超过这个时长就强制停电机，等微动松开或停止位触发后重新计时。
             <br>默认 <b>30 秒</b>（实测正常补料一次 7~15 秒，留一倍余量），范围 5~120。
+            <br>· 超时停料后，<b>必须把微动松开再压下</b>才会继续送料（不是自动重试）；
             <br>· 正常补料被中途打断 → 调大；
             <br>· 卡住后等太久才停 → 调小。
+            <div class="hr"></div>
+            <b>「双失效保护」是防微动坏的保险</b>：打印中<b>开始位和停止位都不触发</b>
+            超过这个时长 → 停电机 + 打日志（缓冲器状态完全读不到，多半是微动线断了）。
+            <br>默认 <b>60 秒</b>，范围 0~600，<b>填 0 = 关闭</b>。
+            <br>· 缓冲器半满时"两个都不触发"是正常中间态，所以这个值不能太短；
+            <br>· 真卡死了要尽快停 → 调小到 20~30。
             <div class="hr"></div>
             <b>怎么定 PWM</b>：在「硬件调试」里点动一次，日志会打出
             <code>电流统计: 进料 PWM=100% 时长=… 启动峰值=…mA 稳态均值=…mA 稳态峰值=…mA</code>，

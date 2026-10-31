@@ -62,6 +62,19 @@ struct SettingsData {
 #define FEED_TIMEOUT_SEC_MIN      5
 #define FEED_TIMEOUT_SEC_MAX      120
 
+/* ★ v1.1.29：双微动失效保护 —— 开始位和停止位**都不触发**持续多久就停机保护。
+ *
+ * 现场需求（2026-10-31）："在打印过程中如果两个都不触发，超过多少秒就停机保护"。
+ *
+ * 缓冲器半满时"两个都不触发"是正常中间态，所以这个值要给得足够长，
+ * 默认 60 秒。真的两个都超过 60 秒不动，基本就是微动线断了 / 卡死，
+ * 这时继续送料只会把料顶进挤出机。
+ *
+ * 填 0 = 关闭该保护。范围 0~600。 */
+#define DEFAULT_IDLE_TIMEOUT_SEC  60
+#define IDLE_TIMEOUT_SEC_MIN      0
+#define IDLE_TIMEOUT_SEC_MAX      600
+
 // 外部变量（供其他模块访问）
 extern int PULLBACK_TIMEOUT[16];
 extern int SLEEP_TIMEOUT_MIN;
@@ -70,6 +83,7 @@ extern int CHANNEL_MODE[16];
 extern int AMS_COUNT;
 extern int FEED_PWM;   /* v1.1.26：自动送料 PWM 百分比（40~100） */
 extern int FEED_TIMEOUT_SEC;  /* v1.1.27：缓冲送料连续运行上限（秒，5~120） */
+extern int IDLE_TIMEOUT_SEC;  /* v1.1.29：双微动失效停机保护（秒，0=关闭） */
 
 // 初始化设置存储（在setup中调用）
 void settings_storage_init();
@@ -106,3 +120,7 @@ int settings_get_feed_pwm(void);
  *   get: 当前生效值 */
 int settings_set_feed_timeout(int sec);
 int settings_get_feed_timeout(void);
+
+/* ★ v1.1.29：双微动失效停机保护（秒，0=关闭，范围 0~600） */
+int settings_set_idle_timeout(int sec);
+int settings_get_idle_timeout(void);

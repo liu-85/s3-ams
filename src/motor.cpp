@@ -57,7 +57,16 @@ static int64_t     s_dir_started_us = 0;
  * 250ms 脉冲，不打印，避免把网页日志刷爆。 */
 #define MOTOR_PROFILE_PERIOD_US   20000   /* 20ms 采样一次 */
 #define MOTOR_PROFILE_MIN_MS      500     /* 短于此的运行不打日志 */
-#define MOTOR_PROFILE_START_MS    800     /* 启动段时长（与堵转保护的 blank_ms 同量级） */
+/* ★ v1.1.29：启动段 800ms → 300ms
+ *
+ * 现场（2026-10-31）实测大量"时长≈800ms、稳态均值=0"的记录 —— 那不是
+ * 电机没转，而是**整段都被算进了启动段，稳态段一个采样点都没有**。
+ * 起动电流主要集中在最初 100~300ms，300ms 足够覆盖；
+ * 之后的 500ms 就能给出真实的稳态均值。
+ *
+ * 注意：这和堵转保护的 blank_ms(起步屏蔽, 默认 800ms) 是两回事 ——
+ * 那个是"判堵转前先别判"，这个只是统计分段。 */
+#define MOTOR_PROFILE_START_MS    300
 
 typedef struct {
     bool     active;        /* 正在统计 */
@@ -318,8 +327,24 @@ bool motor_set_dir_speed(motor_dir_t dir, int speed_pct)
         motor_apply(0, speed_pct);
     }
 
-    /* v1.1.26：开始/重启一次电流统计（换向或换速都算新的一段） */
-    motor_profile_start(dir, speed_pct);
+    /* ★ v1.1.29：只在**方向变化**时重启电流统计
+     *
+     * 现场（2026-10-31）：15 条记录的时长全是 780~812ms，稳态均值全为 0。
+     * 根因不是电机没转，而是**统计被反复重置**：
+     *   缓冲微动用 settings_get_feed_pwm()（90%）
+     *   状态机送料用 MOTOR_SPEED_485_FEED（100%）
+     * 两者交替调用 motor_set_dir_speed()，速度一变就不满足幂等条件 →
+     * 重新 apply + motor_profile_start() 重置计时 →
+     * 每次统计只有几十~几百 ms，而 MOTOR_PROFILE_START_MS(800) 又把
+     * 整段都划进"启动段"，稳态段一个采样点都没有 → 均值恒为 0。
+     *
+     * 修法：同方向只换速度时**继续累计**，不重启统计（只更新记录的 pct）。
+     * 这样一次连续运行（同方向）只会有一条完整记录。 */
+    if (!same_dir || s_dir_started_us == 0) {
+        motor_profile_start(dir, speed_pct);
+    } else if (s_prof.active) {
+        s_prof.pct = speed_pct;   /* 同方向换速：继续累计，只更新速度记录 */
+    }
 
     if (!same_dir || s_dir_started_us == 0) {
         s_dir_started_us = esp_timer_get_time();
