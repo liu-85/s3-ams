@@ -1147,11 +1147,13 @@ void send_for_Fxx(unsigned char *buf, int length)
     {
         uint8_t req_num = buf[5];
 
-        /* ★ v1.1.21：超出本板台数（2 台）的 0x06 握手直接不应答。
-         * 原来无条件回包，打印机问台 2/3/4… 也照样收到应答，
-         * 会被当成"又发现一台 AMS"，耗材页就多出重复卡片。 */
-        if (req_num >= AMS_COUNT) return;
-
+        /* ★ v1.1.22：撤销 v1.1.21 在这里加的 `if (req_num >= AMS_COUNT) return;`。
+         *
+         * 0x06 是打印机**逐台握手确认**的帧，参考实现 esp32s3-485 对它
+         * 是无条件回包的。少回一次就是"链路上有一次无应答"，打印机侧
+         * 很容易记成通信异常 —— 和 0x402 是同一类错误。
+         * 重复 AMS 卡片的问题不在"回不回包"，而在这里无条件回、且
+         * res_for_06_num 会把所有台号都改成同一个（见下方逻辑，暂未动）。 */
         uint8_t ams_num = req_num;
         if (res_for_06_num == 0xFF)
         {
@@ -1300,13 +1302,21 @@ void send_for_long_packge_version(unsigned char *buf, int length)
         else if (printer_data_long.data_length > 0)
             AMS_num = printer_data_long.datas[0];
 
-        /* ★ v1.1.21：越界台号**直接不应答**，不再 clamp 到 0。
+        /* ★ v1.1.22：越界台号必须 clamp 到 0 后**继续应答**，绝不能 return。
          *
-         * 原来 `if (AMS_num >= AMS_COUNT) AMS_num = 0;` 会让台 2/3/4/5… 的查询
-         * 统统拿回"台 0 的序列号"，打印机据此可能认为又发现一台 AMS，
-         * 耗材页就会出现重复的 AMS-A。本工程其他长包（0x21A/0x211/0x05）
-         * 都是 `>= AMS_COUNT` 就 return，只有这里不一致 —— 统一成不应答。 */
-        if (AMS_num >= AMS_COUNT) return;
+         * v1.1.21 曾把这里改成 `if (AMS_num >= AMS_COUNT) return;`（照其他长包
+         * "越界就不应答"的写法统一），结果打印机在枚举 AMS-A 时报
+         * `[0500-40A3] AMS(或AMS lite) A 通信异常`。
+         *
+         * 原因：0x402 的台号并不总在 payload[33]。包长 ≤ 33 时会退到 payload[0]，
+         * 而 payload[0] 不一定是台号（可能是别的字段），值一旦 >= AMS_COUNT
+         * 就 return → 打印机**一个序列号包都收不到** → 判定 A 通信异常。
+         * 参考实现 esp32s3-485 的 on_version() 同样先 `unit = pl[0]` 兜底，
+         * 但紧接着是 `if (unit >= AMS_UNITS) unit = 0;` —— **clamp 不是 return**。
+         *
+         * 宁可回一个"台 0 的序列号"（最多让耗材页多张卡片，不影响打印），
+         * 也绝不能让链路上出现"查询无应答"（直接报通信异常、无法打印）。 */
+        if (AMS_num >= AMS_COUNT) AMS_num = 0;
 
         payload = long_packge_version_serial_number_AMS08;
         payload_len = sizeof(long_packge_version_serial_number_AMS08);
@@ -1317,32 +1327,31 @@ void send_for_long_packge_version(unsigned char *buf, int length)
     }
     else if (printer_data_long.type == 0x103)
     {
-        /* ★ v1.1.13：版本号改成可配置的真实值，不再用 Tianshu 编造的 90.00.00.00。
+        /* ★ v1.1.22：长度回退 21 字节（v1.1.21 曾改成 22）。
          *
-         * 包结构（22 字节）：
+         * 22 字节是参考实现 esp32s3-485 的做法（b[20]/b[21] 都写台号），
+         * 但本工程 1.1.20 及以前一直是 21 字节、台号只写 [20]，且**实测能
+         * 正常识别 AMS-A/B**。既然 21 是已验证行为，就不要为"多写一个
+         * 台号副本"去改长包的 data_length —— 打印机会校验长度，
+         * 长度变了就可能整包丢弃，表现同样是通信异常。
+         *
+         * 包结构（21 字节）：
          *   [0..3]  版本号 uint32 小端，例如 01.00.06.87 → 57 06 00 01
          *   [4..8]  型号代号 "AMS08"（AMS / AMS 2 Pro / AMS HT 这条线）
          *   [9..19] 补 0
-         *   [20]    台号（BMCU370 读这里）
-         *   [21]    台号（Tianshu/旧固件读这里）
-         *
-         * ★ v1.1.21：长度 21 → 22，两个台号位置都写。
-         * 原来只有 21 字节、台号只写 [20]，如果打印机读 [21] 就完全读不到台号
-         * → 多台 AMS 台号全是 0 → 耗材页出现重复设备。
-         * esp32s3-485 的 build_ver() 就是 22 字节 + 两处都写。
+         *   [20]    台号
          *
          * 打印机会同时校验「版本号是否在白名单」和「型号代号」，两者任一
          * 对不上都可能弹「当前固件仅支持 AMS / AMS 2 Pro / AMS HT」。 */
-        static unsigned char ver_pkt[22];
+        static unsigned char ver_pkt[21];
         uint32_t v = s_ams_fw_ver;
         ver_pkt[0] = (unsigned char)(v & 0xFF);
         ver_pkt[1] = (unsigned char)((v >> 8) & 0xFF);
         ver_pkt[2] = (unsigned char)((v >> 16) & 0xFF);
         ver_pkt[3] = (unsigned char)((v >> 24) & 0xFF);
         memcpy(ver_pkt + 4, "AMS08", 5);
-        memset(ver_pkt + 9, 0x00, 13);   /* [9..21] 清零 */
+        memset(ver_pkt + 9, 0x00, 11);   /* [9..19] 清零 */
         ver_pkt[20] = AMS_num;
-        ver_pkt[21] = AMS_num;
 
         payload = ver_pkt;
         payload_len = sizeof(ver_pkt);

@@ -16,3 +16,6 @@ build/
 Thumbs.db
 .DS_Store
 logs/
+
+# 485 抓包日志（体积大，不入库）
+tools/*.txt
