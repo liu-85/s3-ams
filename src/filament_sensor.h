@@ -93,6 +93,18 @@ bool sensor_set_channel_enabled(int channel, bool enabled);
 /* 启用掩码（bit0 = 料盘位1） */
 uint8_t sensor_enabled_mask(void);
 
+/* ★ v1.1.24：诊断用 —— 第 idx 只微动脚的**原始** digitalRead 电平
+ *   （1 = HIGH 松开，0 = LOW 压下；不受去抖 / 掩码 / 通道映射影响）
+ * 返回 -1 表示 idx 越界。
+ *
+ * 为什么需要：现场"某几路微动 WEB 上完全不变"时，必须先把
+ *   「引脚没信号（硬件/接线）」和「有信号但被判成别的状态（软件）」
+ *   分开，否则只能瞎猜。 */
+int sensor_raw_level(int idx);
+
+/* ★ v1.1.24：第 idx 只微动脚的 GPIO 编号（-1 越界） */
+int sensor_pin_of(int idx);
+
 /* 边沿序号 */
 uint32_t sensor_trigger_seq(int channel, sensor_kind_t kind);
 uint32_t sensor_release_seq(int channel, sensor_kind_t kind);

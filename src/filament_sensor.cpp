@@ -478,6 +478,26 @@ uint8_t sensor_enabled_mask(void)
     return s_enabled_mask;
 }
 
+/* ★ v1.1.24：原始电平诊断。
+ *
+ * 现场（2026-10-31）：通道 2~4 的微动在 WEB 上完全不变，只有通道 1 会动。
+ * 光看 /status 的 ch[][] 分不清是「引脚没信号」还是「有信号但被掩码/去抖挡」，
+ * 所以直接把 digitalRead 的原始值暴露出来：
+ *   raw=1 且按下不变  → 接线/微动本身问题（常开没接通、GND 没共）
+ *   raw=0 且松开不变  → 引脚被拉死（常闭微动、短路、或被别处占用）
+ *   raw 会变但 ch 不变 → 软件问题（掩码 / 去抖 / 通道映射） */
+int sensor_raw_level(int idx)
+{
+    if (idx < 0 || idx >= BOARD_CHANNEL_COUNT) return -1;
+    return (digitalRead(s_pins[idx]) == HIGH) ? 1 : 0;
+}
+
+int sensor_pin_of(int idx)
+{
+    if (idx < 0 || idx >= BOARD_CHANNEL_COUNT) return -1;
+    return s_pins[idx];
+}
+
 uint32_t sensor_trigger_seq(int channel, sensor_kind_t kind)
 {
     if (channel < 0 || channel >= BOARD_CHANNEL_COUNT) return 0;

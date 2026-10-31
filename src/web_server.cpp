@@ -258,7 +258,7 @@ void web_log_install_hook(void)
 }
 
 /* App 版本 */
-static const char *APP_VERSION = "1.1.23-s3ams";
+static const char *APP_VERSION = "1.1.24-s3ams";
 
 /* 单 IO 双微动：每路一个 ADC 脚（开始位/停止位共用同一脚，电阻编码） */
 static const int BOARD_SENSOR_PINS[BOARD_CHANNEL_COUNT] = BOARD_PIN_SENSOR_ARRAY;
@@ -740,6 +740,16 @@ static void handle_status(void)
         json += sensor_combo_degraded(i) ? "1" : "0";
     }
     json += "],";
+    /* ★ v1.1.24：8 只微动脚的**原始** digitalRead 电平（1=HIGH 松开 / 0=LOW 压下）。
+       不受去抖、不受启用掩码、不受通道映射影响 —— 用来把
+       「引脚没信号（硬件）」和「有信号但被软件挡（掩码/去抖）」分开。
+       pins 给出对应的 GPIO 号，便于对照原理图。 */
+    json += "\"raw\":[";
+    for (int i = 0; i < BOARD_CHANNEL_COUNT; i++) {
+        if (i) json += ",";
+        json += String(sensor_raw_level(i));
+    }
+    json += "],";
     json += "\"job\":1,";   // 简化：认为有打印任务时微动才驱动
     json += "\"stage\":1,";
     json += "\"cur\":" + String(cur);
@@ -814,18 +824,72 @@ static void handle_sensor_set(void)
         return;
     }
     String body = server.arg("plain");
-    // 简单解析 channel 和 enable
+    /* 简单解析 channel 和 enable
+     *
+     * ★ v1.1.24：原来找的是 "\"enable\""，但前端 app.js 发的字段名是
+     *   **"enabled"**（`{channel:ch, func:..., enabled:0/1}`）。
+     *   `"enable"`（带引号）在 `"enabled"` 里**匹配不上**（e 后面是 d 不是 "），
+     *   于是 eidx 恒为 -1、enable 恒为 -1、`enable != 0` 恒为 true →
+     *   缓冲送料开关**只能开、关不掉**。
+     *   这里两种写法都认。 */
     int channel = -1, enable = -1;
     int cidx = body.indexOf("\"channel\"");
-    int eidx = body.indexOf("\"enable\"");
+    int eidx = body.indexOf("\"enabled\"");
+    if (eidx < 0) eidx = body.indexOf("\"enable\"");
     if (cidx >= 0) channel = body.substring(cidx + 9, body.indexOf("}", cidx)).toInt();
-    if (eidx >= 0) enable = body.substring(eidx + 8, body.indexOf("}", eidx)).toInt();
+    if (eidx >= 0) {
+        int off = body.indexOf("\"enabled\"") >= 0 ? 10 : 9;   /* 跳过 "enabled" / "enable" */
+        enable = body.substring(eidx + off, body.indexOf("}", eidx)).toInt();
+    }
 
     bool ok = false;
     if (channel >= 1 && channel <= BOARD_CHANNEL_COUNT) {
         ok = sensor_set_channel_enabled(channel - 1, enable != 0);
     }
     server.send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
+}
+
+/* ★ v1.1.24：微动原始电平诊断页（纯 JSON，浏览器直接打开就能看）
+ *
+ *   http://192.168.2.100/sensor_raw
+ *
+ * 返回：
+ *   pins  —— 8 只微动对应的 GPIO 号
+ *   raw   —— 8 只微动的原始电平（1=HIGH 松开 / 0=LOW 压下）
+ *   trig  —— 去抖后的触发状态（按"开始位/停止位"配对后的通道视图）
+ *   mask  —— 缓冲送料启用掩码（0x0F = 前 4 路都开）
+ *   deb   —— 去抖计数（0..3，到了 3 才认可）
+ *
+ * 判读：
+ *   按下微动 raw 从 1 变 0 → 硬件没问题，问题在软件（掩码/映射）
+ *   按下 raw 不变（一直是 1）→ 微动没接通 / GND 没共
+ *   一直 0（松开也不回 1）  → 引脚被拉死：常闭微动、短路、或引脚被占用 */
+static void handle_sensor_raw(void)
+{
+    String j = "{\"mode\":\"";
+    j += SENSOR_TEMP_DIGITAL ? "digital" : "encoded";
+    j += "\",\"mask\":" + String((unsigned)sensor_enabled_mask());
+    j += ",\"pins\":[";
+    for (int i = 0; i < BOARD_CHANNEL_COUNT; i++) {
+        if (i) j += ",";
+        j += String(sensor_pin_of(i));
+    }
+    j += "],\"raw\":[";
+    for (int i = 0; i < BOARD_CHANNEL_COUNT; i++) {
+        if (i) j += ",";
+        j += String(sensor_raw_level(i));
+    }
+    j += "],\"trig\":[";
+    for (int i = 0; i < BOARD_CHANNEL_COUNT / 2; i++) {
+        if (i) j += ",";
+        j += "[";
+        j += String(sensor_triggered(i, SENSOR_STOP) ? 1 : 0);
+        j += ",";
+        j += String(sensor_triggered(i, SENSOR_START) ? 1 : 0);
+        j += "]";
+    }
+    j += "]}";
+    server.send(200, "application/json; charset=utf-8", j);
 }
 
 static void handle_wifi_scan(void)
@@ -1487,6 +1551,7 @@ void web_server_start(void)
     server.on("/status", handle_status);
     server.on("/log", handle_log);
     server.on("/sensor_set", HTTP_POST, handle_sensor_set);
+    server.on("/sensor_raw", HTTP_GET, handle_sensor_raw);
     server.on("/wifi_scan", HTTP_POST, handle_wifi_scan);
     server.on("/wifi_connect", HTTP_POST, handle_wifi_connect);
     server.on("/wifi_set", HTTP_POST, handle_wifi_set);

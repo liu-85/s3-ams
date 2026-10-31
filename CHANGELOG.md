@@ -6,6 +6,44 @@ RELEASE.md 在 `release/vX.Y.Z/`。
 
 ---
 
+## v1.1.24 —— 微动原始电平诊断 + 修缓冲开关关不掉
+
+**2026-10-31**
+
+**症状**：通道 2~4 的微动在 WEB 上完全不变（一直"触发"），只有通道 1 会变。
+v1.1.14 测试微动时正常。
+
+**先确认不是回归**：`git log -- src/filament_sensor.cpp` 显示最后一次改动就是
+`71a38a7`（v1.1.14），之后一行没动；引脚表 `BOARD_PIN_SENSOR_ARRAY` 也没动。
+所以先加可观测性，不动逻辑。
+
+**新增**：
+
+- `GET /sensor_raw` —— 8 只微动的**原始** `digitalRead` 电平 + 去抖状态 + 启用掩码
+  ```
+  {"mode":"digital","mask":15,"pins":[1,2,9,8,10,11,12,13],
+   "raw":[1,0,0,0,1,1,1,1],"trig":[[0,0],[0,1],[0,1],[0,1]]}
+  ```
+- `filament_sensor.cpp`：`sensor_raw_level(idx)` / `sensor_pin_of(idx)`
+- `/status` 的 `sensors` 段增加 `raw` 数组
+
+**判读**：
+
+| 现象 | 结论 |
+|---|---|
+| 按下 `raw` 1→0 | 硬件正常，问题在软件 |
+| `raw` 恒 1 | 没接通 / GND 没共 |
+| `raw` 恒 0（松开也不回 1） | 接了**常闭(NC)**触点 / 短路 / 引脚被占 |
+
+**顺带修 bug**：前端 `app.js` 发的是 `enabled`，后端找的是 `"enable"`
+（`"enable"` 带引号在 `"enabled"` 里匹配不上）→ `enable` 恒 -1 →
+`enable != 0` 恒 true → **缓冲送料开关只能开、关不掉**。现在两种写法都认。
+
+**没动**：引脚表、`SENSOR_TEMP_DIGITAL` / `SENSOR_TEMP_ACTIVE_LOW` 宏、
+去抖 `N=3`、v1.1.23 的缓冲准入逻辑。
+
+---
+
 ## v1.1.23 —— 修流量校准阶段微动不送料
 
 **2026-10-31**
