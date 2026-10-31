@@ -27,6 +27,20 @@
 #define LED_BLINK_INTERVAL 500
 #define BUFFER_FEED_TIMEOUT_MS 15000  /* 缓冲送料无反馈超时（15秒回退停止） */
 
+/* ★ v1.1.25：缓冲送料**连续**运行时长的硬上限（30 秒）。
+ *
+ * 为什么必须加：v1.1.23 让 AMCU_motion() 的 case waiting 在
+ * s_buffer_feed_decision==1 时不再 drive_stop()，本意是别把刚送起来的
+ * 料掐掉。但如果微动卡在"一直触发"（常闭接反、线短接到 GND、焊接后
+ * 引脚被拉死），decision 就永远是 1，而 start_trig 分支每轮都刷新
+ * s_buffer_last_feedback → BUFFER_FEED_TIMEOUT_MS(15s) 永远不到 →
+ * **电机会一直转不停**。
+ *
+ * 电机长时间堵转/空转的后果不只是发热：大电流会让 3.3V/5V 电源纹波变大，
+ * 485 收发器最容易受影响 —— 表现就是打印机报 [0500-40A3] 通信异常。
+ * 所以这里加一道与"无反馈超时"独立的、按**连续运行时长**计的兜底。 */
+#define BUFFER_FEED_MAX_MS 30000
+
 // ============================
 //  全局变量
 // ============================
@@ -263,6 +277,8 @@ static int s_current_channel = 0;
 // 缓冲送料状态跟踪（每通道上次决策）
 static int s_buffer_feed_decision[BOARD_CHANNEL_COUNT] = {0};  // 0=停, 1=送料
 static uint32_t s_buffer_last_feedback[BOARD_CHANNEL_COUNT] = {0};
+/* v1.1.25：本轮"连续送料"的起点（0 = 当前没在送料），用于连续运行时长兜底 */
+static uint32_t s_buffer_feed_start[BOARD_CHANNEL_COUNT] = {0};
 
 // last_action 跟踪（简化版）
 static uint8_t s_last_action[MAX_FILAMENT_NUM] = {0};
@@ -538,6 +554,22 @@ void AMCU_buffer_assist_feed(int channel)
 
     uint32_t now = millis();
 
+    /* ★ v1.1.25：连续送料时长兜底（见 BUFFER_FEED_MAX_MS 注释）。
+     * 微动卡死时 decision 永远是 1、start_trig 每轮刷新 feedback 时间戳，
+     * 15 秒的"无反馈超时"永远不触发 → 电机无限转 → 电源纹波 → 485 误码。
+     * 这里按"从 decision 置 1 开始算的连续时长"硬性截断。 */
+    if (s_buffer_feed_decision[channel] == 1 && s_buffer_feed_start[channel] != 0 &&
+        (now - s_buffer_feed_start[channel]) > BUFFER_FEED_MAX_MS)
+    {
+        AMCU_drive_stop();
+        s_buffer_feed_decision[channel] = 0;
+        s_buffer_feed_start[channel] = 0;
+        log_w("缓冲送料超时强制停：通道%d 连续送料超过 %d 秒（微动可能卡在触发态，"
+              "检查该路微动是否常闭接反/短接到 GND）", channel + 1,
+              (int)(BUFFER_FEED_MAX_MS / 1000));
+        return;
+    }
+
     if (start_trig) {
         /* 需要补料：吸合离合 + 进料 */
         /* ★ v1.1.23：先把决策置 1，再谈电机。
@@ -545,6 +577,7 @@ void AMCU_buffer_assist_feed(int channel)
          * （走下面的 else 分支）或正在等吸合时都不置 1，于是
          * AMCU_motion() 的 case waiting 看到 decision==0 就把电机停了，
          * 现场表现就是"微动压下了，电机不转"。 */
+        if (s_buffer_feed_decision[channel] == 0) s_buffer_feed_start[channel] = now;
         s_buffer_feed_decision[channel] = 1;
         if (!clutch_is_engaged(channel + 1)) {
             if (AMCU_drive_channel(channel + 1, MOTOR_DIR_FEED, MOTOR_SPEED_FULL)) {
@@ -558,6 +591,7 @@ void AMCU_buffer_assist_feed(int channel)
         /* 缓冲器满：停电机 + 释放离合 */
         AMCU_drive_stop();
         s_buffer_feed_decision[channel] = 0;
+        s_buffer_feed_start[channel] = 0;
         s_buffer_last_feedback[channel] = now;
     } else {
         /* 中间档：保持上一决策 */
@@ -565,6 +599,7 @@ void AMCU_buffer_assist_feed(int channel)
             if (now - s_buffer_last_feedback[channel] > BUFFER_FEED_TIMEOUT_MS) {
                 AMCU_drive_stop();
                 s_buffer_feed_decision[channel] = 0;
+                s_buffer_feed_start[channel] = 0;
             }
             /* 否则保持送料 */
         }

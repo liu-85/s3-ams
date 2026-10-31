@@ -463,6 +463,26 @@ void send_uart(const unsigned char *data, uint16_t length)
 uint8_t buf_X[1000];
 CRC8 _RX_IRQ_crcx(0x39, 0x66, 0x00, false, false);
 
+/* ★ v1.1.25：485 链路计数（只读诊断，不参与任何逻辑）
+ *
+ * 为什么要加：现场"打印机报 [0500-40A3] AMS A 通信异常"时，光看现象
+ * 分不清三种完全不同的原因：
+ *   ① 物理层断了（线松/焊点虚/收发器坏/极性接反）
+ *      → rx_bytes 完全不涨
+ *   ② 收到帧但 CRC 大量错（波特率/干扰/共地不良/电源纹波）
+ *      → rx_bytes 涨、rx_frames 不涨、crc_err 猛涨
+ *   ③ 帧收得好好的，但我们对某类查询没应答（协议 bug）
+ *      → rx_frames 正常涨、对应 tx_* 不涨
+ * 刷一次机看 /status 的 ams.diag 就能定性，不用再靠抓包。 */
+static uint32_t s_485_rx_bytes    = 0;  /* 收到的原始字节数 */
+static uint32_t s_485_rx_frames   = 0;  /* CRC 校验通过、完整收下的帧数 */
+static uint32_t s_485_rx_crc_err  = 0;  /* CRC8 校验失败的帧数 */
+static uint32_t s_485_rx_overflow = 0;  /* 超长/半截帧被丢弃的次数 */
+static uint32_t s_485_tx_402      = 0;  /* 0x402 序列号查询的应答次数 */
+static uint32_t s_485_tx_103      = 0;  /* 0x103 版本查询的应答次数 */
+static uint32_t s_485_tx_06       = 0;  /* 0x06 握手查询的应答次数 */
+static uint32_t s_485_last_rx_ms  = 0;  /* 最近一次成功收帧的时刻 */
+
 /* 单字节协议解析（原 RX_IRQ 逻辑，改为函数调用） */
 static void RX_IRQ(unsigned char data)
 {
@@ -512,6 +532,7 @@ static void RX_IRQ(unsigned char data)
         {
             if (data != _RX_IRQ_crcx.calc())
             {
+                s_485_rx_crc_err++;   /* v1.1.25 诊断 */
                 _index = 0;
                 return;
             }
@@ -522,10 +543,13 @@ static void RX_IRQ(unsigned char data)
             _index = 0;
             memcpy(buf_X, BambuBus_data_buf, length);
             BambuBus_have_data = length;
+            s_485_rx_frames++;                 /* v1.1.25 诊断 */
+            s_485_last_rx_ms = millis();
             bus485raw_record(0, BambuBus_data_buf, length);  /* 原始报文记录：打印机发来 */
         }
         if (_index >= 999)
         {
+            s_485_rx_overflow++;               /* v1.1.25 诊断 */
             _index = 0;
         }
     }
@@ -537,6 +561,7 @@ static void BambuBus_UART_Poll(void)
     while (RS485.available() > 0)
     {
         unsigned char x = RS485.read();
+        s_485_rx_bytes++;      /* v1.1.25 诊断：物理层是否有数据进来 */
         RX_IRQ(x);
     }
 }
@@ -1151,6 +1176,7 @@ void send_for_Fxx(unsigned char *buf, int length)
         F00_res[ams_num][6] = ams_num;
 
         package_send_with_crc(F00_res[ams_num], 29);
+        s_485_tx_06++;   /* v1.1.25 诊断：0x06 握手已应答 */
 
         if (memcmp(F00_res[ams_num] + 7, buf + 7, 20) == 0)
             have_registered[ams_num] = true;
@@ -1215,6 +1241,7 @@ void send_for_long_packge_MC_online(unsigned char *buf, int length)
     data.source_address = BambuBus_address_AMS08;
     data.target_address = printer_data_long.source_address;
     Bambubus_long_package_send(&data);
+    s_485_tx_103++;   /* v1.1.25 诊断：0x103 版本查询已应答 */
 }
 
 // ==================== 读取耗材信息 ====================
@@ -1259,6 +1286,7 @@ void send_for_long_packge_filament(unsigned char *buf, int length)
     data.source_address = BambuBus_address_AMS08;
     data.target_address = printer_data_long.source_address;
     Bambubus_long_package_send(&data);
+    s_485_tx_402++;   /* v1.1.25 诊断：0x402 序列号查询已应答 */
 }
 
 // ==================== 版本和序列号数组定义 ====================
@@ -1524,6 +1552,36 @@ uint8_t get_channel_last_statu(int num)
 {
     if (num < 0 || num >= 16) return 0;
     return filament_ext[num / 4][num % 4].last_statu;
+}
+
+/* ★ v1.1.25：485 链路诊断计数快照（供 /status 的 ams.diag 输出）
+ *
+ * 判读表（刷完看一次 /status 即可定性 40A3）：
+ *   rx_bytes 不涨             → 物理层没数据：线松/焊点虚/收发器坏/A-B 接反
+ *   rx_bytes 涨、crc_err 猛涨 → 干扰或波特率/共地问题（电机电源纹波常见）
+ *   rx_frames 涨、tx_402=0    → 我们没应答序列号查询（协议分支 bug）
+ *   tx_402 涨、仍报 40A3      → 应答内容不对（台号/长度/型号指纹），查协议内容
+ *   last_rx_age 很大          → 打印机根本没在跟我们说话（对端/接线） */
+void bambubus_485_stats(uint32_t *rx_bytes, uint32_t *rx_frames, uint32_t *crc_err,
+                        uint32_t *overflow, uint32_t *tx_402, uint32_t *tx_103,
+                        uint32_t *tx_06, uint32_t *last_rx_ms)
+{
+    if (rx_bytes)  *rx_bytes  = s_485_rx_bytes;
+    if (rx_frames) *rx_frames = s_485_rx_frames;
+    if (crc_err)   *crc_err   = s_485_rx_crc_err;
+    if (overflow)  *overflow  = s_485_rx_overflow;
+    if (tx_402)    *tx_402    = s_485_tx_402;
+    if (tx_103)    *tx_103    = s_485_tx_103;
+    if (tx_06)     *tx_06     = s_485_tx_06;
+    if (last_rx_ms) *last_rx_ms = s_485_last_rx_ms;
+}
+
+/* v1.1.25：清零 485 链路计数（改接线后重新开始计数，便于对照） */
+void bambubus_485_stats_reset(void)
+{
+    s_485_rx_bytes = s_485_rx_frames = s_485_rx_crc_err = s_485_rx_overflow = 0;
+    s_485_tx_402 = s_485_tx_103 = s_485_tx_06 = 0;
+    s_485_last_rx_ms = 0;
 }
 
 /* 打印阶段细分查询（v1.1.12）—— 见 BambuBus.h 注释 */

@@ -88,6 +88,13 @@ extern bool is_channel_active_recently(int num, uint32_t window_ms);
 /* v1.1.23：诊断用，最近一次收到的 statu（0 = 还没收到过） */
 extern uint8_t get_channel_last_statu(int num);
 
+/* ★ v1.1.25：485 链路诊断计数（任一指针可传 NULL）
+ * 用来把「打印机报 40A3」定性成：物理层断 / 干扰误码 / 没应答 / 应答内容错 */
+extern void bambubus_485_stats(uint32_t *rx_bytes, uint32_t *rx_frames, uint32_t *crc_err,
+                               uint32_t *overflow, uint32_t *tx_402, uint32_t *tx_103,
+                               uint32_t *tx_06, uint32_t *last_rx_ms);
+extern void bambubus_485_stats_reset(void);
+
 /* 打印阶段细分查询（v1.1.12）。
  *
  * 为什么需要：map_internal_to_api() 把 before_on_use / on_use / stop_on_use

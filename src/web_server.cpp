@@ -258,7 +258,7 @@ void web_log_install_hook(void)
 }
 
 /* App 版本 */
-static const char *APP_VERSION = "1.1.24-s3ams";
+static const char *APP_VERSION = "1.1.25-s3ams";
 
 /* 单 IO 双微动：每路一个 ADC 脚（开始位/停止位共用同一脚，电阻编码） */
 static const int BOARD_SENSOR_PINS[BOARD_CHANNEL_COUNT] = BOARD_PIN_SENSOR_ARRAY;
@@ -581,6 +581,28 @@ static void handle_status(void)
             ",\"target_switch\":" + String((unsigned long)amcu_clutch_switch_count()) +
             ",\"target_abort\":" + String((unsigned long)amcu_clutch_abort_count()) +
             ",\"exchange_ok\":0,\"exchange_fail\":0,\"last_error\":\"—\",\"last_error_ms\":-1}";
+
+    /* ===== v1.1.25：485 链路诊断 =====
+     * 打印机报 [0500-40A3] AMS A 通信异常时，看这一段就能定性：
+     *   rx_bytes 不涨              → 物理层没数据（线松/焊点虚/收发器坏/A-B 反）
+     *   rx_bytes 涨 + crc_err 猛涨 → 干扰或共地不良（电机电源纹波常见）
+     *   rx_frames 涨 + tx_402=0    → 我们没应答序列号查询（协议分支问题）
+     *   tx_402 涨 + 仍报 40A3      → 应答内容不对（台号/长度/型号指纹）
+     *   last_rx_age_ms 很大        → 打印机没在跟我们说话
+     */
+    {
+        uint32_t rb = 0, rf = 0, ce = 0, ov = 0, t402 = 0, t103 = 0, t06 = 0, lrx = 0;
+        bambubus_485_stats(&rb, &rf, &ce, &ov, &t402, &t103, &t06, &lrx);
+        long age = (lrx == 0) ? -1 : (long)(millis() - lrx);
+        json += ",\"link\":{\"rx_bytes\":" + String((unsigned long)rb) +
+                ",\"rx_frames\":" + String((unsigned long)rf) +
+                ",\"crc_err\":" + String((unsigned long)ce) +
+                ",\"overflow\":" + String((unsigned long)ov) +
+                ",\"tx_402\":" + String((unsigned long)t402) +
+                ",\"tx_103\":" + String((unsigned long)t103) +
+                ",\"tx_06\":" + String((unsigned long)t06) +
+                ",\"last_rx_age_ms\":" + String(age) + "}";
+    }
     json += "},";
 
     /* ===== 送料链诊断（v1.1.9 加）=====
@@ -1182,7 +1204,8 @@ static void handle_diag_reset(void)
 {
     clutch_reset_conflict_count();
     amcu_clutch_reset_diag();
-    server.send(200, "application/json", "{\"ok\":true,\"info\":\"已清除离合冲突/仲裁计数\"}");
+    bambubus_485_stats_reset();   /* v1.1.25：485 计数也清零，便于改接线后对照 */
+    server.send(200, "application/json", "{\"ok\":true,\"info\":\"已清除离合冲突/仲裁计数与 485 链路计数\"}");
 }
 
 /* 清零全部料位的计米。
