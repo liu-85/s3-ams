@@ -109,12 +109,28 @@ void setup() {
 void loop() {
     static unsigned long last_wdt = 0;
 
-    /* v1.1.28：记录主循环最大间隔（诊断 485 丢帧用，见上面注释） */
+    /* v1.1.28：记录主循环最大间隔（诊断 485 丢帧用，见上面注释）
+     * v1.1.38：超过 50ms 就记一条日志。
+     *
+     * 为什么加：现场"发打印任务就报 [0500-40A3]、自动取消"。
+     * 已经把 485 应答内容做到和 v1.1.29（能打印那版）逐字节一致、
+     * 应答延迟都是 1ms，问题仍在 —— 那剩下的可能就是**应答迟到**：
+     * 打印任务开始时送料动作会跑离合吸合（release 60 + 静默 20 + engage 80
+     * ≈ 160ms 的阻塞），主循环被堵住的这段时间里，打印机的查询没人应答。
+     * 这条日志能直接指认"卡了多久、卡在哪一帧"。 */
     {
         const uint32_t now_ms = millis();
         if (s_loop_last_ms != 0) {
             const uint32_t gap = now_ms - s_loop_last_ms;
             if (gap > s_loop_max_gap_ms) s_loop_max_gap_ms = gap;
+            if (gap >= 50) {
+                static uint32_t s_gap_log_last = 0;
+                if (now_ms - s_gap_log_last > 300) {
+                    s_gap_log_last = now_ms;
+                    log_w("主循环卡顿 %lums（485 应答会迟到这么久）",
+                          (unsigned long)gap);
+                }
+            }
         }
         s_loop_last_ms = now_ms;
     }
