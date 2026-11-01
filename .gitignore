@@ -27,3 +27,4 @@ tools/*.txt
 
 # 临时抓包/诊断输出
 .tmpdiag/
+src/build_id.h

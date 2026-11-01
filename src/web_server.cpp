@@ -10,6 +10,7 @@
 #include "ams_log.h"
 #include "web_server.h"
 #include "web_files.h"
+#include "build_id.h"      /* ★ v1.1.46：每次编译生成的 build id */
 #include "board_pins.h"
 #include "clutch.h"
 #include "motor.h"
@@ -258,7 +259,7 @@ void web_log_install_hook(void)
 }
 
 /* App 版本 */
-static const char *APP_VERSION = "1.1.45-s3ams";
+static const char *APP_VERSION = "1.1.46-s3ams";
 
 /* 单 IO 双微动：每路一个 ADC 脚（开始位/停止位共用同一脚，电阻编码） */
 static const int BOARD_SENSOR_PINS[BOARD_CHANNEL_COUNT] = BOARD_PIN_SENSOR_ARRAY;
@@ -631,6 +632,21 @@ static void handle_status(void)
     json += "\"part\":\"esp32s3\",";
     json += "\"build_time\":\"" + String(__TIME__) + "\",";
     json += "\"build_date\":\"" + String(__DATE__) + "\",";
+    /* ★ v1.1.46：build_id = **本次编译时刻**（tools/gen_build_id.py 生成）。
+     *
+     * 为什么需要它：网页 OTA 的成功判据原来只看 `app_version` 有没有变。
+     * 但 `__DATE__/__TIME__` 是**编译**时刻 —— 只改了别的文件时，
+     * web_server.cpp 不会被重新编译，build_time 就还是旧的。
+     * 于是「同版本号重新刷一次固件」这种最常见的操作，
+     * 页面上 `v !== verBefore` 永远不成立 → 干等 90 秒 → 看着像"没启动成功"。
+     *
+     * （ESP-IDF app descriptor 里的 time/date 也不行：Arduino 预编译的
+     *   IDF 库那两个字段是**库包**的编译时间，实测恒为 "Feb 12 2025"，
+     *   不随我们的链接变化。）
+     *
+     * build_id 由预脚本每次编译重新生成 → 头文件一变 → web_server.cpp
+     * 被重新编译 → 新 id 烧进固件 ⇒ 刷进去一定和上一版不同。 */
+    json += "\"build_id\":\"" + String(S3AMS_BUILD_ID) + "\",";
     json += "\"comm_mode\":2,";  // 485 直连（自动）
     json += "\"comm_mode_text\":\"RS-485 直连打印机（BambuBus）\",";
     /* 上报给打印机的 AMS 版本号（v1.1.13）。

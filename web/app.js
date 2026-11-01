@@ -52,6 +52,7 @@
        OTA 用它做"上传前 vs 重启后"的版本比对 —— 这是判断升级真假的唯一可靠判据
        （设备重启会掐断上传连接，浏览器拿不到那句 JSON 是常态）。 */
     var lastVer = '';
+    var lastBuildId = '';   /* ★ v1.1.46：链接时刻，OTA 判真假成败用 */
 
     function store(key, val) {
         try {
@@ -298,6 +299,7 @@
     function applyStatus(d) {
         d = d || {};
         if (d.app_version) lastVer = d.app_version;   /* OTA 版本比对用 */
+        if (d.build_id) lastBuildId = d.build_id;     /* ★ v1.1.46：链接时刻，唯一可靠 */
         var wifiOn = !!d.wifi_isconnected;
         var mqttOn = !!d.is_mqtt_con;
         apOn = !!d.ap_on;
@@ -2426,6 +2428,7 @@
         /* 上传前记下当前版本号：上传完成后靠"版本号有没有变"判断真假成败
            （设备重启会掐断连接，浏览器拿不到那句 JSON 是常态，见 otaWaitReboot 注释） */
         var verBefore = lastVer || '';
+        var bidBefore = lastBuildId || '';   /* ★ v1.1.46：链接时刻 */
         var uploadDone = false;   /* 浏览器已把 100% 数据发完 */
         /* ★ 上传一开始就暂停日志轮询：OTA 要几十秒，期间每 2 秒一次
            的 pollLog 会和上传抢这台单客户端的 Web 服务器，弱信号下
@@ -2464,12 +2467,12 @@
                 bar.style.width = '100%';
                 $('ota_box').innerHTML = '<div class="tip ok">' + esc(d.info) + '</div>';
                 toast('升级成功，设备即将重启', 'ok');
-                otaWaitReboot(verBefore, bar);
+                otaWaitReboot(verBefore, bar, bidBefore);
             } else if (uploadDone) {
                 /* 数据已 100% 发完但没拿到合法 JSON：设备多半已经 Update.end()
                    成功并立刻重启，弱信号下那句 JSON 丢了。
                    别急着报失败 —— 用版本号说话。 */
-                otaWaitReboot(verBefore, bar);
+                otaWaitReboot(verBefore, bar, bidBefore);
             } else {
                 /* 失败：恢复日志轮询，让「设备日志」面板把固件记录的
                    OTA 失败原因（OTA end 失败/写入失败…）显示出来 */
@@ -2483,7 +2486,7 @@
             if (uploadDone) {
                 /* 同 onload：固件已经收完最后一块，设备正在重启把连接掐了。
                    这是 OTA 成功时最常见的一种"假失败"。 */
-                otaWaitReboot(verBefore, bar);
+                otaWaitReboot(verBefore, bar, bidBefore);
                 return;
             }
             logPaused = false;
@@ -2505,7 +2508,7 @@
          （刷新后版本号确实变了 —— 2026-10-25 现场实测）。
        正确判据是版本号：轮询 /status，版本和上传前不一样就是真成功。
        ======================================================================= */
-    function otaWaitReboot(verBefore, bar) {
+    function otaWaitReboot(verBefore, bar, bidBefore) {
         logPaused = true;
         if (bar) bar.style.width = '100%';
         var box = $('ota_box');
@@ -2517,7 +2520,9 @@
         function tick() {
             if (Date.now() > deadline) {
                 box.innerHTML = '<div class="tip err">等了 90 秒还没拿到设备状态。' +
-                    '请手动刷新页面看「固件版本」：<br>若已是新版本说明升级成功（只是回执丢了）；' +
+                    '请手动刷新页面看「固件版本」和 build 号：<br>' +
+                    '若 build 号已变（上传前 ' + esc(bidBefore || '?') + ' → 现在 ' +
+                    esc(lastBuildId || '?') + '）说明升级成功（只是回执丢了）；' +
                     '若还是 ' + esc(verBefore || '旧版本') + ' 则升级失败，重试一次。</div>';
                 toast('无法确认升级结果', 'bad');
                 logPaused = false;
@@ -2541,17 +2546,37 @@
                         return;
                     }
                     var v = (d && d.app_version) || '';
-                    if (v && verBefore && v !== verBefore) {
-                        /* ★ 版本号变了 = 升级成功（唯一可信判据） */
+                    var bid = (d && d.build_id) || '';
+                    /* ★ v1.1.46：成功判据改成"**链接时刻变了**"优先。
+                     *
+                     * 原来只看 `app_version` 变没变 → **同版本号重刷固件时
+                     * 永远不成立**（比如刷一个改了代码但忘了改版本号的包），
+                     * 页面就一直停在"正在等待设备重启并核对版本…"，看着像
+                     * "没启动成功"，其实固件早就写进去、早就跑起来了。
+                     *
+                     * build_id 来自 app descriptor 的链接时刻：只要重新链接
+                     * 就一定变，重刷同一个版本也能正确判成功。
+                     *
+                     * 判据优先级：build_id 变了 → 成功；
+                     *           build_id 没变但版本号变了 → 成功（老固件没有 build_id）；
+                     *           两者都没变 → 继续等。 */
+                    var changed = false;
+                    if (bid && bidBefore) {
+                        changed = (bid !== bidBefore);
+                    } else if (v && verBefore) {
+                        changed = (v !== verBefore);
+                    }
+                    if (changed) {
                         box.innerHTML = '<div class="tip ok">升级成功：' +
-                            esc(verBefore) + ' → <b>' + esc(v) + '</b>' +
+                            esc(verBefore || '旧版本') + ' → <b>' + esc(v) + '</b>' +
+                            (bid ? '（build ' + esc(bid) + '）' : '') +
                             '<br>设备已重启，可直接使用。</div>';
                         toast('升级成功：' + v, 'ok');
                         logPaused = false;
                         setTimeout(function () { location.reload(); }, 1500);
                         return;
                     }
-                    if (v && !verBefore) {
+                    if (v && !verBefore && !bidBefore) {
                         /* 上传前没抓到版本号（首次加载失败），只能报当前版本 */
                         box.innerHTML = '<div class="tip ok">设备已重启，当前版本 <b>' +
                             esc(v) + '</b>。若这就是刚上传的版本即升级成功。</div>';

@@ -671,13 +671,33 @@ static uint32_t s_485_last_byte_ms = 0;
  *
  * 顺带：原来 `_index >= 999` 那个保护跟"UART 溢出"毫无关系，
  * 所以现场一直看到 `overflow=0` —— 又一个诊断盲区。
+ *
+ * ★★★★ v1.1.45 初版踩的坑（"AMS 不显示"的真凶，必须记住）：
+ *
+ *   初版在帧头把 `s_rx_expect` 初始化成了 **0**，于是收帧判定
+ *   `s_rx_index >= s_rx_expect` 在**第 1 个字节**就成立 →
+ *   帧以 `len = 0` 判定完成 → `rx_queue_push(buf, 0)` 计入 rx_dropped
+ *   → 一帧都没进队列 → 一条查询都没应答 → 打印机里 AMS 根本不显示。
+ *
+ *   **"期望长度"在读到长度字段之前必须是"大值"**：
+ *     旧代码 = 6（`length = data_CRC8_index = 6`）
+ *     BMCU-U = 999（`expected_length_ = 999u`）
+ *   现在照 BMCU-U 用 999。
+ *
+ *   同理，长包的长度下标必须用 **5**（不是 4）：uint16 长度跨 buf[4..5]，
+ *   在 index 4 就写进"期望长度"会让半截长度触发收帧判定。
+ *   BMCU-U 的 `data_length_index_ = 5u` 就是这个道理。
+ *
+ *   教训：**"新旧算法结果等价"这种判断，必须把"期望长度初值"和
+ *   "长度字段下标"一起算进去** —— 只比对最终算出的长度是不够的。
  * ========================================================================== */
 #define RX_FRAME_TIMEOUT_MS 20    /* 一帧最多允许收 20ms（最长帧 ~2ms） */
+#define RX_EXPECT_PENDING   999  /* 长度未读到时的"期望长度"（BMCU-U 同款） */
 
 static int      s_rx_index   = 0;    /* 当前帧已收字节数，0 = 等帧头 */
-static uint16_t s_rx_expect  = 0;    /* 本帧总长度 */
-static uint8_t  s_rx_len_idx = 4;    /* 长度字段所在下标 */
-static uint8_t  s_rx_crc_idx = 6;    /* 头 CRC8 所在下标 */
+static uint16_t s_rx_expect  = RX_EXPECT_PENDING; /* 本帧总长度（未读到时=999） */
+static uint8_t  s_rx_len_idx = 2;    /* 长度字段所在下标（短包 2 / 长包 5） */
+static uint8_t  s_rx_crc_idx = 3;    /* 头 CRC8 所在下标（短包 3 / 长包 6） */
 static uint32_t s_rx_t0      = 0;    /* 帧头到达时刻（半帧超时用） */
 
 static void RX_IRQ(unsigned char data)
@@ -697,9 +717,26 @@ static void RX_IRQ(unsigned char data)
         BambuBus_data_buf[0] = 0x3D;
         _RX_IRQ_crcx.restart();
         _RX_IRQ_crcx.add(0x3D);
-        s_rx_len_idx = 4;
-        s_rx_crc_idx = 6;
-        s_rx_expect  = 0;
+        s_rx_len_idx = 2;
+        s_rx_crc_idx = 3;
+        /* ★★★ 关键：长度没读到之前，期望长度必须是"大值"，不能是 0 !!!
+         *
+         * v1.1.45 初版在这里写的是 `s_rx_expect = 0`，于是收帧判定
+         *   `s_rx_index >= s_rx_expect`
+         * 在**第 1 个字节**就成立（1 >= 0）→ 帧以 `len = 0` 判定完成 →
+         *   rx_queue_push(buf, 0) → len==0 → 计入 rx_dropped，帧被丢掉；
+         *   bus485raw_record(buf, 0) → len==0 直接 return，什么都录不到；
+         *   get_packge_type() 永远收不到完整帧 → 一条查询都不应答
+         *   → 打印机里 AMS 根本不显示。
+         *
+         * 现象全部对得上：rx_dropped 与 rx_frames **严格 1:1**、
+         * rx_bytes 在涨、crc_err/bad_len 全 0（长度校验那几行根本没执行到）、
+         * /bus485raw 永远 RX_TOTAL=0。
+         *
+         * 旧代码在这里是 `length = data_CRC8_index = 6`（最小 6 字节），
+         * BMCU-U 是 `expected_length_ = 999` —— 两者都是"大值"，
+         * 保证帧头阶段不会被误判成收帧完成。这里照 BMCU-U 用 999。 */
+        s_rx_expect  = RX_EXPECT_PENDING;
         s_rx_t0      = now;
         s_rx_index   = 1;
         return;
@@ -715,36 +752,38 @@ static void RX_IRQ(unsigned char data)
 
     BambuBus_data_buf[s_rx_index] = data;
 
-    /* 第 2 个字节决定是短包（buf[1] 带 0x80）还是长包 */
+    /* 第 2 个字节决定是短包（buf[1] 带 0x80）还是长包
+     *
+     * ★ v1.1.45 修正：长包的**长度下标改成 5**（不是 4）。
+     *   长包长度是 uint16 小端，跨 buf[4..5]：
+     *     - 若在 index 4 就把低字节写进 s_rx_expect，那么 index 4 之后
+     *       `s_rx_index >= s_rx_expect` 可能被"半截长度"误触发；
+     *     - BMCU-U 的做法就是 `data_length_index_ = 5`，到 index 5 才
+     *       一次性算出 `header_[4] | (value << 8)`（短包才是 index 2）。
+     *   这样"期望长度"要么还是 999（没读到），要么已经是完整长度。 */
     if (s_rx_index == 1)
     {
-        if (data & 0x80) { s_rx_len_idx = 2; s_rx_crc_idx = 3; }
-        else             { s_rx_len_idx = 4; s_rx_crc_idx = 6; }
+        if (data & 0x80) { s_rx_len_idx = 2; s_rx_crc_idx = 3; }   /* 短包 */
+        else             { s_rx_len_idx = 5; s_rx_crc_idx = 6; }   /* 长包 */
     }
 
     if (s_rx_index < s_rx_crc_idx) _RX_IRQ_crcx.add(data);
 
-    /* ① 长度字段：短包单字节，长包 16 位小端 */
+    /* ① 长度字段：短包单字节(buf[2])，长包 16 位小端(buf[4..5]，index 5 才齐) */
     if (s_rx_index == s_rx_len_idx)
     {
-        s_rx_expect = data;
-    }
-    else if (s_rx_len_idx == 4 && s_rx_index == 5)
-    {
-        s_rx_expect = (uint16_t)(s_rx_expect | ((uint16_t)data << 8));
-    }
+        if (s_rx_len_idx == 2) {
+            s_rx_expect = data;
+        } else {
+            s_rx_expect = (uint16_t)(BambuBus_data_buf[4] | ((uint16_t)data << 8));
+        }
 
-    /* ② 长度一到齐就检查合法性，不等收完 */
-    {
-        const uint8_t full_idx = (s_rx_len_idx == 4) ? 5 : 2;
-        if (s_rx_index == full_idx)
+        /* ② 长度一到齐就检查合法性，不等收完 */
+        if (s_rx_expect <= s_rx_crc_idx || s_rx_expect > RX_FRAME_MAX)
         {
-            if (s_rx_expect <= s_rx_crc_idx || s_rx_expect > RX_FRAME_MAX)
-            {
-                s_485_bad_len++;
-                s_rx_index = 0;   /* 立刻复位，重新找 0x3D */
-                return;
-            }
+            s_485_bad_len++;
+            s_rx_index = 0;   /* 立刻复位，重新找 0x3D */
+            return;
         }
     }
 
@@ -810,8 +849,32 @@ void BambuBUS_UART_Init(uint32_t baudrate)
         log_i("485 RX 缓冲 = 8192（兼容位 bit5 打开，BMCU-U 假设对照）");
     } else {
         RS485.setRxBufferSize(256);
-        log_i("485 RX 缓冲 = 256（v1.1.45 默认 = v1.1.29 证明可用）");
+        log_i("485 RX 缓冲 = 256（v1.1.46 默认 = v1.1.29 证明可用）");
     }
+
+    /* ★ v1.1.46：兼容开关非 0 时**大声警告**。
+     *
+     * 这个坑踩过：调试时把兼容位设成 0x70（bit4+bit5+bit6）做 A/B，
+     * 之后**它一直留在 NVS 里**（`s3ams-compat` 命名空间的 flags3 键），
+     * 跨固件升级都带着 —— 于是
+     *   bit4 → 静默门控生效（等总线安静 4ms 才回包）
+     *   bit5 → RX 缓冲被改成 8192（覆盖掉固件里的默认值）
+     *   bit6 → NVS 后台写
+     * 全都还在跑，而固件里的"默认值"完全不起作用，
+     * 现场表现就是"改了代码没效果"+"AMS 不显示"，极难查。
+     *
+     * 现在每次开机只要发现 compat != 0 就打一条醒目的警告，
+     * 提醒先去网页「485 兼容位」恢复默认（0x00）。 */
+    if (bambubus_compat_get() != COMPAT_DEFAULT)
+    {
+        log_w("★ 485 兼容开关非默认 (0x%02X)：批量收帧=%d 大RX缓冲=%d 异步存NVS=%d "
+              "★ 固件默认值已被覆盖！如行为异常请到网页恢复默认(0x00)",
+              (unsigned)bambubus_compat_get(),
+              (bambubus_compat_get() & COMPAT_RX_BATCH) ? 1 : 0,
+              (bambubus_compat_get() & COMPAT_RX_BIGBUF) ? 1 : 0,
+              (bambubus_compat_get() & COMPAT_NVS_ASYNC) ? 1 : 0);
+    }
+
     RS485.begin(baudrate, SERIAL_8E1, BambuBus_pin_rx, BambuBus_pin_tx);
     pinMode(BambuBus_pin_de, OUTPUT);
     digitalWrite(BambuBus_pin_de, 0);  // 默认接收
@@ -1271,8 +1334,7 @@ void bambubus_compat_set(uint8_t v)
           (s_compat & COMPAT_411) ? 1 : 0,
           (s_compat & COMPAT_23C) ? 1 : 0,
           (s_compat & COMPAT_237) ? 1 : 0,
-          (s_compat & COMPAT_RX_BATCH) ? 1 : 0,
-          (s_compat & COMPAT_RX_BIGBUF) ? 1 : 0,
+          (s_compat & COMPAT_RX_BATCH) ? 1 : 0,          (s_compat & COMPAT_RX_BIGBUF) ? 1 : 0,
           (s_compat & COMPAT_NVS_ASYNC) ? 1 : 0);
 }
 
@@ -2178,6 +2240,10 @@ void bambubus_485_stats_reset(void)
     s_485_bad_len = 0;         /* ★ v1.1.45 */
     s_485_rx_peak = 0;
     s_rx_index = 0;            /* 解析器一起复位，避免残留半帧 */
+    s_rx_expect = RX_EXPECT_PENDING;  /* ★ v1.1.45：必须是大值，不能是 0 */
+    s_rx_len_idx = 2;
+    s_rx_crc_idx = 3;
+    s_rx_t0 = 0;
 }
 
 /* ★ v1.1.31：队列丢帧计数（正常恒 0） */
