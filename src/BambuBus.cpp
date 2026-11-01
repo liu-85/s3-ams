@@ -480,7 +480,12 @@ CRC8 _RX_IRQ_crcx(0x39, 0x66, 0x00, false, false);
  * 修法：收帧只入队（环形 8 帧），`BambuBus_run()` 里把队列排空再返回。
  * 帧长由 `length` 字段决定，是 uint8_t，最大 255，所以每槽 256 字节够用。
  */
-#define RX_QUEUE_DEPTH 8
+/* ★ v1.1.33：8 → 32。
+ * 打印任务开始时打印机是**成批连发**的（2 台 × 4 槽的下发 + 逐个查询），
+ * 一次突发十几到二十帧。8 帧队列在"每处理一帧要阻塞发一包（~0.5ms）"
+ * 的情况下很容易填满 → 丢帧 → 那几帧的查询没应答。
+ * 32 帧 = 8KB RAM，对 320KB 的 S3 完全够用。 */
+#define RX_QUEUE_DEPTH 32
 #define RX_FRAME_MAX   256
 static uint8_t  s_rx_q[RX_QUEUE_DEPTH][RX_FRAME_MAX];
 static uint16_t s_rx_q_len[RX_QUEUE_DEPTH];
@@ -951,14 +956,60 @@ static inline uint16_t swap_bytes(uint16_t val) {
     return (val >> 8) | (val << 8);
 }
 
-void set_cxx_buf(unsigned char *set_buf, unsigned char *buf, int length)
+/* ★ v1.1.33：按「台号 × 包类型」统计打印机问了我们多少次
+ *
+ * 为什么加：删掉 AMS-C/D 只留 A/B 之后，发打印任务**经常**报
+ * `[0500-40A3] AMS A 通信异常`。已经猜错过三次（v1.1.21 / 22 / 31），
+ * 这次先让数据说话 —— 关键就一个问题：
+ *
+ *   **打印机到底会不会来问台 2 / 台 3？**
+ *
+ *   · q[2] / q[3] 恒为 0 → 它只认 A/B，40A3 另有原因（继续查别处）
+ *   · q[2] / q[3] 不为 0 → 打印机侧还残留"4 台 AMS"的配置，
+ *     我们按 AMS_COUNT=2 静默不回，它就一直记成通信异常
+ *
+ * qdrop 记「问了但没应答」的次数 —— 这个数**只要涨就一定会报 40A3**。
+ * 类型下标见 QK_*，`/status` 的 `ams.q` / `ams.qdrop` 直接可读。 */
+#define QK_402 0   /* 0x402 序列号 */
+#define QK_103 1   /* 0x103 版本   */
+#define QK_06  2   /* 0x06  握手   */
+#define QK_21A 3   /* 0x21A 耗材信息 */
+#define QK_211 4   /* 0x211 MC 在线  */
+#define QK_CXX 5   /* Cxx  送料状态查询 */
+#define QK_DXX 6   /* Dxx  送料动作命令 */
+#define QK_05  7   /* 0x05  注册（打印机问"你是不是第 N 台"） */
+#define QK_NUM 8
+#define QK_UNITS 4
+
+static uint16_t s_q[QK_UNITS][QK_NUM];
+static uint16_t s_q_drop[QK_NUM];
+
+static inline void q_count(unsigned unit, int kind)
+{
+    if (unit < QK_UNITS) s_q[unit][kind]++;
+}
+static inline void q_drop(int kind) { s_q_drop[kind]++; }
+
+void bambubus_query_stats(uint16_t out_unit[QK_UNITS][QK_NUM], uint16_t out_drop[QK_NUM])
+{
+    memcpy(out_unit, s_q, sizeof(s_q));
+    memcpy(out_drop, s_q_drop, sizeof(s_q_drop));
+}
+
+void bambubus_query_stats_reset(void)
+{
+    memset(s_q, 0, sizeof(s_q));
+    memset(s_q_drop, 0, sizeof(s_q_drop));
+}
+
+bool set_cxx_buf(unsigned char *set_buf, unsigned char *buf, int length)
 {
     unsigned char AMS_num = buf[5];
     unsigned char read_num = buf[7];
     now_op_num = read_num;
     float meters = -1;
 
-    if (AMS_num >= AMS_COUNT) return;
+    if (AMS_num >= AMS_COUNT) return false;
 
     meters = data_save.filament[AMS_num][read_num].meters;
 
@@ -974,12 +1025,27 @@ void set_cxx_buf(unsigned char *set_buf, unsigned char *buf, int length)
     memcpy(set_buf + 8, &pressure, sizeof(pressure));
 
     set_buf[24] = get_filament_left_char(AMS_num);
+    return true;
 }
 
 void send_for_Cxx(unsigned char *buf, int length)
 {
+    q_count(buf[5], QK_CXX);
+
     Cxx_res[1] = 0xC0 | (package_num << 3);
-    set_cxx_buf(Cxx_res + 5, buf, length);
+
+    /* ★ v1.1.33：越界台号**不能回包**。
+     *
+     * 原来 set_cxx_buf() 里遇到 AMS_num >= AMS_COUNT 直接 return（什么都没改），
+     * 但这里**照样**把 Cxx_res 发了出去 —— 发的是**上一台**的
+     * flagx / read_num / meters / pressure，等于用 AMS-A 的数据冒充 AMS-C。
+     * v1.1.20 时 AMS_COUNT=4 永远走不到这条分支，改成 2 台后才暴露。
+     * 对打印机来说"问了 C，回来的数据却是 A 的"，比不回更糟。 */
+    if (!set_cxx_buf(Cxx_res + 5, buf, length)) {
+        q_drop(QK_CXX);
+        return;
+    }
+
     package_send_with_crc(Cxx_res, sizeof(Cxx_res));
     if (package_num < 7)
         package_num++;
@@ -1012,7 +1078,12 @@ void send_for_Dxx(unsigned char *buf, int length)
     float meters = -1;
     uint8_t flagx = 0x02;
 
-    if (AMS_num >= AMS_COUNT) return;
+    q_count(AMS_num, QK_DXX);
+
+    /* ★ v1.1.33：这里必须保持"越界不回"—— Dxx 会跑送料状态机
+     * （process_motion_state_machine），台 2/3 会把 filament_ext[2][x]
+     * 当成通道 8~11 去驱动，本板只有 8 路，绝不能碰。 */
+    if (AMS_num >= AMS_COUNT) { q_drop(QK_DXX); return; }
 
     for (auto i = 0; i < 4; i++)
     {
@@ -1200,7 +1271,16 @@ static inline void bus_wait_idle_5ms(void)
 
 void send_for_Fxx(unsigned char *buf, int length)
 {
-    if (buf[5] == 0x00)
+    /* ★ v1.1.33：这三条分支必须按 buf[4]（子命令）分开判。
+     *
+     * 原来第一条是 `if (buf[5] == 0x00)`，**没看子命令** ——
+     * 打印机发 0x06 握手、台号正好是 0 时（buf[4]=0x06, buf[5]=0x00），
+     * 会误进"广播注册"分支：回两包注册包，却**完全不应答这次握手**，
+     * 打印机超时 → `[0500-40A3]`。这是从 v1.1.16 就带进来的老问题，
+     * 只是因为 AMS_COUNT=4 时分支组合更多、被掩盖了。 */
+    const uint8_t sub = buf[4];   /* 0x05 = 注册查询，0x06 = 握手 */
+
+    if (sub == 0x05 && buf[5] == 0x00)
     {
         for (int i = 0; i < AMS_COUNT; i++)
         {
@@ -1219,12 +1299,18 @@ void send_for_Fxx(unsigned char *buf, int length)
             bus_wait_idle_5ms();
         }
     }
-    else if (buf[5] == 0x01 && buf[6] < AMS_COUNT)
+    else if (sub == 0x05 && buf[5] == 0x01)
     {
+        /* ★ v1.1.33：越界台号统计后不应答（打印机问"你是不是第 2/3 台"，
+         * 我们不是，保持静默才是正确行为 —— 应答反而会造出幽灵 AMS）。 */
+        q_count(buf[6], QK_05);
+        if (buf[6] >= AMS_COUNT) { q_drop(QK_05); return; }
+
         uint8_t ams_num = buf[6];
         if (data_save.filament[ams_num][0].statu != online)
         {
             have_registered[ams_num] = false;
+            q_drop(QK_05);
             return;
         }
 
@@ -1244,7 +1330,7 @@ void send_for_Fxx(unsigned char *buf, int length)
         else
             have_registered[ams_num] = false;
     }
-    else if (buf[4] == 0x06)
+    else if (sub == 0x06)
     {
         uint8_t req_num = buf[5];
 
@@ -1256,6 +1342,7 @@ void send_for_Fxx(unsigned char *buf, int length)
          * 重复 AMS 卡片的问题不在"回不回包"，而在这里无条件回、且
          * res_for_06_num 会把所有台号都改成同一个（见下方逻辑，暂未动）。 */
         uint8_t ams_num = req_num;
+        q_count(req_num, QK_06);
         if (res_for_06_num == 0xFF)
         {
             res_for_06_num = req_num;
@@ -1290,8 +1377,16 @@ void send_for_long_packge_MC_online(unsigned char *buf, int length)
     Bambubus_long_package_analysis(buf, length, &printer_data_long);
 
     uint8_t AMS_num = printer_data_long.datas[0];
-    if (AMS_num >= AMS_COUNT || data_save.filament[AMS_num][0].statu != online)
-        return;
+    q_count(AMS_num, QK_211);
+
+    /* ★ v1.1.33：0x211 也是**查询-应答**对，必须应答。
+     *
+     * v1.1.21 起这里是 `AMS_num >= AMS_COUNT || statu != online` 就 return，
+     * 于是台 2/3 问了没回 —— 和 v1.1.21 的 0x402 是同一个错误（那次报 40A3）。
+     * 现在只挡真正的数组越界（>= 4），台 2/3 照常回一份"MC 未在线"的空包。
+     * 注意：这不会让打印机多出 AMS-C/D 卡片 —— 卡片来自 0x05 注册包，
+     * 而注册循环写死了 `i < AMS_COUNT`，只注册 A/B。 */
+    if (AMS_num >= 4) { q_drop(QK_211); return; }
 
     data.datas = long_packge_MC_online;
     data.datas[0] = AMS_num;
@@ -1324,9 +1419,13 @@ void send_for_long_packge_filament(unsigned char *buf, int length)
     uint8_t AMS_num = printer_data_long.datas[0];
     uint8_t filament_num = printer_data_long.datas[1];
 
-    if (AMS_num >= AMS_COUNT || filament_num >= 4 ||
-        data_save.filament[AMS_num][filament_num].statu != online)
-        return;
+    q_count(AMS_num, QK_21A);
+
+    /* ★ v1.1.33：0x21A 同样是查询-应答对，必须应答（理由同 0x211）。
+     * 只挡真正的数组越界：AMS_num >= 4 或 filament_num >= 4。
+     * 台 2/3 的料位 statu 是 offline，回一份空耗材信息即可 ——
+     * 打印机若根本没注册 C/D，它会直接忽略这份应答。 */
+    if (AMS_num >= 4 || filament_num >= 4) { q_drop(QK_21A); return; }
 
     long_packge_filament[0] = AMS_num;
     long_packge_filament[1] = filament_num;
@@ -1405,6 +1504,8 @@ void send_for_long_packge_version(unsigned char *buf, int length)
         else if (printer_data_long.data_length > 0)
             AMS_num = printer_data_long.datas[0];
 
+        q_count(AMS_num, QK_402);
+
         /* ★ v1.1.22：越界台号必须 clamp 到 0 后**继续应答**，绝不能 return。
          *
          * v1.1.21 曾把这里改成 `if (AMS_num >= AMS_COUNT) return;`（照其他长包
@@ -1447,6 +1548,7 @@ void send_for_long_packge_version(unsigned char *buf, int length)
          * 打印机会同时校验「版本号是否在白名单」和「型号代号」，两者任一
          * 对不上都可能弹「当前固件仅支持 AMS / AMS 2 Pro / AMS HT」。 */
         static unsigned char ver_pkt[21];
+        q_count(AMS_num, QK_103);
         uint32_t v = s_ams_fw_ver;
         ver_pkt[0] = (unsigned char)(v & 0xFF);
         ver_pkt[1] = (unsigned char)((v >> 8) & 0xFF);

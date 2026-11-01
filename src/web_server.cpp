@@ -258,7 +258,7 @@ void web_log_install_hook(void)
 }
 
 /* App 版本 */
-static const char *APP_VERSION = "1.1.32-s3ams";
+static const char *APP_VERSION = "1.1.33-s3ams";
 
 /* 单 IO 双微动：每路一个 ADC 脚（开始位/停止位共用同一脚，电阻编码） */
 static const int BOARD_SENSOR_PINS[BOARD_CHANNEL_COUNT] = BOARD_PIN_SENSOR_ARRAY;
@@ -705,6 +705,37 @@ static void handle_status(void)
                 ",\"tx_06\":" + String((unsigned long)t06) +
                 ",\"last_rx_age_ms\":" + String(age) +
                 ",\"loop_max_gap_ms\":" + String((unsigned long)amcu_loop_max_gap_ms()) + "}";
+    }
+
+    /* ★ v1.1.33：打印机查询统计（按台号 × 包类型）
+     *
+     * 列顺序：402 / 103 / 06 / 21A / 211 / Cxx / Dxx / 05
+     * 行顺序：台 0(A) / 台 1(B) / 台 2(C) / 台 3(D)
+     *
+     * 判读（删掉 C/D 后经常报 40A3，靠这两组数定性）：
+     *   q[2] / q[3] 全 0   → 打印机只认 A/B，问题不在"它来问幽灵台"
+     *   q[2] / q[3] 有值   → 打印机侧还残留 4 台配置，需要在那里清掉
+     *   qdrop 任一非 0     → 我们有"问了没回"，这就是 40A3 的直接来源 */
+    {
+        uint16_t qu[4][8];
+        uint16_t qd[8];
+        bambubus_query_stats(qu, qd);
+        json += ",\"q\":[";
+        for (int i = 0; i < 4; i++) {
+            if (i) json += ",";
+            json += "[";
+            for (int k = 0; k < 8; k++) {
+                if (k) json += ",";
+                json += String((unsigned)qu[i][k]);
+            }
+            json += "]";
+        }
+        json += "],\"qdrop\":[";
+        for (int k = 0; k < 8; k++) {
+            if (k) json += ",";
+            json += String((unsigned)qd[k]);
+        }
+        json += "]";
     }
 
     /* ★ v1.1.31：耗材信息落盘统计
@@ -1364,8 +1395,9 @@ static void handle_diag_reset(void)
     clutch_reset_conflict_count();
     amcu_clutch_reset_diag();
     bambubus_485_stats_reset();   /* v1.1.25：485 计数也清零，便于改接线后对照 */
+    bambubus_query_stats_reset(); /* v1.1.33：按台号×包类型的查询计数 */
     amcu_loop_gap_reset();        /* v1.1.28：主循环最大间隔也重新统计 */
-    server.send(200, "application/json", "{\"ok\":true,\"info\":\"已清除离合冲突/仲裁计数、485 链路计数与主循环间隔\"}");
+    server.send(200, "application/json", "{\"ok\":true,\"info\":\"已清除离合冲突/仲裁计数、485 链路计数、查询统计与主循环间隔\"}");
 }
 
 /* 清零全部料位的计米。

@@ -104,6 +104,20 @@ extern void bambubus_485_stats_reset(void);
  * 正常应该恒为 0。持续增长说明打印机的突发比我们排空得快。 */
 extern uint32_t bambubus_rx_dropped(void);
 
+/* ★ v1.1.33：打印机「按台号 × 包类型」的查询次数 + 未应答次数。
+ *
+ * 目的：一次说清"打印机到底会不会来问台 2/3（AMS-C/D）"。
+ *   out_unit[台号][类型]，类型下标：
+ *     0=0x402 序列号  1=0x103 版本   2=0x06 握手   3=0x21A 耗材信息
+ *     4=0x211 MC在线  5=Cxx 送料查询 6=Dxx 送料命令 7=0x05 注册
+ *   out_drop[类型] = 问了但没应答的次数（**只要涨就一定会报 40A3**）
+ *
+ * 判读：
+ *   · out_unit[2]/[3] 全 0  → 打印机只认 A/B，40A3 另有原因
+ *   · out_unit[2]/[3] 有值  → 打印机侧还残留 4 台配置，需要在那里清掉 */
+extern void bambubus_query_stats(uint16_t out_unit[4][8], uint16_t out_drop[8]);
+extern void bambubus_query_stats_reset(void);
+
 /* ★ v1.1.31：耗材信息落盘统计（NVS 写已移到后台任务）
  *   saves    —— 真正写 flash 的次数
  *   skipped  —— 内容未变而跳过的次数
