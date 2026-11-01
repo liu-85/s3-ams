@@ -17,6 +17,7 @@
 #include <Preferences.h>
 #include "current_sense.h"
 #include "settings_storage.h"
+#include "rgb_led.h"     /* ★ v1.1.43：只为在初始化时让 RMT 接管 GPIO42（见 init_io_pins） */
 
 // ============================
 //  硬件参数定义
@@ -849,31 +850,27 @@ bool amcu_follow_feed_active(void) { return s_follow_ch != 0 && s_follow_on; }
 //  初始化 IO 引脚
 // ============================
 void init_io_pins() {
-    /* ★ v1.1.42：GPIO42 必须**显式脱离 JTAG** —— 这是 40A3 的真正病根。
+    /* ★ v1.1.43：GPIO42 的配置**不再放这里**，改由 rgb_led_init() 里的
+     * `neopixelWrite(42,...)` 交给 RMT 接管。
      *
-     * 硬件事实（见 esp32s3-485/main/board_pins_s3.h 的板级说明）：
-     *   本板 GPIO3 是 **strapping 脚（JTAG 源选择）**，而 GPIO3 又是电流采样的
-     *   ISEN（经 200Ω 到地）。上电瞬间没电流 → GPIO3≈0V → **ROM 判定
-     *   "外部 JTAG"** → **GPIO39 / 40 / 41 / 42 先按 JTAG 功能配置**。
+     * 为什么（v1.1.42 的教训）：本板 GPIO3 是 strapping 脚（JTAG 源选择），
+     * 而 GPIO3 又是电流采样 ISEN（经 200Ω 到地）。上电无电流 → GPIO3≈0V
+     * → ROM 判定「外部 JTAG」→ **GPIO39/40/41/42 先按 JTAG 功能配置**。
+     * GPIO39 是 485 的 DE、GPIO42 是状态灯，两者同属 JTAG 那一组。
      *
-     *   GPIO39 正是 485 的 DE（方向脚），GPIO42 是状态灯，两者**同属 JTAG 组**。
+     * v1.1.30 删灯效时把「配置 GPIO42」一起删了 → 42 一直挂在 JTAG 上 →
+     * 连累同组 GPIO39（485 DE）→ 发打印任务立刻 `[0500-40A3]` + 自动取消，
+     * 而 485 数据本身干净（crc_err/overflow/rx_dropped/qdrop 全 0）。
      *
-     * 踩的坑：v1.1.30 删灯效时，把「配置 GPIO42」这一步一起删掉了，
-     * 于是 GPIO42 从上电起就一直挂在 JTAG 上，同组的 GPIO39（485 DE）
-     * 也跟着不能稳定工作 —— 现象就是发打印任务立刻
-     * `[0500-40A3] AMS A 通信异常` + 自动取消，而 485 收发数据本身是干净的
-     * （crc_err=0 / overflow=0 / rx_dropped=0 / qdrop=0 全部为 0）。
+     * ★ 但 v1.1.42 证明了：**只把 GPIO42 设成普通 GPIO 输出（reset+output+level0）
+     *   不够，仍然报 40A3**。必须让 RMT 接管这个脚才行 ——
+     *   差别在于 `rmt_set_pin()` 会把 GPIO42 的 IO MUX 输出信号真正切到
+     *   `RMT_SIG_OUT`，而 `gpio_set_direction(OUTPUT)` 只是把 GPIO 输出使能打开，
+     *   引脚仍留在 JTAG 那一组的 MUX 配置里。
      *
-     * 验证：v1.1.41 把 v1.1.29 的整套 WS2812 灯效原样加回来（它内部
-     * `neopixelWrite(42,...)` 会把 GPIO42 重新路由到 RMT = 脱离 JTAG），
-     * 现场立刻恢复正常打印。
-     *
-     * 这里用最直接、副作用最小的写法：**只做 reset + 输出 + 拉低**，
-     * 不驱动 WS2812、不做任何闪烁（GPIO42 上那颗 TXD 指示灯保持常灭）。 */
-    gpio_reset_pin((gpio_num_t)BOARD_PIN_LED);
-    gpio_set_direction((gpio_num_t)BOARD_PIN_LED, GPIO_MODE_OUTPUT);
-    gpio_set_level((gpio_num_t)BOARD_PIN_LED, 0);
-
+     * 所以现在保持 v1.1.41（实测能打印）的做法：交给 rgb_led_init()。
+     * 区别只是**不再调用 led_state_update()**，所以运行时不刷 WS2812、
+     * GPIO42 上那颗 TXD 指示灯保持常灭。 */
     if (BOARD_485_ENABLED) {
         gpio_reset_pin((gpio_num_t)BOARD_PIN_485_DE);
         gpio_set_direction((gpio_num_t)BOARD_PIN_485_DE, GPIO_MODE_OUTPUT);
@@ -1085,6 +1082,16 @@ void check_buffer_status() {
 // ============================
 void AMCU_init() {
     init_io_pins();
+    /* ★ v1.1.43：让 RMT 接管 GPIO42 —— 这一步是 40A3 的关键，不能删。
+     *
+     * 内部就是一句 neopixelWrite(42,0,0,0)，作用是 rmt_set_pin() 把 GPIO42
+     * 的 IO MUX 输出真正切到 RMT_SIG_OUT，从而脱离上电时 ROM 给
+     * GPIO39~42 配的那组 JTAG 功能（GPIO39 就是 485 的 DE）。
+     *
+     * ⚠️ 不要改成 gpio_set_direction(42, OUTPUT) —— v1.1.42 试过，照样报 40A3。
+     * ⚠️ 本版**不再调用 led_state_update()**，所以运行时不刷 WS2812，
+     *    那颗 TXD 指示灯保持常灭（只在 init 时写一次全黑）。 */
+    rgb_led_init();
     sensor_init();
     motor_init();
     clutch_init();
