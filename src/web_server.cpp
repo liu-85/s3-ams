@@ -258,7 +258,7 @@ void web_log_install_hook(void)
 }
 
 /* App 版本 */
-static const char *APP_VERSION = "1.1.40-s3ams";
+static const char *APP_VERSION = "1.1.41-s3ams";
 
 /* 单 IO 双微动：每路一个 ADC 脚（开始位/停止位共用同一脚，电阻编码） */
 static const int BOARD_SENSOR_PINS[BOARD_CHANNEL_COUNT] = BOARD_PIN_SENSOR_ARRAY;
@@ -593,6 +593,14 @@ static bool json_struct_ok(const String &s)
         last_sig = c;
     }
     return depth == 0 && !in_str;
+}
+
+/* ★ v1.1.41：恢复（v1.1.30 删灯效时一起删掉了，AMCU 的 led_state_update() 要用）。 */
+uint32_t web_get_channel_color(int ch)
+{
+    if (ch < 0 || ch >= 16) return 0x22CC66;
+    const uint32_t c = s_color_list[ch];
+    return (c == 0) ? 0x22CC66 : c;
 }
 
 static void handle_status(void)
