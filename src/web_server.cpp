@@ -258,7 +258,7 @@ void web_log_install_hook(void)
 }
 
 /* App 版本 */
-static const char *APP_VERSION = "1.1.31-s3ams";
+static const char *APP_VERSION = "1.1.32-s3ams";
 
 /* 单 IO 双微动：每路一个 ADC 脚（开始位/停止位共用同一脚，电阻编码） */
 static const int BOARD_SENSOR_PINS[BOARD_CHANNEL_COUNT] = BOARD_PIN_SENSOR_ARRAY;
@@ -548,6 +548,53 @@ extern void amcu_loop_gap_reset(void);
 /* v1.1.30：v1.1.29 为 RGB 灯加的 web_get_channel_color() 已随灯效一起删除
  * （本板无可用状态灯：GPIO42 是 TXD 指示灯，板载 RGB 的 GPIO48 被 485 RX 占用）。 */
 
+/* ★ v1.1.32：/status 的 JSON 结构自检
+ *
+ * 为什么加这一段（v1.1.31 现场踩的坑）：
+ *   v1.1.31 在 ams 里加 nvs 统计时，字符串拼错成
+ *       ..."link":{...}  "nvs":{...},}      ← 少了前导逗号、多了尾逗号
+ *   结果整个 /status 返回的 JSON 非法，前端 JSON.parse 直接抛异常：
+ *     · 网页所有状态位变成 "-"（包括 OTA 页的"当前版本 / 当前运行分区"）
+ *     · OTA 上传完成后靠"版本号变了"判断成败 → 永远判不出来 →
+ *       卡在"设备正在重启中…（已等待 N 秒）"
+ *   而**设备本身完全正常**（WiFi、485、打印都好好的），现场看起来
+ *   极像"固件刷死了"，非常难定位。
+ *
+ * 这里只做两件最便宜的检查（O(n)，n≈4KB，只在 /status 请求时跑一次）：
+ *   ① 花括号/方括号配对，引号是否闭合（跳过字符串内的转义）
+ *   ② 逗号后面紧跟 } 或 ]（尾逗号，JSON 不允许）
+ * 不做完整解析 —— 目的只是把"结构性损坏"当场指出来，而不是代替解析器。 */
+static bool json_struct_ok(const String &s)
+{
+    int  depth   = 0;
+    bool in_str  = false;
+    bool esc     = false;
+    char last_sig = 0;   /* 最近一个非空白、且不在字符串内的有效字符 */
+
+    for (size_t i = 0; i < s.length(); i++) {
+        const char c = s[i];
+
+        if (in_str) {
+            if (esc)                 esc = false;
+            else if (c == '\\')      esc = true;
+            else if (c == '"')     { in_str = false; last_sig = c; }
+            continue;
+        }
+
+        if (c == '"') { in_str = true; last_sig = c; continue; }
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
+
+        if (c == '}' || c == ']') {
+            if (last_sig == ',') return false;      /* 尾逗号 */
+            if (--depth < 0)     return false;      /* 多出来的右括号 */
+        } else if (c == '{' || c == '[') {
+            depth++;
+        }
+        last_sig = c;
+    }
+    return depth == 0 && !in_str;
+}
+
 static void handle_status(void)
 {
     int cur = get_now_filament_num();
@@ -671,11 +718,15 @@ static void handle_status(void)
         uint32_t ns = 0, nk = 0, nmax = 0, ntot = 0;
         bool npend = false;
         bambubus_nvs_stats(&ns, &nk, &nmax, &ntot, &npend);
-        json += "\"nvs\":{\"saves\":" + String((unsigned long)ns) +
+        /* ★ v1.1.32 修：这里原来少了前导逗号、多了尾逗号，
+         * 生成的 JSON 是 `...}"nvs":{...},}` —— 语法非法，
+         * 前端 JSON.parse 直接抛异常 → 整页状态全变 "-"、
+         * OTA 页也永远判不出"设备已重启"。*/
+        json += ",\"nvs\":{\"saves\":" + String((unsigned long)ns) +
                 ",\"skipped\":" + String((unsigned long)nk) +
                 ",\"max_ms\":" + String((unsigned long)nmax) +
                 ",\"total_ms\":" + String((unsigned long)ntot) +
-                ",\"pending\":" + String(npend ? 1 : 0) + "},";
+                ",\"pending\":" + String(npend ? 1 : 0) + "}";
     }
     json += "},";
 
@@ -872,6 +923,20 @@ static void handle_status(void)
     json += "}";
 
     json += "}";
+
+    /* ★ v1.1.32：结构自检（见 json_struct_ok 注释）。
+     * 坏掉时**照样发**（总比什么都不回强），但日志里明确指出，
+     * 这样"整页显示 - "就能一眼定位到是后端拼串出错，不用再怀疑固件刷死。 */
+    if (!json_struct_ok(json)) {
+        static uint32_t s_json_bad_last = 0;
+        if (millis() - s_json_bad_last > 5000) {
+            s_json_bad_last = millis();
+            log_e("/status 的 JSON 结构非法（括号/引号不配对或有尾逗号），"
+                  "前端会显示全 \"-\"；长度 %u 字节",
+                  (unsigned)json.length());
+        }
+    }
+
     server.send(200, "application/json; charset=utf-8", json);
 }
 

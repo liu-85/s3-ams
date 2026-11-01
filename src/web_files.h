@@ -1522,7 +1522,7 @@ static const char *WEB_STYLE_CSS =
 "}\n"
 "";
 
-// 来源: web/app.js  (103835 字节)
+// 来源: web/app.js  (104527 字节)
 static const char *WEB_APP_JS =
   "/* ===========================================================================\n"
 "   ESP-AMS-S3 配置界面前端\n"
@@ -3998,8 +3998,22 @@ static const char *WEB_APP_JS =
 "                return;\n"
 "            }\n"
 "            fetch('/status?_=' + Date.now(), { cache: 'no-store' })\n"
-"                .then(function (r) { if (!r.ok) throw new Error('x'); return r.json(); })\n"
-"                .then(function (d) {\n"
+"                .then(function (r) { if (!r.ok) throw new Error('x'); return r.text(); })\n"
+"                .then(function (txt) {\n"
+"                    /* ★ v1.1.32：拿到 200 响应但解析失败 ≠ 设备在重启。\n"
+"                       v1.1.31 现场：后端拼 JSON 多了个逗号，这里 JSON.parse\n"
+"                       抛异常 → 被当成\"正在重启\"，干等 90 秒，而设备其实好\n"
+"                       好的。现在把这两种情况分开报。 */\n"
+"                    var d;\n"
+"                    try { d = JSON.parse(txt); }\n"
+"                    catch (e) {\n"
+"                        box.innerHTML = '<div class=\"tip err\">设备<b>在线</b>，但 ' +\n"
+"                            '/status 返回的不是合法 JSON（固件状态接口异常）。<br>' +\n"
+"                            '升级通常已经完成：请手动刷新页面，看顶部「固件版本」确认。</div>';\n"
+"                        toast('设备在线，但状态接口异常', 'bad');\n"
+"                        logPaused = false;\n"
+"                        return;\n"
+"                    }\n"
 "                    var v = (d && d.app_version) || '';\n"
 "                    if (v && verBefore && v !== verBefore) {\n"
 "                        /* ★ 版本号变了 = 升级成功（唯一可信判据） */\n"

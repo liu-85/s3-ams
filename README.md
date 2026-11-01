@@ -3,7 +3,7 @@
 单电机 + 8 路电磁离合方案，通过 RS-485 以 **BambuBus 协议**直连拓竹（Bambu Lab）打印机。
 板载 Web 界面负责配置、诊断和 OTA 升级，不需要拆机、不需要串口。
 
-> 当前版本：**v1.1.31**（`1.1.31-s3ams`）—— 修 40A3 真凶之二：连续帧互相覆盖 + NVS 写阻塞 485
+> 当前版本：**v1.1.32**（`1.1.32-s3ams`）—— 修 `/status` 的 JSON 语法错（网页全显示 "-"、OTA 卡在"正在重启"）
 > 最新验证：**2026-10-25，A1 通道进料全流程通过**（详见 [docs/TEST-2026-10-25-A1-FEED.md](docs/TEST-2026-10-25-A1-FEED.md)）
 
 ---
@@ -176,6 +176,7 @@ s3-ams/
 | `tools/motor_test.bat` | 电机三档判定（转 / PWM 没推动 / 软件没驱动） |
 | `tools/log_monitor.py` | 只盯 `/log` + `/status`，轻量版 |
 | `tools/ana485*.py` | 针对旧格式抓包的分析脚本（历史遗留，逐步被 `ana_log.py` 取代） |
+| `tools/check_status_json.py` | **离线校验 `/status` 的 JSON 拼串**（`[FAIL]` 才是真错）。改了 `handle_status()` 之后跑一次，比刷机快 |
 | `flash_s3.py` | 串口刷写 |
 
 用法与排错见 [docs/TOOLS.md](docs/TOOLS.md)。

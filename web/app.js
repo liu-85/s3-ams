@@ -2472,8 +2472,22 @@
                 return;
             }
             fetch('/status?_=' + Date.now(), { cache: 'no-store' })
-                .then(function (r) { if (!r.ok) throw new Error('x'); return r.json(); })
-                .then(function (d) {
+                .then(function (r) { if (!r.ok) throw new Error('x'); return r.text(); })
+                .then(function (txt) {
+                    /* ★ v1.1.32：拿到 200 响应但解析失败 ≠ 设备在重启。
+                       v1.1.31 现场：后端拼 JSON 多了个逗号，这里 JSON.parse
+                       抛异常 → 被当成"正在重启"，干等 90 秒，而设备其实好
+                       好的。现在把这两种情况分开报。 */
+                    var d;
+                    try { d = JSON.parse(txt); }
+                    catch (e) {
+                        box.innerHTML = '<div class="tip err">设备<b>在线</b>，但 ' +
+                            '/status 返回的不是合法 JSON（固件状态接口异常）。<br>' +
+                            '升级通常已经完成：请手动刷新页面，看顶部「固件版本」确认。</div>';
+                        toast('设备在线，但状态接口异常', 'bad');
+                        logPaused = false;
+                        return;
+                    }
                     var v = (d && d.app_version) || '';
                     if (v && verBefore && v !== verBefore) {
                         /* ★ 版本号变了 = 升级成功（唯一可信判据） */
