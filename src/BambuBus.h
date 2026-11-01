@@ -48,6 +48,10 @@ enum package_type
     BambuBus_package_ETC,
     BambuBus_package_ERROR,
     BambuBus_package_set_filament_type2,  // 新增：0x05 0x218 长包设置耗材
+    /* ★ v1.1.35：打印机一直在发、我们一直没回的三种长包 */
+    BambuBus_long_package_ext_411,        // 0x411 payload 4B，[0]=台号
+    BambuBus_long_package_ext_23C,        // 0x23C payload 4B
+    BambuBus_long_package_ext_237,        // 0x237 payload 3B
     __BambuBus_package_packge_type_size
 };
 
@@ -110,13 +114,25 @@ extern uint32_t bambubus_rx_dropped(void);
  *   out_unit[台号][类型]，类型下标：
  *     0=0x402 序列号  1=0x103 版本   2=0x06 握手   3=0x21A 耗材信息
  *     4=0x211 MC在线  5=Cxx 送料查询 6=Dxx 送料命令 7=0x05 注册
+ *     8=0x05 注册(0x80|台号)  9=0x411  10=0x23C  11=0x237
  *   out_drop[类型] = 问了但没应答的次数（**只要涨就一定会报 40A3**）
  *
  * 判读：
  *   · out_unit[2]/[3] 全 0  → 打印机只认 A/B，40A3 另有原因
  *   · out_unit[2]/[3] 有值  → 打印机侧还残留 4 台配置，需要在那里清掉 */
-extern void bambubus_query_stats(uint16_t out_unit[4][8], uint16_t out_drop[8]);
+#define BAMBUBUS_QK_NUM 12
+extern void bambubus_query_stats(uint16_t out_unit[4][BAMBUBUS_QK_NUM],
+                                 uint16_t out_drop[BAMBUBUS_QK_NUM]);
 extern void bambubus_query_stats_reset(void);
+
+/* ★ v1.1.35：兼容开关（NVS 持久化，HTTP /compat_set 可改，默认全开）
+ *   bit0 = 应答 0x05 里 `0x80|台号` 那一组注册查询
+ *   bit1 = 应答 0x411 长包
+ *   bit2 = 应答 0x23C 长包
+ *   bit3 = 应答 0x237 长包
+ * 关掉某一位就退回 v1.1.34 的"静默"行为，用于 A/B 对照。 */
+extern uint8_t bambubus_compat_get(void);
+extern void bambubus_compat_set(uint8_t v);
 
 /* ★ v1.1.34：按当前 AMS_COUNT 重写 16 个料位的 online/offline。
  * WEB 改「AMS 台数」后调用，立即生效（不需要重启）。 */

@@ -925,11 +925,17 @@ package_type get_packge_type(unsigned char *buf, int length)
             return BambuBus_long_package_version;
         case 0x402:
             return BambuBus_long_package_version;
+        /* ★ v1.1.35：以前落到 default 只记日志、不应答的三类，现在真回包 */
+        case 0x411:
+            return BambuBus_long_package_ext_411;
+        case 0x23C:
+            return BambuBus_long_package_ext_23C;
+        case 0x237:
+            return BambuBus_long_package_ext_237;
         default:
-            /* ★ v1.1.34：未实现的长包类型，记下来。
+            /* 未实现的长包类型，记下来（3 秒限流）。
              * 2026-11-01 实测打印机在空闲时反复发 0x411 / 0x23C / 0x237，
-             * 我们一律不应答 —— 如果它们是"查询"，这就是 40A3 的来源。
-             * 先只记日志（3 秒限流），确认后再决定要不要回。 */
+             * 现在这三种已单独处理，能落到这里的都是**新**类型。 */
             {
                 static uint32_t s_unk_last_ms = 0;
                 if (millis() - s_unk_last_ms > 3000) {
@@ -1006,8 +1012,61 @@ static inline uint16_t swap_bytes(uint16_t val) {
 #define QK_CXX 5   /* Cxx  送料状态查询 */
 #define QK_DXX 6   /* Dxx  送料动作命令 */
 #define QK_05  7   /* 0x05  注册（打印机问"你是不是第 N 台"） */
-#define QK_NUM 8
+#define QK_05HI 8  /* 0x05  注册，但台号带 0x80 前缀（0x80|N） */
+#define QK_411 9   /* 0x411 长包 */
+#define QK_23C 10  /* 0x23C 长包 */
+#define QK_237 11  /* 0x237 长包 */
+#define QK_NUM 12
 #define QK_UNITS 4
+
+/* ★ v1.1.35：兼容开关。见 BambuBus.h 注释。
+ * 现场实测（打印机空闲，25 秒窗口）：
+ *   0x411  271 帧  →  我们回了 0 帧
+ *   0x23C   70 帧  →  我们回了 0 帧
+ *   0x237   22 帧  →  我们回了 0 帧
+ *   0x05 注册 172 帧 → 我们只回 89 帧，其余 83 帧是 `0x80|台号`，被当越界丢掉
+ * 合计 **每秒约 3.7 次"问了不回"**，`qdrop` 以 3.65/s 稳定增长。
+ * 这正是 40A3（AMS 通信异常）的持续来源，先全部回上，再用开关做 A/B。 */
+#define COMPAT_REG_HI 0x01
+#define COMPAT_411    0x02
+#define COMPAT_23C    0x04
+#define COMPAT_237    0x08
+#define COMPAT_ALL    0x0F
+#define COMPAT_NVS_NS "s3ams-compat"
+
+static uint8_t s_compat = COMPAT_ALL;
+static bool    s_compat_loaded = false;
+
+static void compat_load(void)
+{
+    if (s_compat_loaded) return;
+    s_compat_loaded = true;
+    Preferences p;
+    if (p.begin(COMPAT_NVS_NS, true)) {
+        s_compat = p.getUChar("flags", COMPAT_ALL);
+        p.end();
+    }
+    s_compat &= COMPAT_ALL;
+}
+
+uint8_t bambubus_compat_get(void) { compat_load(); return s_compat; }
+
+void bambubus_compat_set(uint8_t v)
+{
+    compat_load();
+    s_compat = v & COMPAT_ALL;
+    Preferences p;
+    if (p.begin(COMPAT_NVS_NS, false)) {
+        p.putUChar("flags", s_compat);
+        p.end();
+    }
+    log_i("485 兼容开关 = 0x%02X（reg_hi=%d 411=%d 23C=%d 237=%d）",
+          (unsigned)s_compat,
+          (s_compat & COMPAT_REG_HI) ? 1 : 0,
+          (s_compat & COMPAT_411) ? 1 : 0,
+          (s_compat & COMPAT_23C) ? 1 : 0,
+          (s_compat & COMPAT_237) ? 1 : 0);
+}
 
 static uint16_t s_q[QK_UNITS][QK_NUM];
 static uint16_t s_q_drop[QK_NUM];
@@ -1017,6 +1076,21 @@ static inline void q_count(unsigned unit, int kind)
     if (unit < QK_UNITS) s_q[unit][kind]++;
 }
 static inline void q_drop(int kind) { s_q_drop[kind]++; }
+
+/* ★ v1.1.35：台号字节可能带 0x80 标志位。
+ *
+ * 现场实测（v1.1.35 刷入后 15 秒窗口）：
+ *   Dxx 送料命令的台号分布 = {0:92, 1:97, 2:105, 3:113,
+ *                            0x80:119, 0x81:117, 0x82:106, 0x83:100}
+ *   —— 打印机对**每个**台号同时用 0x00|n 和 0x80|n 两套地址在发，
+ *   注册查询 0x05 也一样（0x80 那组 payload 长度为 0，没带指纹）。
+ *
+ * v1.1.34 及以前 0x80|n 全部落进 `>= AMS_COUNT` 的越界分支被静默丢弃，
+ * 折算每秒 3.7 次"问了不回" —— 这就是 40A3 的持续来源。
+ *
+ * 处理原则：**剥掉 0x80 取真实台号去干活，回包时把原始地址字节镜像回去**。
+ * 不新增逻辑台，不会造出幽灵 AMS；打印机问哪个地址，我们就从哪个地址答。 */
+static inline uint8_t ams_unit_of(uint8_t addr) { return addr & 0x7F; }
 
 void bambubus_query_stats(uint16_t out_unit[QK_UNITS][QK_NUM], uint16_t out_drop[QK_NUM])
 {
@@ -1032,7 +1106,7 @@ void bambubus_query_stats_reset(void)
 
 bool set_cxx_buf(unsigned char *set_buf, unsigned char *buf, int length)
 {
-    unsigned char AMS_num = buf[5];
+    unsigned char AMS_num = ams_unit_of(buf[5]);   /* v1.1.35：剥掉 0x80 标志位 */
     unsigned char read_num = buf[7];
     now_op_num = read_num;
     float meters = -1;
@@ -1058,9 +1132,10 @@ bool set_cxx_buf(unsigned char *set_buf, unsigned char *buf, int length)
 
 void send_for_Cxx(unsigned char *buf, int length)
 {
-    q_count(buf[5], QK_CXX);
+    q_count(ams_unit_of(buf[5]), QK_CXX);
 
     Cxx_res[1] = 0xC0 | (package_num << 3);
+    Cxx_res[5] = buf[5];   /* v1.1.35：镜像原始地址（含 0x80 标志位） */
 
     /* ★ v1.1.33：越界台号**不能回包**。
      *
@@ -1098,7 +1173,8 @@ void send_for_Dxx(unsigned char *buf, int length)
 {
     unsigned char filament_flag_on = 0x00;
     unsigned char filament_flag_NFC = 0x00;
-    unsigned char AMS_num = buf[5];
+    unsigned char AMS_id  = buf[5];
+    unsigned char AMS_num = ams_unit_of(AMS_id);
     unsigned char statu_flags = buf[6];
     unsigned char fliment_motion_flag = buf[7];
     unsigned char read_num = buf[9];
@@ -1110,7 +1186,8 @@ void send_for_Dxx(unsigned char *buf, int length)
 
     /* ★ v1.1.33：这里必须保持"越界不回"—— Dxx 会跑送料状态机
      * （process_motion_state_machine），台 2/3 会把 filament_ext[2][x]
-     * 当成通道 8~11 去驱动，本板只有 8 路，绝不能碰。 */
+     * 当成通道 8~11 去驱动，本板只有 8 路，绝不能碰。
+     * v1.1.35：`0x80|n` 已剥掉高位，这里只剩真正的越界（台号 >= AMS_COUNT）。 */
     if (AMS_num >= AMS_COUNT) { q_drop(QK_DXX); return; }
 
     for (auto i = 0; i < 4; i++)
@@ -1236,12 +1313,12 @@ void send_for_Dxx(unsigned char *buf, int length)
     }
 
     Dxx_res[1] = 0xC0 | (package_num << 3);
-    Dxx_res[5] = AMS_num;
+    Dxx_res[5] = AMS_id;      /* 镜像原始地址（含 0x80 标志位） */
     Dxx_res[9] = filament_flag_on;
     Dxx_res[10] = filament_flag_on - filament_flag_NFC;
     Dxx_res[11] = filament_flag_on - filament_flag_NFC;
     Dxx_res[12] = 0xFF;
-    Dxx_res[17] = AMS_num;
+    Dxx_res[17] = AMS_id;     /* 同上 */
     Dxx_res[19] = use_flag;
     Dxx_res[20] = (read_num == 0xFF) ? 0xFF : read_num;
     Dxx_res[13] = filament_flag_NFC;
@@ -1329,16 +1406,32 @@ void send_for_Fxx(unsigned char *buf, int length)
     }
     else if (sub == 0x05 && buf[5] == 0x01)
     {
-        /* ★ v1.1.33：越界台号统计后不应答（打印机问"你是不是第 2/3 台"，
-         * 我们不是，保持静默才是正确行为 —— 应答反而会造出幽灵 AMS）。 */
-        q_count(buf[6], QK_05);
-        if (buf[6] >= AMS_COUNT) { q_drop(QK_05); return; }
+        /* ★ v1.1.35：`0x80|台号` 这一组也要应答。
+         *
+         * 现场抓包：打印机对**每个**台号会问两遍 ——
+         *   3DC51F580501 00 16 <20字节指纹>   ← 台 0，带指纹
+         *   3DC51F580501 80 00 <全 0>         ← 0x80，payload 长度 0
+         * 0x00~0x03 我们一直回，0x80~0x83 因为 `0x80 >= AMS_COUNT` 被当越界丢掉。
+         * 实测 172 次注册查询只回了 89 次，差 83 次正好是 0x80~0x83 那组，
+         * 折算下来**每秒 3.7 次"问了不回"**，qdrop 以 3.65/s 稳定增长。
+         *
+         * 处理：把 0x80 当"高位标志"剥掉取台号，回包时把原始台号原样镜像回去，
+         * 这样打印机问的是哪个地址、我们答的就是哪个地址，不会凭空多出 AMS。 */
+        const uint8_t req_id  = buf[6];
+        const uint8_t ams_num = req_id & 0x7F;
+        const bool    hi_flag = (req_id & 0x80) != 0;
 
-        uint8_t ams_num = buf[6];
+        q_count(ams_num, hi_flag ? QK_05HI : QK_05);
+        if (ams_num >= AMS_COUNT) { q_drop(hi_flag ? QK_05HI : QK_05); return; }
+        if (hi_flag && !(bambubus_compat_get() & COMPAT_REG_HI)) {
+            q_drop(QK_05HI);
+            return;
+        }
+
         if (data_save.filament[ams_num][0].statu != online)
         {
             have_registered[ams_num] = false;
-            q_drop(QK_05);
+            q_drop(hi_flag ? QK_05HI : QK_05);
             return;
         }
 
@@ -1348,7 +1441,7 @@ void send_for_Fxx(unsigned char *buf, int length)
         F00_res[ams_num][3] = 0xB4;
         F00_res[ams_num][4] = 0x05;
         F00_res[ams_num][5] = 0x01;
-        F00_res[ams_num][6] = ams_num;
+        F00_res[ams_num][6] = req_id;   /* 镜像原始台号（含 0x80 标志位） */
 
         package_send_with_crc(F00_res[ams_num], 29);
         s_485_tx_06++;   /* v1.1.25 诊断：0x06 握手已应答 */
@@ -1404,20 +1497,18 @@ void send_for_long_packge_MC_online(unsigned char *buf, int length)
     long_packge_data data;
     Bambubus_long_package_analysis(buf, length, &printer_data_long);
 
-    uint8_t AMS_num = printer_data_long.datas[0];
-    q_count(AMS_num, QK_211);
+    /* v1.1.35：这是 0x21A（"MC 在线"查询）。台号同样可能带 0x80 标志位
+     * —— 实测 0x21A 每秒 3.4 帧，其中约一半 datas[0] >= 4 被丢。 */
+    const uint8_t AMS_id  = printer_data_long.datas[0];
+    const uint8_t AMS_num = ams_unit_of(AMS_id);
+    q_count(AMS_num, QK_21A);
 
-    /* ★ v1.1.33：0x211 也是**查询-应答**对，必须应答。
-     *
-     * v1.1.21 起这里是 `AMS_num >= AMS_COUNT || statu != online` 就 return，
-     * 于是台 2/3 问了没回 —— 和 v1.1.21 的 0x402 是同一个错误（那次报 40A3）。
-     * 现在只挡真正的数组越界（>= 4），台 2/3 照常回一份"MC 未在线"的空包。
-     * 注意：这不会让打印机多出 AMS-C/D 卡片 —— 卡片来自 0x05 注册包，
-     * 而注册循环写死了 `i < AMS_COUNT`，只注册 A/B。 */
-    if (AMS_num >= 4) { q_drop(QK_211); return; }
+    /* ★ v1.1.33：0x21A 是**查询-应答**对，必须应答。
+     * 现在只挡真正的数组越界（>= 4），台 2/3 照常回一份"MC 未在线"的空包。 */
+    if (AMS_num >= 4) { q_drop(QK_21A); return; }
 
     data.datas = long_packge_MC_online;
-    data.datas[0] = AMS_num;
+    data.datas[0] = AMS_id;      /* 镜像原始地址 */
     data.data_length = sizeof(long_packge_MC_online);
 
     data.package_number = printer_data_long.package_number;
@@ -1425,7 +1516,62 @@ void send_for_long_packge_MC_online(unsigned char *buf, int length)
     data.source_address = BambuBus_address_AMS08;
     data.target_address = printer_data_long.source_address;
     Bambubus_long_package_send(&data);
-    s_485_tx_103++;   /* v1.1.25 诊断：0x103 版本查询已应答 */
+}
+
+/* ★ v1.1.35：0x411 / 0x23C / 0x237 三种"从未应答过"的长包。
+ *
+ * 现场实测（打印机空闲，25 秒窗口）：0x411 271 帧、0x23C 70 帧、0x237 22 帧，
+ * 我们**一帧都没回**。三者结构和 0x21A（我们一直在回的"MC 在线"查询）
+ * 完全同族 —— 同一个包头 `3D 05 00 00 <len> <crc8> 00 07 00 03`，
+ * 也就是 printer(0x0300) → AMS(0x0700)，标准"查询-应答"格式。
+ * 0x411 的 payload 是 4 字节且 [0] 在 0~3 之间轮转（就是台号），
+ * 和 0x21A 的请求格式一模一样。
+ *
+ * 这里用**镜像回包**：类型、包号原样带回，payload 长度与请求一致、
+ * 内容照抄请求（这几类请求的 payload 除台号外全是 0），源地址改成 AMS。
+ * 不做语义猜测 —— 打印机问什么地址，我们就从什么地址答什么。
+ *
+ * 风险控制：三条都挂在 bambubus_compat_set() 的开关上，出问题可以
+ * 单独关掉任何一条退回 v1.1.34 的静默行为。 */
+static void send_for_ext_long(uint16_t type, uint8_t flag, int kind)
+{
+    uint8_t AMS_id = (printer_data_long.data_length > 0) ? printer_data_long.datas[0] : 0;
+    q_count(ams_unit_of(AMS_id), kind);
+
+    if (!(bambubus_compat_get() & flag)) { q_drop(kind); return; }
+
+    static uint8_t echo[64];
+    uint16_t n = printer_data_long.data_length;
+    if (n > sizeof(echo)) n = sizeof(echo);
+    memset(echo, 0, sizeof(echo));
+    if (n > 0) memcpy(echo, printer_data_long.datas, n);
+
+    long_packge_data data;
+    data.datas = echo;
+    data.data_length = n;
+    data.package_number = printer_data_long.package_number;
+    data.type = type;
+    data.source_address = BambuBus_address_AMS08;
+    data.target_address = printer_data_long.source_address;
+    Bambubus_long_package_send(&data);
+}
+
+void send_for_long_packge_ext_411(unsigned char *buf, int length)
+{
+    Bambubus_long_package_analysis(buf, length, &printer_data_long);
+    send_for_ext_long(0x411, COMPAT_411, QK_411);
+}
+
+void send_for_long_packge_ext_23C(unsigned char *buf, int length)
+{
+    Bambubus_long_package_analysis(buf, length, &printer_data_long);
+    send_for_ext_long(0x23C, COMPAT_23C, QK_23C);
+}
+
+void send_for_long_packge_ext_237(unsigned char *buf, int length)
+{
+    Bambubus_long_package_analysis(buf, length, &printer_data_long);
+    send_for_ext_long(0x237, COMPAT_237, QK_237);
 }
 
 // ==================== 读取耗材信息 ====================
@@ -1444,18 +1590,20 @@ void send_for_long_packge_filament(unsigned char *buf, int length)
     long_packge_data data;
     Bambubus_long_package_analysis(buf, length, &printer_data_long);
 
-    uint8_t AMS_num = printer_data_long.datas[0];
+    /* v1.1.35：这是 0x211（读取耗材信息）。台号同样可能带 0x80 标志位。 */
+    const uint8_t AMS_id  = printer_data_long.datas[0];
+    const uint8_t AMS_num = ams_unit_of(AMS_id);
     uint8_t filament_num = printer_data_long.datas[1];
 
-    q_count(AMS_num, QK_21A);
+    q_count(AMS_num, QK_211);
 
-    /* ★ v1.1.33：0x21A 同样是查询-应答对，必须应答（理由同 0x211）。
+    /* ★ v1.1.33：0x211 同样是查询-应答对，必须应答（理由同 0x21A）。
      * 只挡真正的数组越界：AMS_num >= 4 或 filament_num >= 4。
      * 台 2/3 的料位 statu 是 offline，回一份空耗材信息即可 ——
      * 打印机若根本没注册 C/D，它会直接忽略这份应答。 */
-    if (AMS_num >= 4 || filament_num >= 4) { q_drop(QK_21A); return; }
+    if (AMS_num >= 4 || filament_num >= 4) { q_drop(QK_211); return; }
 
-    long_packge_filament[0] = AMS_num;
+    long_packge_filament[0] = AMS_id;   /* 镜像原始地址 */
     long_packge_filament[1] = filament_num;
     memcpy(long_packge_filament + 19, data_save.filament[AMS_num][filament_num].ID, 8);
     memcpy(long_packge_filament + 27, data_save.filament[AMS_num][filament_num].name, 20);
@@ -1992,6 +2140,15 @@ int BambuBus_run()
             break;
         case BambuBus_package_set_filament_type2:
             send_for_Set_filament_type2(buf_X, data_length);
+            break;
+        case BambuBus_long_package_ext_411:
+            send_for_long_packge_ext_411(buf_X, data_length);
+            break;
+        case BambuBus_long_package_ext_23C:
+            send_for_long_packge_ext_23C(buf_X, data_length);
+            break;
+        case BambuBus_long_package_ext_237:
+            send_for_long_packge_ext_237(buf_X, data_length);
             break;
         default:
             break;

@@ -258,7 +258,7 @@ void web_log_install_hook(void)
 }
 
 /* App 版本 */
-static const char *APP_VERSION = "1.1.34-s3ams";
+static const char *APP_VERSION = "1.1.35-s3ams";
 
 /* 单 IO 双微动：每路一个 ADC 脚（开始位/停止位共用同一脚，电阻编码） */
 static const int BOARD_SENSOR_PINS[BOARD_CHANNEL_COUNT] = BOARD_PIN_SENSOR_ARRAY;
@@ -711,7 +711,7 @@ static void handle_status(void)
 
     /* ★ v1.1.33：打印机查询统计（按台号 × 包类型）
      *
-     * 列顺序：402 / 103 / 06 / 21A / 211 / Cxx / Dxx / 05
+     * 列顺序：402 / 103 / 06 / 21A / 211 / Cxx / Dxx / 05 / 05hi / 411 / 23C / 237
      * 行顺序：台 0(A) / 台 1(B) / 台 2(C) / 台 3(D)
      *
      * 判读（删掉 C/D 后经常报 40A3，靠这两组数定性）：
@@ -719,25 +719,27 @@ static void handle_status(void)
      *   q[2] / q[3] 有值   → 打印机侧还残留 4 台配置，需要在那里清掉
      *   qdrop 任一非 0     → 我们有"问了没回"，这就是 40A3 的直接来源 */
     {
-        uint16_t qu[4][8];
-        uint16_t qd[8];
+        uint16_t qu[4][BAMBUBUS_QK_NUM];
+        uint16_t qd[BAMBUBUS_QK_NUM];
         bambubus_query_stats(qu, qd);
         json += ",\"q\":[";
         for (int i = 0; i < 4; i++) {
             if (i) json += ",";
             json += "[";
-            for (int k = 0; k < 8; k++) {
+            for (int k = 0; k < BAMBUBUS_QK_NUM; k++) {
                 if (k) json += ",";
                 json += String((unsigned)qu[i][k]);
             }
             json += "]";
         }
         json += "],\"qdrop\":[";
-        for (int k = 0; k < 8; k++) {
+        for (int k = 0; k < BAMBUBUS_QK_NUM; k++) {
             if (k) json += ",";
             json += String((unsigned)qd[k]);
         }
         json += "]";
+        /* ★ v1.1.35：兼容开关当前值（0~15），bit 含义见 BambuBus.h */
+        json += ",\"compat\":" + String((unsigned)bambubus_compat_get());
     }
 
     /* ★ v1.1.31：耗材信息落盘统计
@@ -1658,6 +1660,37 @@ static void handle_ams_count_set(void)
     server.send(200, "application/json", msg);
 }
 
+/* ★ v1.1.35：485 兼容开关（0~15）。
+ * 现场实测打印机对每个台号会问两遍注册（`0x00~0x03` 和 `0x80~0x83`），
+ * 还会发 0x411 / 0x23C / 0x237 三种我们从来没回过的长包 ——
+ * 合计每秒约 3.7 次"问了不回"，qdrop 稳定增长，是 40A3 的直接来源。
+ * 这里做成开关，出问题可以逐位关掉退回 v1.1.34 的静默行为做 A/B。 */
+static void handle_compat_set(void)
+{
+    if (!server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"ok\":false,\"err\":\"no body\"}");
+        return;
+    }
+    String body = server.arg("plain");
+    long v = 0;
+    if (!json_get_int(body, "flags", &v)) {
+        server.send(400, "application/json", "{\"ok\":false,\"err\":\"缺少 flags\"}");
+        return;
+    }
+    if (v < 0 || v > 15) {
+        server.send(200, "application/json",
+            "{\"ok\":false,\"info\":\"flags 需在 0~15 之间\"}");
+        return;
+    }
+    bambubus_compat_set((uint8_t)v);
+    char msg[200];
+    snprintf(msg, sizeof(msg),
+             "{\"ok\":true,\"compat\":%d,\"info\":\"兼容开关已改为 0x%02X"
+             "（bit0=0x80注册 bit1=0x411 bit2=0x23C bit3=0x237）\"}",
+             (int)bambubus_compat_get(), (unsigned)bambubus_compat_get());
+    server.send(200, "application/json", msg);
+}
+
 static void handle_idle_timeout_set(void)
 {
     if (!server.hasArg("plain")) {
@@ -1909,6 +1942,7 @@ void web_server_start(void)
     server.on("/feed_timeout_set", HTTP_POST, handle_feed_timeout_set);  /* v1.1.27 */
     server.on("/idle_timeout_set", HTTP_POST, handle_idle_timeout_set);  /* v1.1.29 */
     server.on("/ams_count_set", HTTP_POST, handle_ams_count_set);        /* v1.1.34 */
+    server.on("/compat_set", HTTP_POST, handle_compat_set);              /* v1.1.35 */
     server.on("/assist_set", HTTP_POST, handle_ok);
     server.on("/retract_set", HTTP_POST, handle_ok);
     server.on("/temper_set", HTTP_POST, handle_ok);
