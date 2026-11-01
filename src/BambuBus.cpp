@@ -511,7 +511,41 @@ static uint32_t s_485_rx_dropped = 0;   /* 队列满 / 帧过长被丢弃的帧�
 
 static bool rx_queue_push(const uint8_t *data, uint16_t len)
 {
-    if (len == 0 || len > RX_FRAME_MAX || s_rx_q_count >= RX_QUEUE_DEPTH) {
+    if (len == 0 || len > RX_FRAME_MAX) {
+        s_485_rx_dropped++;
+        return false;
+    }
+
+    /* ★ v1.1.40：默认（bit4 关）= **完全照 v1.1.29 的语义 —— 只保留最后一帧**。
+     *
+     * 这才是真凶。打印机在打印任务开始时是**连发**的（2 台 × 4 槽下发 + 逐个查询）。
+     *
+     * v1.1.29：`memcpy(buf_X, ...)` 直接覆盖，一次 poll 里收到的多帧只剩最后一帧，
+     *          所以回复永远发生在**突发结束、总线已经安静**之后 → 不撞车 → 能打印。
+     * v1.1.31~v1.1.39：入队后逐帧回包。回第 N 帧的时候，打印机的第 N+1 帧
+     *          **正在总线上传**，RS485 是半双工 —— 两边同时驱动 → 双方数据都成垃圾：
+     *          · 我们收到的后续帧 CRC 错 → 不回（但我们以为回了）；
+     *          · 打印机收到的我们的应答是垃圾 → 判 `AMS A 通信异常`。
+     *
+     * 这也解释了为什么"空闲时抓包两版回包逐字节一致、延迟都是 1ms"：
+     * 空闲时打印机一帧一问、问完等答，**根本没有撞车的机会**。
+     * 也解释了 `/status` 里 `qdrop` 全是 0（我们确实"答"了）却仍然 40A3
+     * —— 答了，但被撞坏了，打印机没收到。
+     *
+     * 打开 bit4 = 入队 + 静默门控（见 BambuBus_run）：不丢帧也不撞车。 */
+    if (!(bambubus_compat_get() & COMPAT_RX_BATCH)) {
+        if (s_rx_q_count > 0) {
+            s_485_rx_dropped++;      /* 被新帧覆盖掉的旧帧（= v1.1.29 的行为） */
+        }
+        memcpy(s_rx_q[0], data, len);
+        s_rx_q_len[0] = len;
+        s_rx_q_head  = (uint8_t)(1 % RX_QUEUE_DEPTH);
+        s_rx_q_tail  = 0;
+        s_rx_q_count = 1;
+        return true;
+    }
+
+    if (s_rx_q_count >= RX_QUEUE_DEPTH) {
         s_485_rx_dropped++;
         return false;
     }
@@ -2152,16 +2186,27 @@ int BambuBus_run()
         stu = -1;
     }
 
-    /* ★ v1.1.39：是否每轮把队列排空，受 COMPAT_RX_BATCH（bit4）控制。
+    /* ★ v1.1.40：收帧/回包节奏，受 COMPAT_RX_BATCH（bit4）控制。
      *
-     * 默认关 = 每轮只处理**一帧**（= v1.1.29 的行为）：
-     *   打印机连发时后面的帧会留在队列里等下一轮，两包应答之间自然隔开
-     *   delay(2) + AMCU_run 的时间，总线有一段空闲。
-     * 打开 = 一次排空（v1.1.31~v1.1.38 的行为）：
-     *   突发时连回好几包，包间隔≈0。现场怀疑正是这个把打印机惹毛的，
-     *   所以做成开关，刷一次机就能二选一验证。 */
+     * 关（默认）= v1.1.29 的语义：
+     *   `rx_queue_push()` 只保留**最后一帧**（新帧覆盖旧帧），
+     *   所以回复一定发生在**突发结束、总线安静**之后 —— 不撞车。
+     *   这是现场唯一确认过"能打印"的行为。
+     *
+     * 开 = 入队 + **静默门控**（v1.1.40 新方案）：
+     *   帧全部入队不丢，但要等总线**连续 3ms 没有新字节**才把队列排空回包。
+     *   既不像 v1.1.29 那样丢查询，也不像 v1.1.31~39 那样边收边回撞车。
+     *
+     * 为什么门控是必须的：RS485 半双工，打印机连发时我们插话 →
+     * 双方数据都成垃圾 → 打印机判 `AMS A 通信异常`。 */
     const bool batch = (bambubus_compat_get() & COMPAT_RX_BATCH) != 0;
-    const int  max_frames = batch ? RX_QUEUE_DEPTH : 1;
+    if (batch) {
+        /* 总线还在动（3ms 内收到过字节）就先别开口 */
+        if ((uint32_t)(millis() - s_485_last_rx_ms) < 3) {
+            return stu;
+        }
+    }
+    const int max_frames = batch ? RX_QUEUE_DEPTH : 1;
     int processed = 0;
     while (s_rx_q_count > 0 && processed < max_frames)
     {

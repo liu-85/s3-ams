@@ -2,7 +2,7 @@
 #pragma once
 #include <Arduino.h>
 
-// 来源: web/index.html  (41064 字节)
+// 来源: web/index.html  (41182 字节)
 static const char *WEB_INDEX_HTML =
   "<!DOCTYPE html>\n"
 "<html lang=\"zh-CN\">\n"
@@ -470,15 +470,18 @@ static const char *WEB_INDEX_HTML =
 "            <button class=\"primary\" style=\"flex:1\" id=\"btn_compat_save\">保存兼容位</button>\n"
 "          </div>\n"
 "          <div class=\"tip\">\n"
-"            <b>485 兼容位（v1.1.39）</b>：默认 <b>0</b> = 完全退回 v1.1.29 的收发行为。\n"
+"            <b>485 兼容位（v1.1.40）</b>：默认 <b>0</b> = 完全退回 v1.1.29 的收发行为。\n"
 "            <div class=\"hr\"></div>\n"
-"            现场已确认 v1.1.29 原厂固件能打印、v1.1.38 不能，而两版的\n"
-"            <b>应答内容逐字节一致</b>，所以差异只可能在\"什么时候发\"上。逐位打开即可定位：\n"
-"            <br><code>+16</code>（bit4）每轮把收帧队列排空 —— 突发时连回好几包，包间隔≈0\n"
+"            <code>+16</code>（bit4）收帧改为<b>入队 + 静默门控</b>：一帧都不丢，\n"
+"            但等总线连续 3ms 没新字节才回包（避免半双工撞车）。默认关 = v1.1.29 的\n"
+"            「新帧覆盖旧帧、只回最后一帧」。\n"
 "            <br><code>+32</code>（bit5）UART 接收缓冲 2048 字节（<b>改完要重启</b>）\n"
 "            <br><code>+64</code>（bit6）耗材信息交给后台任务写 flash\n"
 "            <br>bit0~3 是加热器相关（0x80 注册 / 0x411 / 0x23C / 0x237），\n"
 "            <b>必须保持关闭</b> —— 打开会让打印机报一屏「加热器故障」。\n"
+"            <div class=\"hr\"></div>\n"
+"            <b>抓包</b>：<code>/bus485raw</code> 现在是 <b>96 帧</b>双向记录\n"
+"            （约 30ms 历史），够覆盖打印任务开始时那一整串突发。\n"
 "          </div>\n"
 "          <div class=\"tip\">\n"
 "            <b>上面是速度，下面是保险</b>：微动触发补料时的电机 PWM，默认 <b>100%</b>。\n"

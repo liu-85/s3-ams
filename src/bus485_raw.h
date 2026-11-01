@@ -15,8 +15,13 @@
 
 #include <Arduino.h>
 
-#define BUS485_RAW_CAP    32    /* 环形帧数 */
-#define BUS485_RAW_MAXLEN 256   /* 每帧最多记录字节（超出截断） */
+/* ★ v1.1.40：32 → 96 帧。
+ * 为什么：打印任务开始时打印机是**连发**的，32 帧只能覆盖 ~6ms 的历史，
+ * 抓不到"失败那一刻之前发生了什么"。96 帧 ≈ 30ms，够覆盖整个突发。
+ * 每帧只留前 64 字节（包类型/台号/长度都在前 12 字节里），
+ * 静态占用 96 × (4+4+1+1+64) ≈ 7KB。 */
+#define BUS485_RAW_CAP    96    /* 环形帧数 */
+#define BUS485_RAW_MAXLEN 64    /* 每帧最多记录字节（超出截断） */
 
 /* dir: 0=RX(打印机发来的) 1=TX(本机回的) */
 void bus485raw_record(int dir, const uint8_t *data, size_t len);

@@ -258,7 +258,7 @@ void web_log_install_hook(void)
 }
 
 /* App 版本 */
-static const char *APP_VERSION = "1.1.39-s3ams";
+static const char *APP_VERSION = "1.1.40-s3ams";
 
 /* 单 IO 双微动：每路一个 ADC 脚（开始位/停止位共用同一脚，电阻编码） */
 static const int BOARD_SENSOR_PINS[BOARD_CHANNEL_COUNT] = BOARD_PIN_SENSOR_ARRAY;
@@ -1371,11 +1371,13 @@ static void handle_bus485raw(void)
                  " TX_TOTAL=" + String(bus485raw_tx_count()) +
                  " LAST_SEQ=" + String(bus485raw_last_seq()) + "\n";
 
-    /* hex 展开后最大 ~32 帧 × 560 字节 ≈ 18KB，用堆上 String 不占静态 */
-    char *buf = (char *)malloc(BUS485_RAW_CAP * 576 + 64);
+    /* ★ v1.1.40：环形缓冲 32→96 帧，hex 展开后最大 ≈ 96 × (64×2+40) ≈ 16KB，
+       用堆上 String 不占静态。公式跟着 bus485_raw.h 的宏走，改容量不会再对不上。 */
+    const size_t need = (size_t)BUS485_RAW_CAP * (BUS485_RAW_MAXLEN * 2 + 40) + 64;
+    char *buf = (char *)malloc(need);
     if (buf) {
         uint32_t first = 0;
-        int n = bus485raw_dump(buf, BUS485_RAW_CAP * 576 + 64, since, &first);
+        int n = bus485raw_dump(buf, need, since, &first);
         if (n > 0) out += String(buf);
         free(buf);
     }
