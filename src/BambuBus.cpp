@@ -1115,7 +1115,7 @@ void bambubus_query_stats_reset(void)
 
 bool set_cxx_buf(unsigned char *set_buf, unsigned char *buf, int length)
 {
-    unsigned char AMS_num = ams_unit_of(buf[5]);   /* v1.1.35：剥掉 0x80 标志位 */
+    unsigned char AMS_num = buf[5];   /* v1.1.37：不剥 0x80，见 send_for_Dxx 注释 */
     unsigned char read_num = buf[7];
     now_op_num = read_num;
     float meters = -1;
@@ -1141,10 +1141,12 @@ bool set_cxx_buf(unsigned char *set_buf, unsigned char *buf, int length)
 
 void send_for_Cxx(unsigned char *buf, int length)
 {
-    q_count(ams_unit_of(buf[5]), QK_CXX);
+    q_count(buf[5], QK_CXX);
 
     Cxx_res[1] = 0xC0 | (package_num << 3);
-    Cxx_res[5] = buf[5];   /* v1.1.35：镜像原始地址（含 0x80 标志位） */
+    /* ★ v1.1.37：**不要**往 Cxx_res[5] 写台号。
+     * v1.1.29（能打印的版本）里 Cxx_res[5] 一直是模板里的 0x00，
+     * v1.1.35 擅自改成镜像 buf[5]，等于改了回包内容 —— 已回退。 */
 
     /* ★ v1.1.33：越界台号**不能回包**。
      *
@@ -1182,8 +1184,16 @@ void send_for_Dxx(unsigned char *buf, int length)
 {
     unsigned char filament_flag_on = 0x00;
     unsigned char filament_flag_NFC = 0x00;
+    /* ★ v1.1.37：这里**必须用原始 buf[5]**，不能剥 0x80。
+     *
+     * v1.1.35 曾把 `0x80|n` 剥成 n 后照常应答并跑送料状态机 ——
+     * 等于把 AMS-HT（另一种设备）的送料命令当成 AMS A/B 执行，
+     * 打印机那边看到"命令被别的设备执行了"，表现就是
+     * `[0500-40A3] AMS A 通信异常` + 自动取消打印任务。
+     * v1.1.29 的原始写法是 `buf[5] >= AMS_COUNT` 直接 return（静默），
+     * 那才是正确语义：我们没有 AMS-HT，就不该替它干活。 */
     unsigned char AMS_id  = buf[5];
-    unsigned char AMS_num = ams_unit_of(AMS_id);
+    unsigned char AMS_num = buf[5];
     unsigned char statu_flags = buf[6];
     unsigned char fliment_motion_flag = buf[7];
     unsigned char read_num = buf[9];
@@ -1415,51 +1425,43 @@ void send_for_Fxx(unsigned char *buf, int length)
     }
     else if (sub == 0x05 && buf[5] == 0x01)
     {
-        /* ★ v1.1.35：`0x80|台号` 这一组也要应答。
+        /* ★ v1.1.37：恢复 v1.1.29 的写法 —— **不做 0x80 剥离**。
          *
-         * 现场抓包：打印机对**每个**台号会问两遍 ——
-         *   3DC51F580501 00 16 <20字节指纹>   ← 台 0，带指纹
-         *   3DC51F580501 80 00 <全 0>         ← 0x80，payload 长度 0
-         * 0x00~0x03 我们一直回，0x80~0x83 因为 `0x80 >= AMS_COUNT` 被当越界丢掉。
-         * 实测 172 次注册查询只回了 89 次，差 83 次正好是 0x80~0x83 那组，
-         * 折算下来**每秒 3.7 次"问了不回"**，qdrop 以 3.65/s 稳定增长。
-         *
-         * 处理：把 0x80 当"高位标志"剥掉取台号，回包时把原始台号原样镜像回去，
-         * 这样打印机问的是哪个地址、我们答的就是哪个地址，不会凭空多出 AMS。 */
+         * 打印机对每个台号会问两遍：`0x00|n`（带 20 字节指纹）和
+         * `0x80|n`（payload 长度 0）。后者是 **AMS-HT** 的注册探测。
+         * v1.1.35 把它剥成 n 后照常应答，结果打印机凭空注册出
+         * AMS-HT A/B/C/D 四台，还连带报一屏加热器故障。
+         * 正确语义：`buf[6] >= AMS_COUNT` 就静默（"我们没有这台"）。 */
         const uint8_t req_id  = buf[6];
-        const uint8_t ams_num = req_id & 0x7F;
         const bool    hi_flag = (req_id & 0x80) != 0;
 
-        q_count(ams_num, hi_flag ? QK_05HI : QK_05);
-        if (ams_num >= AMS_COUNT) { q_drop(hi_flag ? QK_05HI : QK_05); return; }
-        if (hi_flag && !(bambubus_compat_get() & COMPAT_REG_HI)) {
-            /* v1.1.36：`0x80|n` = AMS-HT 的注册探测。我们没有 AMS-HT，
-             * **静默才是正确语义**，不算"丢包"（qdrop 只统计该回没回的）。 */
-            return;
-        }
+        /* ★ v1.1.37：恢复 v1.1.29 的 `buf[6] < AMS_COUNT` 语义。
+         * `0x80|n` = AMS-HT 的注册探测，>= AMS_COUNT 就是"我们没有这台"，
+         * **静默是正确行为**，不计入 qdrop。 */
+        q_count(req_id & 0x7F, hi_flag ? QK_05HI : QK_05);
+        if (req_id >= AMS_COUNT) return;
 
-        if (data_save.filament[ams_num][0].statu != online)
+        if (data_save.filament[req_id][0].statu != online)
         {
-            have_registered[ams_num] = false;
-            q_drop(hi_flag ? QK_05HI : QK_05);
+            have_registered[req_id] = false;
             return;
         }
 
-        F00_res[ams_num][0] = 0x3D;
-        F00_res[ams_num][1] = 0xC0;
-        F00_res[ams_num][2] = 29;
-        F00_res[ams_num][3] = 0xB4;
-        F00_res[ams_num][4] = 0x05;
-        F00_res[ams_num][5] = 0x01;
-        F00_res[ams_num][6] = req_id;   /* 镜像原始台号（含 0x80 标志位） */
+        F00_res[req_id][0] = 0x3D;
+        F00_res[req_id][1] = 0xC0;
+        F00_res[req_id][2] = 29;
+        F00_res[req_id][3] = 0xB4;
+        F00_res[req_id][4] = 0x05;
+        F00_res[req_id][5] = 0x01;
+        F00_res[req_id][6] = req_id;
 
-        package_send_with_crc(F00_res[ams_num], 29);
+        package_send_with_crc(F00_res[req_id], 29);
         s_485_tx_06++;   /* v1.1.25 诊断：0x06 握手已应答 */
 
-        if (memcmp(F00_res[ams_num] + 7, buf + 7, 20) == 0)
-            have_registered[ams_num] = true;
+        if (memcmp(F00_res[req_id] + 7, buf + 7, 20) == 0)
+            have_registered[req_id] = true;
         else
-            have_registered[ams_num] = false;
+            have_registered[req_id] = false;
     }
     else if (sub == 0x06)
     {
@@ -1507,18 +1509,16 @@ void send_for_long_packge_MC_online(unsigned char *buf, int length)
     long_packge_data data;
     Bambubus_long_package_analysis(buf, length, &printer_data_long);
 
-    /* v1.1.35：这是 0x21A（"MC 在线"查询）。台号同样可能带 0x80 标志位
-     * —— 实测 0x21A 每秒 3.4 帧，其中约一半 datas[0] >= 4 被丢。 */
-    const uint8_t AMS_id  = printer_data_long.datas[0];
-    const uint8_t AMS_num = ams_unit_of(AMS_id);
+    /* ★ v1.1.37：恢复 v1.1.29 语义 —— 台号越界或该台不在线就**静默**。
+     * v1.1.33 曾改成"只挡数组越界、一律回空包"，但 v1.1.29 那样才是能打印的。 */
+    const uint8_t AMS_num = printer_data_long.datas[0];
     q_count(AMS_num, QK_21A);
 
-    /* ★ v1.1.33：0x21A 是**查询-应答**对，必须应答。
-     * 现在只挡真正的数组越界（>= 4），台 2/3 照常回一份"MC 未在线"的空包。 */
-    if (AMS_num >= 4) { q_drop(QK_21A); return; }
+    if (AMS_num >= AMS_COUNT ||
+        data_save.filament[AMS_num][0].statu != online) return;
 
     data.datas = long_packge_MC_online;
-    data.datas[0] = AMS_id;      /* 镜像原始地址 */
+    data.datas[0] = AMS_num;
     data.data_length = sizeof(long_packge_MC_online);
 
     data.package_number = printer_data_long.package_number;
@@ -1611,20 +1611,16 @@ void send_for_long_packge_filament(unsigned char *buf, int length)
     long_packge_data data;
     Bambubus_long_package_analysis(buf, length, &printer_data_long);
 
-    /* v1.1.35：这是 0x211（读取耗材信息）。台号同样可能带 0x80 标志位。 */
-    const uint8_t AMS_id  = printer_data_long.datas[0];
-    const uint8_t AMS_num = ams_unit_of(AMS_id);
+    /* ★ v1.1.37：恢复 v1.1.29 语义（台号越界 / 料位越界 / 该台不在线 → 静默）。 */
+    const uint8_t AMS_num = printer_data_long.datas[0];
     uint8_t filament_num = printer_data_long.datas[1];
 
     q_count(AMS_num, QK_211);
 
-    /* ★ v1.1.33：0x211 同样是查询-应答对，必须应答（理由同 0x21A）。
-     * 只挡真正的数组越界：AMS_num >= 4 或 filament_num >= 4。
-     * 台 2/3 的料位 statu 是 offline，回一份空耗材信息即可 ——
-     * 打印机若根本没注册 C/D，它会直接忽略这份应答。 */
-    if (AMS_num >= 4 || filament_num >= 4) { q_drop(QK_211); return; }
+    if (AMS_num >= AMS_COUNT || filament_num >= 4 ||
+        data_save.filament[AMS_num][filament_num].statu != online) return;
 
-    long_packge_filament[0] = AMS_id;   /* 镜像原始地址 */
+    long_packge_filament[0] = AMS_num;
     long_packge_filament[1] = filament_num;
     memcpy(long_packge_filament + 19, data_save.filament[AMS_num][filament_num].ID, 8);
     memcpy(long_packge_filament + 27, data_save.filament[AMS_num][filament_num].name, 20);

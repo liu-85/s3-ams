@@ -450,7 +450,7 @@ static const char *WEB_INDEX_HTML =
 "            <button class=\"primary\" style=\"flex:1\" id=\"btn_idle_timeout_save\">保存双失效保护</button>\n"
 "          </div>\n"
 "          <div class=\"row\" style=\"margin-top:10px\">\n"
-"            <input type=\"number\" id=\"ams_count\" min=\"1\" max=\"4\" step=\"1\" value=\"2\">\n"
+"            <input type=\"number\" id=\"ams_count\" min=\"1\" max=\"2\" step=\"1\" value=\"2\">\n"
 "            <span style=\"align-self:center\" class=\"dim\">台 AMS</span>\n"
 "            <button class=\"primary\" style=\"flex:1\" id=\"btn_ams_count_save\">保存 AMS 台数</button>\n"
 "          </div>\n"
