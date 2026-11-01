@@ -463,6 +463,55 @@ void send_uart(const unsigned char *data, uint16_t length)
 uint8_t buf_X[1000];
 CRC8 _RX_IRQ_crcx(0x39, 0x66, 0x00, false, false);
 
+/* ★ v1.1.31：RX 帧队列 —— 修"连续帧互相覆盖导致查询无应答"
+ *
+ * 现场（2026-11-01）：删掉 2 台 AMS 只留 A/B 之后，连续发 3 次打印任务，
+ * 前两次都报 `[0500-40A3] AMS A 通信异常`，第三次才正常开始打印。
+ *
+ * 根因（本文件）：
+ *   原来 RX_IRQ 每收完一帧就 `memcpy(buf_X, ...)` 并置 `BambuBus_have_data`，
+ *   而 `BambuBus_run()` **一次只处理一帧**。打印机在**打印任务开始时是连发的**
+ *   （给每台 AMS 的每个槽位下发耗材信息、再逐个查询），
+ *   一个 `BambuBus_UART_Poll()` 里收完两帧时，第二帧直接**覆盖**第一帧 →
+ *   第一帧的查询永远没有应答 → 打印机判 AMS A 通信异常。
+ *   这也解释了"第一次第二次失败、第三次成功"：第三次下发的内容和上次一样，
+ *   打印机不再连发 set_filament，突发消失。
+ *
+ * 修法：收帧只入队（环形 8 帧），`BambuBus_run()` 里把队列排空再返回。
+ * 帧长由 `length` 字段决定，是 uint8_t，最大 255，所以每槽 256 字节够用。
+ */
+#define RX_QUEUE_DEPTH 8
+#define RX_FRAME_MAX   256
+static uint8_t  s_rx_q[RX_QUEUE_DEPTH][RX_FRAME_MAX];
+static uint16_t s_rx_q_len[RX_QUEUE_DEPTH];
+static uint8_t  s_rx_q_head  = 0;
+static uint8_t  s_rx_q_tail  = 0;
+static uint8_t  s_rx_q_count = 0;
+static uint32_t s_485_rx_dropped = 0;   /* 队列满 / 帧过长被丢弃的帧数 */
+
+static bool rx_queue_push(const uint8_t *data, uint16_t len)
+{
+    if (len == 0 || len > RX_FRAME_MAX || s_rx_q_count >= RX_QUEUE_DEPTH) {
+        s_485_rx_dropped++;
+        return false;
+    }
+    memcpy(s_rx_q[s_rx_q_head], data, len);
+    s_rx_q_len[s_rx_q_head] = len;
+    s_rx_q_head = (uint8_t)((s_rx_q_head + 1) % RX_QUEUE_DEPTH);
+    s_rx_q_count++;
+    return true;
+}
+
+static int rx_queue_pop(uint8_t *dst, uint16_t dst_max)
+{
+    if (s_rx_q_count == 0) return 0;
+    const uint16_t len = s_rx_q_len[s_rx_q_tail];
+    if (len <= dst_max) memcpy(dst, s_rx_q[s_rx_q_tail], len);
+    s_rx_q_tail = (uint8_t)((s_rx_q_tail + 1) % RX_QUEUE_DEPTH);
+    s_rx_q_count--;
+    return (int)len;
+}
+
 /* ★ v1.1.25：485 链路计数（只读诊断，不参与任何逻辑）
  *
  * 为什么要加：现场"打印机报 [0500-40A3] AMS A 通信异常"时，光看现象
@@ -541,8 +590,9 @@ static void RX_IRQ(unsigned char data)
         if (_index >= length)
         {
             _index = 0;
-            memcpy(buf_X, BambuBus_data_buf, length);
-            BambuBus_have_data = length;
+            /* ★ v1.1.31：入队，不再直接覆盖 buf_X（见 rx_queue_push 注释） */
+            rx_queue_push(BambuBus_data_buf, (uint16_t)length);
+            BambuBus_have_data = s_rx_q_count;
             s_485_rx_frames++;                 /* v1.1.25 诊断 */
             s_485_last_rx_ms = millis();
             bus485raw_record(0, BambuBus_data_buf, length);  /* 原始报文记录：打印机发来 */
@@ -568,6 +618,14 @@ static void BambuBus_UART_Poll(void)
 
 void BambuBUS_UART_Init(uint32_t baudrate)
 {
+    /* ★ v1.1.31：RX 环形缓冲 256 → 2048。
+     *
+     * 1.2288Mbps ≈ 154 字节/ms，Arduino 默认 256 字节 ≈ 1.6ms 就填满。
+     * 打印任务开始时打印机会连发一批帧（8 槽位下发 + 逐个查询），
+     * 主循环 2ms 一轮，默认缓冲很容易在两次 poll 之间溢出 → 丢字节 → CRC 错
+     * → 该帧的查询没有应答 → `[0500-40A3]`。
+     * 必须在 begin() **之前**设置才生效。 */
+    RS485.setRxBufferSize(2048);
     RS485.begin(baudrate, SERIAL_8E1, BambuBus_pin_rx, BambuBus_pin_tx);
     pinMode(BambuBus_pin_de, OUTPUT);
     digitalWrite(BambuBus_pin_de, 0);  // 默认接收
@@ -670,6 +728,9 @@ void BambuBus_init()
     }
 
     BambuBUS_UART_Init(1228800);
+
+    /* ★ v1.1.31：启动"耗材信息落盘"后台任务（见 nvs_save_task 注释） */
+    bambubus_nvs_task_start();
 }
 
 // ==================== 包处理辅助函数 ====================
@@ -1616,7 +1677,11 @@ void bambubus_485_stats_reset(void)
     s_485_rx_bytes = s_485_rx_frames = s_485_rx_crc_err = s_485_rx_overflow = 0;
     s_485_tx_402 = s_485_tx_103 = s_485_tx_06 = 0;
     s_485_last_rx_ms = 0;
+    s_485_rx_dropped = 0;      /* ★ v1.1.31 */
 }
+
+/* ★ v1.1.31：队列丢帧计数（正常恒 0） */
+uint32_t bambubus_rx_dropped(void) { return s_485_rx_dropped; }
 
 /* 打印阶段细分查询（v1.1.12）—— 见 BambuBus.h 注释 */
 bool is_channel_before_on_use(int num)
@@ -1642,6 +1707,99 @@ unsigned char get_now_op_num()
     return now_op_num;
 }
 
+// ==================== 耗材信息落盘（★ v1.1.31 移出 485 热路径）====================
+/*
+ * 现场（2026-11-01）：删掉 2 台 AMS 只留 A/B 后，连续发 3 次打印任务，
+ * 前两次报 `[0500-40A3] AMS A 通信异常`，第三次才正常。
+ *
+ * 根因之二（本段）：
+ *   打印机在**打印任务开始时**会给每台 AMS 的每个槽位下发一次耗材信息
+ *   （0xC5 0x08 / 0x05 0x218），而 `send_for_Set_filament()` 里会调
+ *   `Bambubus_set_need_to_save()`；原来 `BambuBus_run()` 末尾**立刻**
+ *   `Bambubus_save()` 同步写 NVS —— 一次 putBytes(≈800B) + end() 提交，
+ *   实测 10~50ms，NVS 页满时还要擦除（擦除期间**两颗核的 flash cache 全停**）。
+ *   8 个槽位连发就是 8 次写，累计上百毫秒 → 这期间 485 一个应答都发不出去
+ *   → 打印机判 AMS A 通信异常。
+ *
+ * 修法：
+ *   ① 485 侧只置一个 dirty 标志（微秒级），**绝不写 flash**
+ *   ② 独立低优先级任务跑在 core 0（485 主循环在 core 1），
+ *      防抖 1.2 秒把这一批合并成**一次**写
+ *   ③ 内容没变就不写（memcmp 快照）—— 打印机重复下发同样内容时不碰 flash
+ *   ④ 记录耗时，`/status` 的 `ams.nvs` 能直接看到最坏值
+ */
+static volatile bool s_save_dirty = false;
+static uint32_t s_nvs_saves = 0;
+static uint32_t s_nvs_save_max_ms = 0;
+static uint32_t s_nvs_save_total_ms = 0;
+static uint32_t s_nvs_skipped = 0;      /* 内容未变而跳过的次数 */
+static uint8_t  s_nvs_snapshot[sizeof(data_save)];
+static bool     s_nvs_snapshot_valid = false;
+static portMUX_TYPE s_data_mux = portMUX_INITIALIZER_UNLOCKED;
+static TaskHandle_t s_nvs_task = NULL;
+
+static void nvs_save_task(void *arg)
+{
+    (void)arg;
+    static flash_save_struct snap;
+
+    for (;;)
+    {
+        if (!s_save_dirty) { vTaskDelay(pdMS_TO_TICKS(200)); continue; }
+
+        /* 防抖：把这一批 set_filament 全部等完，合并成一次写 */
+        vTaskDelay(pdMS_TO_TICKS(1200));
+        if (!s_save_dirty) continue;
+        s_save_dirty = false;
+
+        /* 拷贝期间关中断，避免 485 侧改到一半（约 800B，几十微秒） */
+        portENTER_CRITICAL(&s_data_mux);
+        memcpy(&snap, &data_save, sizeof(snap));
+        portEXIT_CRITICAL(&s_data_mux);
+
+        if (s_nvs_snapshot_valid &&
+            memcmp(s_nvs_snapshot, &snap, sizeof(snap)) == 0) {
+            s_nvs_skipped++;
+            continue;   /* 内容没变，不碰 flash */
+        }
+
+        const uint32_t t0 = millis();
+        s_prefs.begin("s3ams", false);
+        s_prefs.putBytes(FLASH_KEY, &snap, sizeof(snap));
+        s_prefs.end();
+        const uint32_t dt = millis() - t0;
+
+        memcpy(s_nvs_snapshot, &snap, sizeof(snap));
+        s_nvs_snapshot_valid = true;
+        s_nvs_saves++;
+        s_nvs_save_total_ms += dt;
+        if (dt > s_nvs_save_max_ms) s_nvs_save_max_ms = dt;
+
+        /* 只在慢的时候打日志，正常情况不刷屏 */
+        if (dt >= 30) {
+            log_w("NVS 写耗材信息 %uB 用时 %ums（后台任务，已不挡 485）",
+                  (unsigned)sizeof(snap), (unsigned)dt);
+        }
+    }
+}
+
+void bambubus_nvs_task_start(void)
+{
+    if (s_nvs_task != NULL) return;
+    /* core 0 / 优先级 1：远低于 loopTask(core1) 与离合任务，绝不抢 485 的 CPU */
+    xTaskCreatePinnedToCore(nvs_save_task, "nvs_save", 4096, NULL, 1, &s_nvs_task, 0);
+}
+
+void bambubus_nvs_stats(uint32_t *saves, uint32_t *skipped,
+                        uint32_t *max_ms, uint32_t *total_ms, bool *pending)
+{
+    if (saves)    *saves    = s_nvs_saves;
+    if (skipped)  *skipped  = s_nvs_skipped;
+    if (max_ms)   *max_ms   = s_nvs_save_max_ms;
+    if (total_ms) *total_ms = s_nvs_save_total_ms;
+    if (pending)  *pending  = s_save_dirty;
+}
+
 // ==================== 主循环 ====================
 int BambuBus_run()
 {
@@ -1657,10 +1815,18 @@ int BambuBus_run()
         stu = -1;
     }
 
-    if (BambuBus_have_data)
+    /* ★ v1.1.31：把 RX 队列排空再返回。
+     *
+     * 原来这里是 `if (BambuBus_have_data)` 只处理**一帧**，而打印机在打印
+     * 任务开始时会连发多帧 —— 同一次 poll 里收到的第二帧会把第一帧覆盖掉，
+     * 那一帧的查询就永远没有应答（→ `[0500-40A3] AMS A 通信异常`）。
+     * 现在队列里有多少处理多少，最多 RX_QUEUE_DEPTH 帧（队列本身就只有这么深）。 */
+    int processed = 0;
+    while (s_rx_q_count > 0 && processed < RX_QUEUE_DEPTH)
     {
-        int data_length = BambuBus_have_data;
-        BambuBus_have_data = 0;
+        const int data_length = rx_queue_pop(buf_X, sizeof(buf_X));
+        if (data_length <= 0) break;
+        processed++;
         stu = 1;
         time_set = timex + 1000;
 
@@ -1701,11 +1867,15 @@ int BambuBus_run()
             break;
         }
     }
+    BambuBus_have_data = s_rx_q_count;
 
+    /* ★ v1.1.31：只置脏标志，**绝不在这里写 flash**
+     * （原来这里同步 Bambubus_save()，一次 10~50ms，8 个槽位连发上百毫秒，
+     *   期间 485 完全不应答 —— 见 nvs_save_task 的注释） */
     if (Bambubus_need_to_save)
     {
-        Bambubus_save();
         Bambubus_need_to_save = false;
+        s_save_dirty = true;
     }
 
     return stu;

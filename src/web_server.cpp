@@ -258,7 +258,7 @@ void web_log_install_hook(void)
 }
 
 /* App 版本 */
-static const char *APP_VERSION = "1.1.30-s3ams";
+static const char *APP_VERSION = "1.1.31-s3ams";
 
 /* 单 IO 双微动：每路一个 ADC 脚（开始位/停止位共用同一脚，电阻编码） */
 static const int BOARD_SENSOR_PINS[BOARD_CHANNEL_COUNT] = BOARD_PIN_SENSOR_ARRAY;
@@ -652,11 +652,30 @@ static void handle_status(void)
                 ",\"rx_frames\":" + String((unsigned long)rf) +
                 ",\"crc_err\":" + String((unsigned long)ce) +
                 ",\"overflow\":" + String((unsigned long)ov) +
+                ",\"rx_dropped\":" + String((unsigned long)bambubus_rx_dropped()) +
                 ",\"tx_402\":" + String((unsigned long)t402) +
                 ",\"tx_103\":" + String((unsigned long)t103) +
                 ",\"tx_06\":" + String((unsigned long)t06) +
                 ",\"last_rx_age_ms\":" + String(age) +
                 ",\"loop_max_gap_ms\":" + String((unsigned long)amcu_loop_max_gap_ms()) + "}";
+    }
+
+    /* ★ v1.1.31：耗材信息落盘统计
+     *   saves   真正写 flash 次数
+     *   skipped 内容未变跳过次数
+     *   max_ms  单次写最坏耗时（>100ms 说明赶上 NVS 页擦除）
+     *   pending 是否还有待写数据
+     * 这一段的意义：验证"打印机下发耗材信息导致 NVS 写阻塞 485"这条假设。
+     * 如果 max_ms 动辄 50~200ms，那 40A3 就是它造成的（v1.1.31 已挪到后台任务）。 */
+    {
+        uint32_t ns = 0, nk = 0, nmax = 0, ntot = 0;
+        bool npend = false;
+        bambubus_nvs_stats(&ns, &nk, &nmax, &ntot, &npend);
+        json += "\"nvs\":{\"saves\":" + String((unsigned long)ns) +
+                ",\"skipped\":" + String((unsigned long)nk) +
+                ",\"max_ms\":" + String((unsigned long)nmax) +
+                ",\"total_ms\":" + String((unsigned long)ntot) +
+                ",\"pending\":" + String(npend ? 1 : 0) + "},";
     }
     json += "},";
 

@@ -100,6 +100,19 @@ extern void bambubus_485_stats(uint32_t *rx_bytes, uint32_t *rx_frames, uint32_t
                                uint32_t *tx_06, uint32_t *last_rx_ms);
 extern void bambubus_485_stats_reset(void);
 
+/* ★ v1.1.31：RX 帧队列丢帧数（队列满 / 帧过长）
+ * 正常应该恒为 0。持续增长说明打印机的突发比我们排空得快。 */
+extern uint32_t bambubus_rx_dropped(void);
+
+/* ★ v1.1.31：耗材信息落盘统计（NVS 写已移到后台任务）
+ *   saves    —— 真正写 flash 的次数
+ *   skipped  —— 内容未变而跳过的次数
+ *   max_ms   —— 单次写的最坏耗时（>100ms 说明 NVS 页在擦除）
+ *   pending  —— 是否还有待写数据 */
+extern void bambubus_nvs_stats(uint32_t *saves, uint32_t *skipped,
+                               uint32_t *max_ms, uint32_t *total_ms, bool *pending);
+extern void bambubus_nvs_task_start(void);
+
 /* 打印阶段细分查询（v1.1.12）。
  *
  * 为什么需要：map_internal_to_api() 把 before_on_use / on_use / stop_on_use
