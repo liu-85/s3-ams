@@ -4,6 +4,11 @@
 #include "settings_storage.h"
 #include <Preferences.h>
 
+/* ★ v1.1.34：改 AMS 台数后要立刻重写 16 个料位的 statu（定义在 BambuBus.cpp）。
+ * 注意必须写 extern "C" —— BambuBus.h 整个头文件包在 extern "C" 里，
+ * 这里若用 C++ 链接会报 undefined reference。 */
+extern "C" void bambubus_apply_ams_count(void);
+
 // 外部变量定义
 int PULLBACK_TIMEOUT[16];
 int SLEEP_TIMEOUT_MIN;
@@ -103,6 +108,24 @@ int settings_set_idle_timeout(int sec) {
 
 int settings_get_idle_timeout(void) {
     return IDLE_TIMEOUT_SEC;
+}
+
+/* ★ v1.1.34：AMS 台数（2~4），改完立即生效。
+ *
+ * 为什么要可调：2026-11-01 实测，只报 2 台时打印机会在 485 上每秒一次
+ * 反复探测台 2/台 3（`ams.qdrop[7]` 涨到 1900+），并发打印任务时报 40A3；
+ * 而 v1.1.20 报 4 台时打印正常。留个开关，现场可以自己二选一。
+ * 存 SettingsData.ams_count（已有字段，不用改结构体 → 不会让老配置失效）。 */
+int settings_set_ams_count(int n) {
+    if (n < 1 || n > MAX_AMS_COUNT) return -1;
+    AMS_COUNT = n;
+    bambubus_apply_ams_count();   /* 立即重写 16 个料位的 statu */
+    settings_save_to_flash();
+    return AMS_COUNT;
+}
+
+int settings_get_ams_count(void) {
+    return AMS_COUNT;
 }
 
 void settings_storage_init() {

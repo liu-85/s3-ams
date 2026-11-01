@@ -258,7 +258,7 @@ void web_log_install_hook(void)
 }
 
 /* App 版本 */
-static const char *APP_VERSION = "1.1.33-s3ams";
+static const char *APP_VERSION = "1.1.34-s3ams";
 
 /* 单 IO 双微动：每路一个 ADC 脚（开始位/停止位共用同一脚，电阻编码） */
 static const int BOARD_SENSOR_PINS[BOARD_CHANNEL_COUNT] = BOARD_PIN_SENSOR_ARRAY;
@@ -647,6 +647,8 @@ static void handle_status(void)
     json += "\"feed_timeout\":" + String(settings_get_feed_timeout()) + ",";
     /* v1.1.29：双微动失效停机保护（秒，0=关闭） */
     json += "\"idle_timeout\":" + String(settings_get_idle_timeout()) + ",";
+    /* v1.1.34：AMS 台数（2 = 只报 A/B，4 = 连幽灵 C/D 一起报） */
+    json += "\"ams_count\":" + String(settings_get_ams_count()) + ",";
     json += "\"current_access\":" + String((cur >= 0) ? (cur + 1) : 0) + ",";
     /* v1.1.20：通道映射 + 颜色（网页「通道设置」用；之前完全没输出） */
     json += "\"access_list\":[";
@@ -1625,6 +1627,37 @@ static void handle_ams_ver_set(void)
  * 现场需求："在打印过程中如果两个都不触发，超过多少秒就停机保护"。
  * 缓冲器半满时"两个都不触发"是正常中间态，所以默认给 60 秒。
  * 填 0 = 关闭该保护。 */
+/* ★ v1.1.34：AMS 台数（1~4）。
+ *
+ * 现场背景：只报 2 台时打印机会在 485 上每秒一次反复探测台 2/台 3
+ * （`ams.qdrop[7]` 涨到 1900+），并发打印任务时报 40A3；
+ * v1.1.20 报 4 台时打印正常。留个开关让现场自己二选一。 */
+static void handle_ams_count_set(void)
+{
+    if (!server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"ok\":false,\"err\":\"no body\"}");
+        return;
+    }
+    String body = server.arg("plain");
+    long n = 0;
+    if (!json_get_int(body, "count", &n)) {
+        server.send(400, "application/json", "{\"ok\":false,\"err\":\"缺少 count\"}");
+        return;
+    }
+    int saved = settings_set_ams_count((int)n);
+    if (saved < 0) {
+        server.send(200, "application/json",
+            "{\"ok\":false,\"info\":\"AMS 台数需在 1~4 之间\"}");
+        return;
+    }
+    char msg[160];
+    snprintf(msg, sizeof(msg),
+             "{\"ok\":true,\"count\":%d,\"info\":\"AMS 台数已改为 %d（%s），已立即生效\"}",
+             saved, saved,
+             saved <= 2 ? "耗材页只显示 A/B" : "耗材页会出现空的 C/D 卡片");
+    server.send(200, "application/json", msg);
+}
+
 static void handle_idle_timeout_set(void)
 {
     if (!server.hasArg("plain")) {
@@ -1875,6 +1908,7 @@ void web_server_start(void)
     server.on("/feed_pwm_set", HTTP_POST, handle_feed_pwm_set);   /* v1.1.26 */
     server.on("/feed_timeout_set", HTTP_POST, handle_feed_timeout_set);  /* v1.1.27 */
     server.on("/idle_timeout_set", HTTP_POST, handle_idle_timeout_set);  /* v1.1.29 */
+    server.on("/ams_count_set", HTTP_POST, handle_ams_count_set);        /* v1.1.34 */
     server.on("/assist_set", HTTP_POST, handle_ok);
     server.on("/retract_set", HTTP_POST, handle_ok);
     server.on("/temper_set", HTTP_POST, handle_ok);

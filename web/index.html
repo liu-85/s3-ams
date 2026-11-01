@@ -443,6 +443,21 @@
             <span style="align-self:center" class="dim">秒 双失效保护</span>
             <button class="primary" style="flex:1" id="btn_idle_timeout_save">保存双失效保护</button>
           </div>
+          <div class="row" style="margin-top:10px">
+            <input type="number" id="ams_count" min="1" max="4" step="1" value="2">
+            <span style="align-self:center" class="dim">台 AMS</span>
+            <button class="primary" style="flex:1" id="btn_ams_count_save">保存 AMS 台数</button>
+          </div>
+          <div class="tip">
+            <b>AMS 台数</b>：本板 8 个通道 ÷ 4 料位 = <b>2 台</b>（A/B），默认 2。
+            <div class="hr"></div>
+            但 2026-11-01 实测：只报 2 台时，打印机在 485 上<b>每秒一次</b>反复探测
+            「台 2 / 台 3 在不在」（<code>/status</code> 的 <code>ams.qdrop[7]</code> 会涨到
+            1900+），发打印任务时容易报 <code>[0500-40A3] AMS A 通信异常</code>；
+            而报 <b>4 台</b>时打印正常（v1.1.20 的行为），代价是耗材页会多出两张空的
+            AMS-C / AMS-D 卡片。<br>
+            <b>遇到 40A3 就改成 4 试一次</b>，改完立即生效、不用重启。
+          </div>
           <div class="tip">
             <b>上面是速度，下面是保险</b>：微动触发补料时的电机 PWM，默认 <b>100%</b>。
             改完立即生效并写入 NVS，重启不丢。

@@ -532,6 +532,10 @@
         if (typeof d.idle_timeout === 'number' && d.idle_timeout >= 0) {
             syncIdleTimeoutInput(d.idle_timeout);
         }
+        /* ---- AMS 台数（v1.1.34） ---- */
+        if (typeof d.ams_count === 'number' && d.ams_count > 0) {
+            syncAmsCountInput(d.ams_count);
+        }
 
         /* ---- 硬件 ---- */
         updateHardware(d.hardware);
@@ -1804,6 +1808,27 @@
         });
     }
 
+    /* ---- AMS 台数（v1.1.34）---- */
+    function syncAmsCountInput(n) {
+        var el = $('ams_count');
+        if (el && document.activeElement !== el) {
+            var s = String(n);
+            if (el.value !== s) el.value = s;
+        }
+    }
+
+    function saveAmsCount() {
+        var v = parseInt(val('ams_count'), 10);
+        if (isNaN(v) || v < 1 || v > 4) {
+            toast('AMS 台数请在 1~4 之间（本板实际 2 台）', 'bad');
+            return;
+        }
+        post('/ams_count_set', { count: v }, function (d) {
+            if (d && typeof d.count === 'number') syncAmsCountInput(d.count);
+            toast((d && d.info) || '已保存', (d && d.ok) ? 'ok' : 'bad');
+        });
+    }
+
     /* =======================================================================
        蠕动参数
        ======================================================================= */
@@ -2574,6 +2599,7 @@
         $('btn_feed_pwm_save').onclick = saveFeedPwm;
         $('btn_feed_timeout_save').onclick = saveFeedTimeout;
         $('btn_idle_timeout_save').onclick = saveIdleTimeout;
+        $('btn_ams_count_save').onclick = saveAmsCount;
         $('btn_creep_save').onclick = saveCreep;
         $('btn_assist_toggle').onclick = toggleAssist;
         $('btn_assist_hold').onclick = toggleAssistHold;

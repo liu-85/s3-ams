@@ -31,12 +31,18 @@ struct SettingsData {
 #define DEFAULT_PULLBACK_TIMEOUT    4
 #define DEFAULT_SLEEP_TIMEOUT_MIN   15
 #define DEFAULT_SCREEN_ALWAYS_ON    0
-/* ★ v1.1.21：AMS 台数上限 2（AMS-A + AMS-B，共 8 料位）。
+/* AMS 台数（WEB 可改，2~4）
  *
- * 本板 8 个物理通道 ÷ 每台 4 料位 = 2 台。原来写 4 会让打印机看到
- * AMS-C / AMS-D 两台"幽灵 AMS"（没有任何物理通道），耗材页出现
- * 重复卡片。改成 2 后 0x05 注册、0x402 序列号、0x103 版本都只报 A/B。 */
-#define MAX_AMS_COUNT             2
+ * 本板 8 个物理通道 ÷ 每台 4 料位 = 2 台，所以默认 2（AMS-A + AMS-B）。
+ * 但 2026-11-01 实测发现：只报 2 台时，打印机在 485 上**每秒一次**地
+ * 反复探测"台 2 / 台 3 在不在"（`/status` 的 `ams.qdrop[7]` 涨到 1900+），
+ * 并发打印任务时报 `[0500-40A3]`；而 v1.1.20 报 4 台时打印正常。
+ *
+ * 所以上限放到 4，让现场可以二选一：
+ *   2 = 耗材页干净（只有 A/B），但打印机可能一直探测幽灵台
+ *   4 = 耗材页多出空的 AMS-C/D 卡片，但和 v1.1.20 行为一致（实测能打印）
+ * 改完立即生效（重新写 16 个料位的 statu），不需要重启。 */
+#define MAX_AMS_COUNT             4
 #define DEFAULT_AMS_COUNT         2
 
 /* ★ v1.1.26：自动送料（微动缓冲送料）的电机 PWM 百分比，WEB 可调。
@@ -124,3 +130,8 @@ int settings_get_feed_timeout(void);
 /* ★ v1.1.29：双微动失效停机保护（秒，0=关闭，范围 0~600） */
 int settings_set_idle_timeout(int sec);
 int settings_get_idle_timeout(void);
+
+/* ★ v1.1.34：AMS 台数（1~4，默认 2）。改完立即生效，返回实际值，-1 = 参数非法。
+ * 现场用法：报 40A3 时试着改成 4（= v1.1.20 的行为），看是否恢复。 */
+int settings_set_ams_count(int n);
+int settings_get_ams_count(void);

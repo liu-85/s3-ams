@@ -738,6 +738,21 @@ void BambuBus_init()
     bambubus_nvs_task_start();
 }
 
+/* ★ v1.1.34：按当前 AMS_COUNT 重写 16 个料位的 statu。
+ * WEB 改「AMS 台数」后调用，立即生效，不用重启。 */
+void bambubus_apply_ams_count(void)
+{
+    for (int a = 0; a < 4; a++) {
+        for (int j = 0; j < 4; j++) {
+            data_save.filament[a][j].statu =
+                (a < AMS_COUNT) ? online : offline;
+        }
+    }
+    for (int i = 0; i < 4; i++) have_registered[i] = false;
+    log_i("AMS 台数已改为 %d（%s），已重写 16 个料位状态",
+          AMS_COUNT, (AMS_COUNT <= 2) ? "耗材页只有 A/B" : "耗材页会出现空的 C/D");
+}
+
 // ==================== 包处理辅助函数 ====================
 bool package_check_crc16(uint8_t *data, int data_length)
 {
@@ -911,6 +926,19 @@ package_type get_packge_type(unsigned char *buf, int length)
         case 0x402:
             return BambuBus_long_package_version;
         default:
+            /* ★ v1.1.34：未实现的长包类型，记下来。
+             * 2026-11-01 实测打印机在空闲时反复发 0x411 / 0x23C / 0x237，
+             * 我们一律不应答 —— 如果它们是"查询"，这就是 40A3 的来源。
+             * 先只记日志（3 秒限流），确认后再决定要不要回。 */
+            {
+                static uint32_t s_unk_last_ms = 0;
+                if (millis() - s_unk_last_ms > 3000) {
+                    s_unk_last_ms = millis();
+                    log_w("485 收到未实现的长包类型 0x%03X（payload %d 字节），未应答",
+                          (unsigned)printer_data_long.type,
+                          (int)(printer_data_long.data_length));
+                }
+            }
             return BambuBus_package_ETC;
         }
     }

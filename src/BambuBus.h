@@ -118,6 +118,10 @@ extern uint32_t bambubus_rx_dropped(void);
 extern void bambubus_query_stats(uint16_t out_unit[4][8], uint16_t out_drop[8]);
 extern void bambubus_query_stats_reset(void);
 
+/* ★ v1.1.34：按当前 AMS_COUNT 重写 16 个料位的 online/offline。
+ * WEB 改「AMS 台数」后调用，立即生效（不需要重启）。 */
+extern void bambubus_apply_ams_count(void);
+
 /* ★ v1.1.31：耗材信息落盘统计（NVS 写已移到后台任务）
  *   saves    —— 真正写 flash 的次数
  *   skipped  —— 内容未变而跳过的次数

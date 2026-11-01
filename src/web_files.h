@@ -2,7 +2,7 @@
 #pragma once
 #include <Arduino.h>
 
-// 来源: web/index.html  (39373 字节)
+// 来源: web/index.html  (40186 字节)
 static const char *WEB_INDEX_HTML =
   "<!DOCTYPE html>\n"
 "<html lang=\"zh-CN\">\n"
@@ -448,6 +448,21 @@ static const char *WEB_INDEX_HTML =
 "            <input type=\"number\" id=\"idle_timeout\" min=\"0\" max=\"600\" step=\"10\" value=\"60\">\n"
 "            <span style=\"align-self:center\" class=\"dim\">秒 双失效保护</span>\n"
 "            <button class=\"primary\" style=\"flex:1\" id=\"btn_idle_timeout_save\">保存双失效保护</button>\n"
+"          </div>\n"
+"          <div class=\"row\" style=\"margin-top:10px\">\n"
+"            <input type=\"number\" id=\"ams_count\" min=\"1\" max=\"4\" step=\"1\" value=\"2\">\n"
+"            <span style=\"align-self:center\" class=\"dim\">台 AMS</span>\n"
+"            <button class=\"primary\" style=\"flex:1\" id=\"btn_ams_count_save\">保存 AMS 台数</button>\n"
+"          </div>\n"
+"          <div class=\"tip\">\n"
+"            <b>AMS 台数</b>：本板 8 个通道 ÷ 4 料位 = <b>2 台</b>（A/B），默认 2。\n"
+"            <div class=\"hr\"></div>\n"
+"            但 2026-11-01 实测：只报 2 台时，打印机在 485 上<b>每秒一次</b>反复探测\n"
+"            「台 2 / 台 3 在不在」（<code>/status</code> 的 <code>ams.qdrop[7]</code> 会涨到\n"
+"            1900+），发打印任务时容易报 <code>[0500-40A3] AMS A 通信异常</code>；\n"
+"            而报 <b>4 台</b>时打印正常（v1.1.20 的行为），代价是耗材页会多出两张空的\n"
+"            AMS-C / AMS-D 卡片。<br>\n"
+"            <b>遇到 40A3 就改成 4 试一次</b>，改完立即生效、不用重启。\n"
 "          </div>\n"
 "          <div class=\"tip\">\n"
 "            <b>上面是速度，下面是保险</b>：微动触发补料时的电机 PWM，默认 <b>100%</b>。\n"
@@ -1522,7 +1537,7 @@ static const char *WEB_STYLE_CSS =
 "}\n"
 "";
 
-// 来源: web/app.js  (104527 字节)
+// 来源: web/app.js  (105425 字节)
 static const char *WEB_APP_JS =
   "/* ===========================================================================\n"
 "   ESP-AMS-S3 配置界面前端\n"
@@ -2057,6 +2072,10 @@ static const char *WEB_APP_JS =
 "        /* ---- 双微动失效保护（v1.1.29，0 = 关闭，所以不能用 > 0 判断） ---- */\n"
 "        if (typeof d.idle_timeout === 'number' && d.idle_timeout >= 0) {\n"
 "            syncIdleTimeoutInput(d.idle_timeout);\n"
+"        }\n"
+"        /* ---- AMS 台数（v1.1.34） ---- */\n"
+"        if (typeof d.ams_count === 'number' && d.ams_count > 0) {\n"
+"            syncAmsCountInput(d.ams_count);\n"
 "        }\n"
 "\n"
 "        /* ---- 硬件 ---- */\n"
@@ -3330,6 +3349,27 @@ static const char *WEB_APP_JS =
 "        });\n"
 "    }\n"
 "\n"
+"    /* ---- AMS 台数（v1.1.34）---- */\n"
+"    function syncAmsCountInput(n) {\n"
+"        var el = $('ams_count');\n"
+"        if (el && document.activeElement !== el) {\n"
+"            var s = String(n);\n"
+"            if (el.value !== s) el.value = s;\n"
+"        }\n"
+"    }\n"
+"\n"
+"    function saveAmsCount() {\n"
+"        var v = parseInt(val('ams_count'), 10);\n"
+"        if (isNaN(v) || v < 1 || v > 4) {\n"
+"            toast('AMS 台数请在 1~4 之间（本板实际 2 台）', 'bad');\n"
+"            return;\n"
+"        }\n"
+"        post('/ams_count_set', { count: v }, function (d) {\n"
+"            if (d && typeof d.count === 'number') syncAmsCountInput(d.count);\n"
+"            toast((d && d.info) || '已保存', (d && d.ok) ? 'ok' : 'bad');\n"
+"        });\n"
+"    }\n"
+"\n"
 "    /* =======================================================================\n"
 "       蠕动参数\n"
 "       ======================================================================= */\n"
@@ -4100,6 +4140,7 @@ static const char *WEB_APP_JS =
 "        $('btn_feed_pwm_save').onclick = saveFeedPwm;\n"
 "        $('btn_feed_timeout_save').onclick = saveFeedTimeout;\n"
 "        $('btn_idle_timeout_save').onclick = saveIdleTimeout;\n"
+"        $('btn_ams_count_save').onclick = saveAmsCount;\n"
 "        $('btn_creep_save').onclick = saveCreep;\n"
 "        $('btn_assist_toggle').onclick = toggleAssist;\n"
 "        $('btn_assist_hold').onclick = toggleAssistHold;\n"
