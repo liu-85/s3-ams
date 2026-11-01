@@ -258,7 +258,7 @@ void web_log_install_hook(void)
 }
 
 /* App 版本 */
-static const char *APP_VERSION = "1.1.44-s3ams";
+static const char *APP_VERSION = "1.1.45-s3ams";
 
 /* 单 IO 双微动：每路一个 ADC 脚（开始位/停止位共用同一脚，电阻编码） */
 static const int BOARD_SENSOR_PINS[BOARD_CHANNEL_COUNT] = BOARD_PIN_SENSOR_ARRAY;
@@ -733,6 +733,19 @@ static void handle_status(void)
                 ",\"over5\":" + String((unsigned long)l5) +
                 ",\"over20\":" + String((unsigned long)l20) +
                 ",\"over100\":" + String((unsigned long)l100) + "}";
+    }
+
+    /* ★ v1.1.45：帧解析异常 + UART 积压峰值
+     *
+     *   bad_len  长度字段非法 → 复位解析器的次数。
+     *            **只要涨，就说明总线上真的丢过字节**（丢字节把 length 读坏了）。
+     *   peak     单次 poll 时 UART 环形缓冲里的最大积压字节数。
+     *            接近 8192 = 主循环被堵住，字节正在被 UART 驱动丢掉。 */
+    {
+        uint32_t bl = 0, pk = 0;
+        bambubus_485_frame_stats(&bl, &pk);
+        json += ",\"frame\":{\"bad_len\":" + String((unsigned long)bl) +
+                ",\"peak\":" + String((unsigned long)pk) + "}";
     }
 
     /* ★ v1.1.33：打印机查询统计（按台号 × 包类型）

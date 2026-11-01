@@ -549,6 +549,10 @@ static uint32_t s_485_lat_over5   = 0;   /* 延迟 > 5ms 的应答次数 */
 static uint32_t s_485_lat_over20  = 0;   /* 延迟 > 20ms */
 static uint32_t s_485_lat_over100 = 0;   /* 延迟 > 100ms */
 
+/* ★ v1.1.45：帧解析异常计数 + UART 积压峰值（见 RX_IRQ 注释） */
+static uint32_t s_485_bad_len    = 0;   /* 长度字段非法 → 复位解析器的次数 */
+static uint32_t s_485_rx_peak    = 0;   /* 单次 poll 时 UART 环形缓冲里的最大积压字节数 */
+
 static bool rx_queue_push(const uint8_t *data, uint16_t len)
 {
     if (len == 0 || len > RX_FRAME_MAX) {
@@ -637,82 +641,146 @@ static uint32_t s_485_last_rx_ms  = 0;  /* 最近一次成功收帧的时刻 */
  * 不是这个思路错。现在改成看"最后一个字节"的时刻。 */
 static uint32_t s_485_last_byte_ms = 0;
 
-/* 单字节协议解析（原 RX_IRQ 逻辑，改为函数调用） */
+/* ==========================================================================
+ * 帧解析器（单字节状态机）
+ *
+ * ★ v1.1.45：按 BMCU-U 的 `src/printer_rx_framer.cpp` 加固。
+ *
+ * 原来的三个缺陷，每一个都会把"偶发丢一个字节"放大成"连续十几帧全丢"：
+ *
+ *   ① **长包长度只取 `buf[4]`，丢掉了 `buf[5]` 高字节。**
+ *      协议里 `package_length` 是 uint16 小端（见 `long_packge_data`：
+ *      `uint16_t package_number; uint16_t package_length; uint8_t crc8; ...`
+ *      从 buf[2] 开始 memcpy 11 字节，所以长度跨 buf[4..5]）。
+ *      BMCU-U 写的是 `header_[4] | (header_[5] << 8)`，我们原来只有低字节。
+ *
+ *   ② **长度字段没有合法性检查。** 丢一个字节就会把 length 读成 0~6 或 200+：
+ *        · length 很小 → 立刻判"收帧完成"，交出一个垃圾帧，
+ *          还可能触发一条垃圾应答发到总线上（进一步污染总线）；
+ *        · length 很大 → 一直吞字节，最多吞到 999 才复位
+ *          —— **一次丢字节能连带毁掉后面十几帧**。
+ *      BMCU-U 的做法：`expected_length_ <= crc8_index_ || > kMaxFrameLength`
+ *      就立刻 `reset()`，不等收完。
+ *
+ *   ③ **没有半帧超时。** 错位之后如果等不到 0x3D，就一直挂在半帧状态。
+ *
+ * 三条叠加就是"偶发 40A3"的放大器：
+ *   主循环卡一下 → UART 环形缓冲溢出丢几个字节 → 解析器错位
+ *   → 后续十几帧全部报废 → 打印机那几帧查询没人应答 → `[0500-40A3]`。
+ *   而本地统计里 `crc_err` / `qdrop` 都是 0（我们压根没收到那些帧）。
+ *
+ * 顺带：原来 `_index >= 999` 那个保护跟"UART 溢出"毫无关系，
+ * 所以现场一直看到 `overflow=0` —— 又一个诊断盲区。
+ * ========================================================================== */
+#define RX_FRAME_TIMEOUT_MS 20    /* 一帧最多允许收 20ms（最长帧 ~2ms） */
+
+static int      s_rx_index   = 0;    /* 当前帧已收字节数，0 = 等帧头 */
+static uint16_t s_rx_expect  = 0;    /* 本帧总长度 */
+static uint8_t  s_rx_len_idx = 4;    /* 长度字段所在下标 */
+static uint8_t  s_rx_crc_idx = 6;    /* 头 CRC8 所在下标 */
+static uint32_t s_rx_t0      = 0;    /* 帧头到达时刻（半帧超时用） */
+
 static void RX_IRQ(unsigned char data)
 {
-    static int _index = 0;
-    static int length = 500;
-    static uint8_t data_length_index;
-    static uint8_t data_CRC8_index;
+    const uint32_t now = millis();
 
-    if (_index == 0)
+    /* ③ 半帧超时：错位后不会一直挂着 */
+    if (s_rx_index > 0 && (uint32_t)(now - s_rx_t0) > RX_FRAME_TIMEOUT_MS)
     {
-        if (data == 0x3D)
-        {
-            BambuBus_data_buf[0] = 0x3D;
-            _RX_IRQ_crcx.restart();
-            _RX_IRQ_crcx.add(0x3D);
-            data_length_index = 4;
-            length = data_CRC8_index = 6;
-            _index = 1;
-        }
+        s_485_rx_overflow++;
+        s_rx_index = 0;
+    }
+
+    if (s_rx_index == 0)
+    {
+        if (data != 0x3D) return;
+        BambuBus_data_buf[0] = 0x3D;
+        _RX_IRQ_crcx.restart();
+        _RX_IRQ_crcx.add(0x3D);
+        s_rx_len_idx = 4;
+        s_rx_crc_idx = 6;
+        s_rx_expect  = 0;
+        s_rx_t0      = now;
+        s_rx_index   = 1;
         return;
     }
-    else
+
+    /* 保险：绝不允许写出缓冲区 */
+    if (s_rx_index >= (int)sizeof(BambuBus_data_buf))
     {
-        BambuBus_data_buf[_index] = data;
-        if (_index == 1)
+        s_485_rx_overflow++;
+        s_rx_index = 0;
+        return;
+    }
+
+    BambuBus_data_buf[s_rx_index] = data;
+
+    /* 第 2 个字节决定是短包（buf[1] 带 0x80）还是长包 */
+    if (s_rx_index == 1)
+    {
+        if (data & 0x80) { s_rx_len_idx = 2; s_rx_crc_idx = 3; }
+        else             { s_rx_len_idx = 4; s_rx_crc_idx = 6; }
+    }
+
+    if (s_rx_index < s_rx_crc_idx) _RX_IRQ_crcx.add(data);
+
+    /* ① 长度字段：短包单字节，长包 16 位小端 */
+    if (s_rx_index == s_rx_len_idx)
+    {
+        s_rx_expect = data;
+    }
+    else if (s_rx_len_idx == 4 && s_rx_index == 5)
+    {
+        s_rx_expect = (uint16_t)(s_rx_expect | ((uint16_t)data << 8));
+    }
+
+    /* ② 长度一到齐就检查合法性，不等收完 */
+    {
+        const uint8_t full_idx = (s_rx_len_idx == 4) ? 5 : 2;
+        if (s_rx_index == full_idx)
         {
-            if (data & 0x80)
+            if (s_rx_expect <= s_rx_crc_idx || s_rx_expect > RX_FRAME_MAX)
             {
-                data_length_index = 2;
-                data_CRC8_index = 3;
-            }
-            else
-            {
-                data_length_index = 4;
-                data_CRC8_index = 6;
-            }
-        }
-        if (_index == data_length_index)
-        {
-            length = data;
-        }
-        if (_index < data_CRC8_index)
-        {
-            _RX_IRQ_crcx.add(data);
-        }
-        else if (_index == data_CRC8_index)
-        {
-            if (data != _RX_IRQ_crcx.calc())
-            {
-                s_485_rx_crc_err++;   /* v1.1.25 诊断 */
-                _index = 0;
+                s_485_bad_len++;
+                s_rx_index = 0;   /* 立刻复位，重新找 0x3D */
                 return;
             }
         }
-        ++_index;
-        if (_index >= length)
+    }
+
+    if (s_rx_index == s_rx_crc_idx)
+    {
+        if (data != _RX_IRQ_crcx.calc())
         {
-            _index = 0;
-            /* ★ v1.1.31：入队，不再直接覆盖 buf_X（见 rx_queue_push 注释） */
-            rx_queue_push(BambuBus_data_buf, (uint16_t)length);
-            BambuBus_have_data = s_rx_q_count;
-            s_485_rx_frames++;                 /* v1.1.25 诊断 */
-            s_485_last_rx_ms = millis();
-            bus485raw_record(0, BambuBus_data_buf, length);  /* 原始报文记录：打印机发来 */
+            s_485_rx_crc_err++;   /* v1.1.25 诊断 */
+            s_rx_index = 0;
+            return;
         }
-        if (_index >= 999)
-        {
-            s_485_rx_overflow++;               /* v1.1.25 诊断 */
-            _index = 0;
-        }
+    }
+
+    s_rx_index++;
+
+    if (s_rx_index >= (int)s_rx_expect)
+    {
+        const uint16_t len = s_rx_expect;
+        s_rx_index = 0;
+        /* ★ v1.1.31：入队，不再直接覆盖 buf_X（见 rx_queue_push 注释） */
+        rx_queue_push(BambuBus_data_buf, len);
+        BambuBus_have_data = s_rx_q_count;
+        s_485_rx_frames++;                 /* v1.1.25 诊断 */
+        s_485_last_rx_ms = now;
+        bus485raw_record(0, BambuBus_data_buf, len);  /* 原始报文记录：打印机发来 */
     }
 }
 
 /* 从 UART 缓冲区读取并喂给协议解析器 */
 static void BambuBus_UART_Poll(void)
 {
+    /* ★ v1.1.45：记录积压峰值。这是"主循环是不是被堵住了"最直接的证据 ——
+     * 一旦接近 RX 缓冲大小，就说明有字节被 UART 驱动丢掉了。 */
+    const int avail = RS485.available();
+    if (avail > 0 && (uint32_t)avail > s_485_rx_peak) s_485_rx_peak = (uint32_t)avail;
+
     while (RS485.available() > 0)
     {
         unsigned char x = RS485.read();
@@ -724,22 +792,25 @@ static void BambuBus_UART_Poll(void)
 
 void BambuBUS_UART_Init(uint32_t baudrate)
 {
-    /* ★ v1.1.31：RX 环形缓冲 256 → 2048。
+    /* 历史（v1.1.31 → v1.1.39）：
+     *   v1.1.31 曾把 256 提到 2048；v1.1.39 又把它做成兼容位 bit5（默认关 = 256），
+     *   理由是"现场确认 v1.1.29（256）能打印、v1.1.38（2048）不能"。
+     *   **那个结论是错的**：v1.1.41（256）后来也照样报 40A3，
+     *   说明能不能打印跟这一位无关，是概率问题。真正的原因见下面 v1.1.45。 */
+    /* ★ v1.1.45（修正）：默认退回 256（= v1.1.29 / v1.1.41 证明能发现 AMS 的行为）。
      *
-     * 1.2288Mbps ≈ 154 字节/ms，Arduino 默认 256 字节 ≈ 1.6ms 就填满。
-     * 打印任务开始时打印机会连发一批帧（8 槽位下发 + 逐个查询），
-     * 主循环 2ms 一轮，默认缓冲很容易在两次 poll 之间溢出 → 丢字节 → CRC 错
-     * → 该帧的查询没有应答 → `[0500-40A3]`。
-     * 必须在 begin() **之前**设置才生效。
+     * v1.1.45 初版把这里默认改成 8192，结果刷入后打印机里 AMS 不显示
+     * （设备发现失败）。复盘：大缓冲本身不会丢帧，但为了避免任何变量、
+     * 优先恢复「最后确认能发现并正常打印」的 256 行为。
      *
-     * ★ v1.1.39：改成受 COMPAT_RX_BIGBUF 控制，默认关 = v1.1.29 的默认 256。
-     * 现场已确认 v1.1.29（256）能打印、v1.1.38（2048）不能，
-     * 所以这一位也要能被排除掉。改完必须重启才生效（begin 只跑一次）。 */
+     * 8192 仍保留为 A/B 对照 —— 打开兼容位 bit5 才用（用来验证
+     * "RX 溢出丢字节→40A3" 这个假设到底成不成立）。 */
     if (bambubus_compat_get() & COMPAT_RX_BIGBUF) {
-        RS485.setRxBufferSize(2048);
-        log_i("485 RX 缓冲 = 2048（兼容位 bit5 打开）");
+        RS485.setRxBufferSize(8192);
+        log_i("485 RX 缓冲 = 8192（兼容位 bit5 打开，BMCU-U 假设对照）");
     } else {
-        log_i("485 RX 缓冲 = 默认 256（兼容位 bit5 关闭，= v1.1.29 行为）");
+        RS485.setRxBufferSize(256);
+        log_i("485 RX 缓冲 = 256（v1.1.45 默认 = v1.1.29 证明可用）");
     }
     RS485.begin(baudrate, SERIAL_8E1, BambuBus_pin_rx, BambuBus_pin_tx);
     pinMode(BambuBus_pin_de, OUTPUT);
@@ -2104,6 +2175,9 @@ void bambubus_485_stats_reset(void)
     s_485_rx_dropped = 0;      /* ★ v1.1.31 */
     s_485_lat_max_ms = 0;      /* ★ v1.1.44 */
     s_485_lat_over5 = s_485_lat_over20 = s_485_lat_over100 = 0;
+    s_485_bad_len = 0;         /* ★ v1.1.45 */
+    s_485_rx_peak = 0;
+    s_rx_index = 0;            /* 解析器一起复位，避免残留半帧 */
 }
 
 /* ★ v1.1.31：队列丢帧计数（正常恒 0） */
@@ -2118,6 +2192,18 @@ void bambubus_485_lat_stats(uint32_t *max_ms, uint32_t *over5,
     if (over5)   *over5   = s_485_lat_over5;
     if (over20)  *over20  = s_485_lat_over20;
     if (over100) *over100 = s_485_lat_over100;
+}
+
+/* ★ v1.1.45：帧解析异常 + UART 积压峰值（供 /status 的 ams.frame 输出）
+ *
+ *   bad_len  长度字段非法 → 复位解析器的次数
+ *            **只要涨，就说明总线上真的丢过字节**（丢字节把 length 读坏了）
+ *   peak     单次 poll 时 UART 环形缓冲里的最大积压字节数
+ *            接近缓冲大小（8192）= 主循环被堵住，字节正在被丢 */
+void bambubus_485_frame_stats(uint32_t *bad_len, uint32_t *peak)
+{
+    if (bad_len) *bad_len = s_485_bad_len;
+    if (peak)    *peak    = s_485_rx_peak;
 }
 
 /* 打印阶段细分查询（v1.1.12）—— 见 BambuBus.h 注释 */
@@ -2349,10 +2435,14 @@ int BambuBus_run()
      *   期间 485 完全不应答 —— 见 nvs_save_task 的注释）
      *
      * ★ v1.1.39：改成受 COMPAT_NVS_ASYNC（bit6）控制。
-     * 默认关 = 就地同步写（v1.1.29 的行为）：写 flash 的阻塞点固定在
-     *   "刚处理完一帧、还没回下一帧"这个可控位置；
-     * 打开 = 交给 core0 后台任务（v1.1.31 起）：写 flash 会关双核 cache，
-     *   可能正好卡在一次查询的中间。哪一位惹的祸，现场二选一就能看出来。 */
+     *
+     * ★ v1.1.45（修正）：恢复 v1.1.41 / v1.1.44 的原逻辑 —— 就地写，
+     * 不"等总线安静 200ms 再写"。
+     *
+     * v1.1.45 初版把 NVS 写延后到"总线安静 200ms 后"，实测结果是
+     * 打印机里 AMS 直接不显示。复盘：注册/发现阶段本就不频繁写 NVS，
+     * 延后写不会改善 AMS 发现，反而多引入一个未验证的状态机，
+     * 增加了变量。先把这一路退回已证明能发现 AMS 的写法。 */
     if (Bambubus_need_to_save)
     {
         Bambubus_need_to_save = false;

@@ -121,6 +121,15 @@ extern uint32_t bambubus_rx_dropped(void);
 extern void bambubus_485_lat_stats(uint32_t *max_ms, uint32_t *over5,
                                    uint32_t *over20, uint32_t *over100);
 
+/* ★ v1.1.45：帧解析异常 + UART 积压峰值（任一指针可传 NULL）
+ *
+ *   bad_len  长度字段非法 → 复位解析器的次数
+ *            **只要涨，就说明总线上真的丢过字节**（丢字节把 length 读坏了）。
+ *            这是"偶发 40A3"唯一可靠的直接证据。
+ *   peak     单次 poll 时 UART 环形缓冲里的最大积压字节数。
+ *            接近缓冲大小（8192）= 主循环被堵住，字节正在被丢。 */
+extern void bambubus_485_frame_stats(uint32_t *bad_len, uint32_t *peak);
+
 /* ★ v1.1.33：打印机「按台号 × 包类型」的查询次数 + 未应答次数。
  *
  * 目的：一次说清"打印机到底会不会来问台 2/3（AMS-C/D）"。
