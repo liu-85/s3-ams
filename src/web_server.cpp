@@ -258,7 +258,7 @@ void web_log_install_hook(void)
 }
 
 /* App 版本 */
-static const char *APP_VERSION = "1.1.43-s3ams";
+static const char *APP_VERSION = "1.1.44-s3ams";
 
 /* 单 IO 双微动：每路一个 ADC 脚（开始位/停止位共用同一脚，电阻编码） */
 static const int BOARD_SENSOR_PINS[BOARD_CHANNEL_COUNT] = BOARD_PIN_SENSOR_ARRAY;
@@ -715,6 +715,24 @@ static void handle_status(void)
                 ",\"tx_06\":" + String((unsigned long)t06) +
                 ",\"last_rx_age_ms\":" + String(age) +
                 ",\"loop_max_gap_ms\":" + String((unsigned long)amcu_loop_max_gap_ms()) + "}";
+    }
+
+    /* ★ v1.1.44：应答延迟（收到问 → 开始回）
+     *
+     * 为什么单列：`qdrop` 只统计 Cxx/Dxx，长包查询（0x402/0x103/0x06/0x21A/0x211）
+     * 走"越界 clamp 到 0 继续应答"，从不计入 qdrop —— 所以 qdrop 全 0
+     * **不等于**每问都答了。真正会要命的是"答得太晚"。
+     *
+     *   max_ms < 10            → 应答及时，40A3 不是迟到引起
+     *   max_ms 几十~几百 ms     → 主循环卡顿，对照 loop_max_gap_ms
+     *   over100 持续增长        → 就是它（同步写 flash / ADC2 / WiFi 抢占） */
+    {
+        uint32_t lm = 0, l5 = 0, l20 = 0, l100 = 0;
+        bambubus_485_lat_stats(&lm, &l5, &l20, &l100);
+        json += ",\"lat\":{\"max_ms\":" + String((unsigned long)lm) +
+                ",\"over5\":" + String((unsigned long)l5) +
+                ",\"over20\":" + String((unsigned long)l20) +
+                ",\"over100\":" + String((unsigned long)l100) + "}";
     }
 
     /* ★ v1.1.33：打印机查询统计（按台号 × 包类型）

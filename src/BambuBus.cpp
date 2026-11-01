@@ -467,9 +467,26 @@ bool need_debug = false;
 void send_uart(const unsigned char *data, uint16_t length)
 {
     TX_IDLE = false;
+
+    /* ★ v1.1.44：DE 时序对齐参考工程 esp32s3-485/main/comm_485.c
+     *
+     * 参考工程那段注释原话：「DE 的时序是这条总线最容易翻车的地方」，
+     * 它的顺序是：DE 拉高 → **等 3us** → 写数据 → 等发完 → **等 2us** → DE 拉低。
+     *
+     * 本工程原来少了这两个微秒级等待：
+     *   · DE 一拉高就立刻写 FIFO。收发器从"接收"切到"发送"需要几百 ns~1us，
+     *     这段时间总线上电平不确定，首字节（0x3D 帧头）的起始位可能被削掉，
+     *     打印机那边就是 CRC 错 → 整帧丢弃 → 该查询无应答 → `[0500-40A3]`。
+     *     这类错误在我们自己的统计里完全看不见（我们发出去的字节是对的），
+     *     所以 `crc_err / overflow / qdrop` 全 0 却仍然报通信异常。
+     *   · flush() 之后立刻拉低 DE，最后一字节的停止位可能还没走完就被掐断。
+     *
+     * 代价：每帧多 5us。一帧本身 ~0.3ms，占比 1.6%，可以忽略。 */
     digitalWrite(BambuBus_pin_de, 1);     // DE 高 = 发送
+    delayMicroseconds(3);                 // 等收发器换向完成
     RS485.write(data, length);
-    RS485.flush();                        // 等待发送完成
+    RS485.flush();                        // 等待发送完成（含移位寄存器）
+    delayMicroseconds(2);                 // 释放总线
     digitalWrite(BambuBus_pin_de, 0);     // DE 低 = 接收
     TX_IDLE = true;
     bus485raw_record(1, (const uint8_t *)data, length);  /* 原始报文记录：本机发出 */
@@ -504,10 +521,33 @@ CRC8 _RX_IRQ_crcx(0x39, 0x66, 0x00, false, false);
 #define RX_FRAME_MAX   256
 static uint8_t  s_rx_q[RX_QUEUE_DEPTH][RX_FRAME_MAX];
 static uint16_t s_rx_q_len[RX_QUEUE_DEPTH];
+/* ★ v1.1.44：每帧的收齐时刻。用来量「从收到问 → 开始回」隔了多久。 */
+static uint32_t s_rx_q_ts[RX_QUEUE_DEPTH];
 static uint8_t  s_rx_q_head  = 0;
 static uint8_t  s_rx_q_tail  = 0;
 static uint8_t  s_rx_q_count = 0;
 static uint32_t s_485_rx_dropped = 0;   /* 队列满 / 帧过长被丢弃的帧数 */
+
+/* ★ v1.1.44：应答延迟统计（这是 40A3 最缺的那块数据）
+ *
+ * 为什么要加：`qdrop` 只统计 Cxx/Dxx 两类，长包查询（0x402 序列号 / 0x103 版本 /
+ * 0x06 握手 / 0x21A / 0x211）**永远不会被计入 qdrop** —— 它们走到越界分支时
+ * 是把台号 clamp 到 0 继续应答，不算"丢"。所以现场看到的 `qdrop` 全 0
+ * **完全不能证明"每问都答了"**，这误导了 v1.1.35~v1.1.43 好几版。
+ *
+ * 真正会要命的是"答得太晚"：主循环里有同步写 flash（Bambubus_save，
+ * 一次 10~50ms）、ADC2 在 WiFi 开着时读 GPIO11/12/13、WiFi 任务抢占……
+ * 任何一次卡顿超过打印机那边的应答超时，它就记一次通信异常 → `[0500-40A3]`。
+ * 而这种迟到在 rx/tx 计数上完全看不出来（我们确实回了，只是晚了几十毫秒）。
+ *
+ * 判读：
+ *   lat_max < 10ms            → 应答及时，40A3 不是迟到引起的
+ *   lat_max 几十~几百 ms      → 主循环卡顿，看 /status 的 loop_max_gap_ms
+ *   lat_over100 在涨          → 直接就是它，必须去掉同步写 flash */
+static uint32_t s_485_lat_max_ms = 0;
+static uint32_t s_485_lat_over5   = 0;   /* 延迟 > 5ms 的应答次数 */
+static uint32_t s_485_lat_over20  = 0;   /* 延迟 > 20ms */
+static uint32_t s_485_lat_over100 = 0;   /* 延迟 > 100ms */
 
 static bool rx_queue_push(const uint8_t *data, uint16_t len)
 {
@@ -539,6 +579,7 @@ static bool rx_queue_push(const uint8_t *data, uint16_t len)
         }
         memcpy(s_rx_q[0], data, len);
         s_rx_q_len[0] = len;
+        s_rx_q_ts[0]  = millis();
         s_rx_q_head  = (uint8_t)(1 % RX_QUEUE_DEPTH);
         s_rx_q_tail  = 0;
         s_rx_q_count = 1;
@@ -551,16 +592,18 @@ static bool rx_queue_push(const uint8_t *data, uint16_t len)
     }
     memcpy(s_rx_q[s_rx_q_head], data, len);
     s_rx_q_len[s_rx_q_head] = len;
+    s_rx_q_ts[s_rx_q_head]  = millis();
     s_rx_q_head = (uint8_t)((s_rx_q_head + 1) % RX_QUEUE_DEPTH);
     s_rx_q_count++;
     return true;
 }
 
-static int rx_queue_pop(uint8_t *dst, uint16_t dst_max)
+static int rx_queue_pop(uint8_t *dst, uint16_t dst_max, uint32_t *out_ts)
 {
     if (s_rx_q_count == 0) return 0;
     const uint16_t len = s_rx_q_len[s_rx_q_tail];
     if (len <= dst_max) memcpy(dst, s_rx_q[s_rx_q_tail], len);
+    if (out_ts) *out_ts = s_rx_q_ts[s_rx_q_tail];
     s_rx_q_tail = (uint8_t)((s_rx_q_tail + 1) % RX_QUEUE_DEPTH);
     s_rx_q_count--;
     return (int)len;
@@ -585,6 +628,14 @@ static uint32_t s_485_tx_402      = 0;  /* 0x402 序列号查询的应答次数 
 static uint32_t s_485_tx_103      = 0;  /* 0x103 版本查询的应答次数 */
 static uint32_t s_485_tx_06       = 0;  /* 0x06 握手查询的应答次数 */
 static uint32_t s_485_last_rx_ms  = 0;  /* 最近一次成功收帧的时刻 */
+/* ★ v1.1.44：最近一次**收到任意字节**的时刻。
+ *
+ * 为什么必须单独记：v1.1.40 的"总线静默门控"用的是 `s_485_last_rx_ms`，
+ * 它只在**整帧收完**时更新。一帧在传的过程中（0.3~2ms）门控是开着的，
+ * 于是我们会在打印机**正在发**的时候插话 → 半双工撞车 → 双方数据都成垃圾。
+ * 这就是"bit4（兼容位 16）试了也失败"最可能的原因：门控本身写错了，
+ * 不是这个思路错。现在改成看"最后一个字节"的时刻。 */
+static uint32_t s_485_last_byte_ms = 0;
 
 /* 单字节协议解析（原 RX_IRQ 逻辑，改为函数调用） */
 static void RX_IRQ(unsigned char data)
@@ -666,6 +717,7 @@ static void BambuBus_UART_Poll(void)
     {
         unsigned char x = RS485.read();
         s_485_rx_bytes++;      /* v1.1.25 诊断：物理层是否有数据进来 */
+        s_485_last_byte_ms = millis();   /* v1.1.44：静默门控看这个，不看整帧时刻 */
         RX_IRQ(x);
     }
 }
@@ -2048,11 +2100,25 @@ void bambubus_485_stats_reset(void)
     s_485_rx_bytes = s_485_rx_frames = s_485_rx_crc_err = s_485_rx_overflow = 0;
     s_485_tx_402 = s_485_tx_103 = s_485_tx_06 = 0;
     s_485_last_rx_ms = 0;
+    s_485_last_byte_ms = 0;    /* ★ v1.1.44 */
     s_485_rx_dropped = 0;      /* ★ v1.1.31 */
+    s_485_lat_max_ms = 0;      /* ★ v1.1.44 */
+    s_485_lat_over5 = s_485_lat_over20 = s_485_lat_over100 = 0;
 }
 
 /* ★ v1.1.31：队列丢帧计数（正常恒 0） */
 uint32_t bambubus_rx_dropped(void) { return s_485_rx_dropped; }
+
+/* ★ v1.1.44：应答延迟统计快照（供 /status 的 ams.lat 输出）
+ * 判读见 s_485_lat_max_ms 的注释。 */
+void bambubus_485_lat_stats(uint32_t *max_ms, uint32_t *over5,
+                            uint32_t *over20, uint32_t *over100)
+{
+    if (max_ms)  *max_ms  = s_485_lat_max_ms;
+    if (over5)   *over5   = s_485_lat_over5;
+    if (over20)  *over20  = s_485_lat_over20;
+    if (over100) *over100 = s_485_lat_over100;
+}
 
 /* 打印阶段细分查询（v1.1.12）—— 见 BambuBus.h 注释 */
 bool is_channel_before_on_use(int num)
@@ -2201,8 +2267,12 @@ int BambuBus_run()
      * 双方数据都成垃圾 → 打印机判 `AMS A 通信异常`。 */
     const bool batch = (bambubus_compat_get() & COMPAT_RX_BATCH) != 0;
     if (batch) {
-        /* 总线还在动（3ms 内收到过字节）就先别开口 */
-        if ((uint32_t)(millis() - s_485_last_rx_ms) < 3) {
+        /* 总线还在动（4ms 内收到过**任意字节**）就先别开口。
+         * ★ v1.1.44：判据从 `s_485_last_rx_ms`（整帧收完的时刻）改成
+         *   `s_485_last_byte_ms`（最后一个字节的时刻）。
+         *   原来一帧在传的过程中门控是开着的，等于没有门控 ——
+         *   这是 v1.1.40 里 bit4 实测失败的直接原因。 */
+        if ((uint32_t)(millis() - s_485_last_byte_ms) < 4) {
             return stu;
         }
     }
@@ -2210,11 +2280,21 @@ int BambuBus_run()
     int processed = 0;
     while (s_rx_q_count > 0 && processed < max_frames)
     {
-        const int data_length = rx_queue_pop(buf_X, sizeof(buf_X));
+        uint32_t rx_ts = 0;
+        const int data_length = rx_queue_pop(buf_X, sizeof(buf_X), &rx_ts);
         if (data_length <= 0) break;
         processed++;
         stu = 1;
         time_set = timex + 1000;
+
+        /* ★ v1.1.44：量「收到问 → 开始回」的延迟（见 s_485_lat_max_ms 注释） */
+        {
+            const uint32_t lat = (uint32_t)(millis() - rx_ts);
+            if (lat > s_485_lat_max_ms) s_485_lat_max_ms = lat;
+            if (lat > 5)   s_485_lat_over5++;
+            if (lat > 20)  s_485_lat_over20++;
+            if (lat > 100) s_485_lat_over100++;
+        }
 
         cmd = get_packge_type(buf_X, data_length);
         switch (cmd)

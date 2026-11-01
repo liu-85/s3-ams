@@ -17,7 +17,10 @@
 #include <Preferences.h>
 #include "current_sense.h"
 #include "settings_storage.h"
-#include "rgb_led.h"     /* ★ v1.1.43：只为在初始化时让 RMT 接管 GPIO42（见 init_io_pins） */
+#include "rgb_led.h"
+
+/* ★ v1.1.29：通道颜色（定义在 web_server.cpp 的 s_color_list，WEB 可改） */
+extern uint32_t web_get_channel_color(int ch);
 
 // ============================
 //  硬件参数定义
@@ -313,25 +316,66 @@ static uint8_t s_last_action[MAX_FILAMENT_NUM] = {0};
 static bool s_last_need_pull_back[MAX_FILAMENT_NUM] = {false};
 
 // ============================
-//  状态 LED（★ v1.1.30：已废弃，仅保留接口不报错）
+//  RGB LED 控制（板载 WS2812，v1.1.29 改）
 // ============================
 
-/* ★ v1.1.30：本板没有可用的状态灯，set_led_state() 变成空操作。
+/* 临时提示（由 set_led_state 设置，800ms 内优先于状态机） */
+static led_mode_t s_led_hint = LED_MODE_IDLE;
+static uint32_t   s_led_hint_until = 0;
+
+/* ★ v1.1.29：按全局状态算最终灯效 —— 每轮调用
  *
- * 历史：
- *   v1.1.28 及之前 —— gpio_set_level(GPIO42)，本意是点普通单色 LED。
- *     现场（2026-10-31）确认：亮起来的是 **TXD 指示灯**，不是状态灯，
- *     等于一直在乱拨串口指示灯，纯干扰。
- *   v1.1.29 —— 误以为板载是 WS2812 并接在 GPIO42，写了 rgb_led 模块。
- *     实测板载 RGB 在 **GPIO48**，而 GPIO48 已经被 485 的 RX 占用
- *     （`BOARD_PIN_485_RX`），不可能挪给灯用。
- *
- * 所以：整块灯效功能删除（rgb_led.{h,cpp} 一并删掉），
- * set_led_state() 保留为空函数，只为不改动 20 多处 RGB_RED/GREEN/BLUE 调用点。
- * 设备状态请看 WEB 控制台。 */
+ * 优先级：
+ *   堵转跳闸           → 红快闪
+ *   正在退料           → 橙呼吸
+ *   800ms 内的临时提示 → 用提示
+ *   正在打印           → 当前耗材颜色呼吸
+ *   其他               → 绿色低亮常亮
+ */
+static void led_state_update(void)
+{
+    const uint32_t now = millis();
+    led_mode_t m;
+
+    if (current_sense_tripped()) {
+        m = LED_MODE_ERROR;
+    } else if (is_need_pull_back) {
+        m = LED_MODE_PULLBACK;
+    } else if (now < s_led_hint_until) {
+        m = s_led_hint;
+    } else {
+        const int cur = get_now_filament_num();
+        const bool printing =
+            (cur >= 0 && cur < BOARD_CHANNEL_COUNT) &&
+            (is_channel_in_use(cur) || is_channel_active_recently(cur, 5000));
+        if (printing) {
+            m = LED_MODE_PRINTING;
+            rgb_led_set_print_color(web_get_channel_color(cur));
+        } else {
+            m = LED_MODE_IDLE;
+        }
+    }
+
+    rgb_led_set_mode(m);
+    rgb_led_tick();
+}
+
 void set_led_state(led_state_t state)
 {
-    s_led_state = state;   /* 只记状态，不驱动任何引脚 */
+    s_led_state = state;
+
+    /* ★ v1.1.29：板载灯改成 WS2812 RGB 状态机（rgb_led 模块）。
+     *
+     * 原来的实现只是 gpio_set_level —— 对 WS2812 完全无效（它要 800kHz 编码）。
+     * 现在 set_led_state() 只充当"临时提示"，实际颜色由 led_state_update()
+     * 按全局状态计算，提示在 800ms 内优先。 */
+    switch (state) {
+    case LED_STATE_RED:   s_led_hint = LED_MODE_ERROR;    break;
+    case LED_STATE_GREEN: s_led_hint = LED_MODE_PRINTING; break;
+    case LED_STATE_BLUE:
+    default:              s_led_hint = LED_MODE_IDLE;     break;
+    }
+    s_led_hint_until = millis() + 800;
 }
 
 #define RGB_RED    set_led_state(LED_STATE_RED)
@@ -850,27 +894,9 @@ bool amcu_follow_feed_active(void) { return s_follow_ch != 0 && s_follow_on; }
 //  初始化 IO 引脚
 // ============================
 void init_io_pins() {
-    /* ★ v1.1.43：GPIO42 的配置**不再放这里**，改由 rgb_led_init() 里的
-     * `neopixelWrite(42,...)` 交给 RMT 接管。
-     *
-     * 为什么（v1.1.42 的教训）：本板 GPIO3 是 strapping 脚（JTAG 源选择），
-     * 而 GPIO3 又是电流采样 ISEN（经 200Ω 到地）。上电无电流 → GPIO3≈0V
-     * → ROM 判定「外部 JTAG」→ **GPIO39/40/41/42 先按 JTAG 功能配置**。
-     * GPIO39 是 485 的 DE、GPIO42 是状态灯，两者同属 JTAG 那一组。
-     *
-     * v1.1.30 删灯效时把「配置 GPIO42」一起删了 → 42 一直挂在 JTAG 上 →
-     * 连累同组 GPIO39（485 DE）→ 发打印任务立刻 `[0500-40A3]` + 自动取消，
-     * 而 485 数据本身干净（crc_err/overflow/rx_dropped/qdrop 全 0）。
-     *
-     * ★ 但 v1.1.42 证明了：**只把 GPIO42 设成普通 GPIO 输出（reset+output+level0）
-     *   不够，仍然报 40A3**。必须让 RMT 接管这个脚才行 ——
-     *   差别在于 `rmt_set_pin()` 会把 GPIO42 的 IO MUX 输出信号真正切到
-     *   `RMT_SIG_OUT`，而 `gpio_set_direction(OUTPUT)` 只是把 GPIO 输出使能打开，
-     *   引脚仍留在 JTAG 那一组的 MUX 配置里。
-     *
-     * 所以现在保持 v1.1.41（实测能打印）的做法：交给 rgb_led_init()。
-     * 区别只是**不再调用 led_state_update()**，所以运行时不刷 WS2812、
-     * GPIO42 上那颗 TXD 指示灯保持常灭。 */
+    /* ★ v1.1.29：板载灯是 WS2812，由 rgb_led 模块用 RMT 驱动（neopixelWrite）。
+     * 这里**不能**再把该引脚设成普通 GPIO 输出 —— 那样 RMT 一接管就会冲突，
+     * 而且普通电平也点不亮 WS2812。引脚配置交给 rgb_led_init()。 */
     if (BOARD_485_ENABLED) {
         gpio_reset_pin((gpio_num_t)BOARD_PIN_485_DE);
         gpio_set_direction((gpio_num_t)BOARD_PIN_485_DE, GPIO_MODE_OUTPUT);
@@ -1082,16 +1108,7 @@ void check_buffer_status() {
 // ============================
 void AMCU_init() {
     init_io_pins();
-    /* ★ v1.1.43：让 RMT 接管 GPIO42 —— 这一步是 40A3 的关键，不能删。
-     *
-     * 内部就是一句 neopixelWrite(42,0,0,0)，作用是 rmt_set_pin() 把 GPIO42
-     * 的 IO MUX 输出真正切到 RMT_SIG_OUT，从而脱离上电时 ROM 给
-     * GPIO39~42 配的那组 JTAG 功能（GPIO39 就是 485 的 DE）。
-     *
-     * ⚠️ 不要改成 gpio_set_direction(42, OUTPUT) —— v1.1.42 试过，照样报 40A3。
-     * ⚠️ 本版**不再调用 led_state_update()**，所以运行时不刷 WS2812，
-     *    那颗 TXD 指示灯保持常灭（只在 init 时写一次全黑）。 */
-    rgb_led_init();
+    rgb_led_init();       /* v1.1.29：WS2812 状态灯（替代原来的普通 GPIO 电平） */
     sensor_init();
     motor_init();
     clutch_init();
@@ -1134,6 +1151,9 @@ void AMCU_run() {
      * 它负责清掉"已不该再占电机"的 decision，并在电机确实被这一路占着时停机。
      * 没有它，停印后 decision 卡在 1 会让电机一直转（现场已复现）。 */
     buffer_feed_watchdog();
+
+    /* ★ v1.1.29：RGB 状态灯每轮更新（内部 50ms 限流，不拖慢主循环） */
+    led_state_update();
 
     static int now_f = 255;
     int x = get_now_filament_num();

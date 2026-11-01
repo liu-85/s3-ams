@@ -12,6 +12,112 @@
 
 ---
 
+## v1.1.44 —— 回到 v1.1.41 基线 + 补上 DE 物理层时序 + 终于能看见"应答迟到"
+
+**2026-11-01**
+
+### 这一版为什么这么做
+
+现场数据（同设备、同线、同打印机）：
+
+| 版本 | 与灯效有关的代码 | 结果 |
+|---|---|---|
+| v1.1.29（存档） | `rgb_led_init()` + `led_state_update()` | 能打印 |
+| v1.1.30 ~ v1.1.40 | 完全不配置 GPIO42 | 报 40A3 |
+| v1.1.41 | `rgb_led_init()` + `led_state_update()` | **能打印**（完整打完一次） |
+| v1.1.42 | `gpio_reset_pin(42)` + 普通 GPIO 输出 | 报 40A3 |
+| v1.1.43 | `rgb_led_init()` 有、`led_state_update()` 无 | **连发两次都失败** |
+
+`git diff v1.1.41 v1.1.43` 已确认：**两者唯一的功能差异就是 `AMCU_run()` 里
+有没有 `led_state_update()` 这一句**（`rgb_led.cpp/h` 自 v1.1.41 起没被改过）。
+
+### 但机制上讲不通 —— 必须承认这一点
+
+查了 Arduino 内核源码 `cores/esp32/esp32-hal-rmt.c`：
+
+```c
+bool rmtWrite(rmt_obj_t* rmt, rmt_data_t* data, size_t size) {
+    ...
+    rmt_write_items(channel, (const rmt_item32_t *)data, size, false);  // wait_tx_done = false
+}
+```
+
+`neopixelWrite()` 走的是 `rmtWrite()`，**`wait_tx_done = false`，是非阻塞的**：
+只写几个寄存器就返回（几微秒），真正的 800kHz 波形由 RMT 硬件在后台发完。
+
+所以 `led_state_update()` 对 485 的实际影响 ≈ 0（`rgb_led.cpp` 里
+"每次同步等待约 30us"那句注释是错的）。**v1.1.41 能打印更可能是概率性的**
+—— 早期现象本来就是"发三次打印任务，第三次才成功"。
+
+结论：**不再把灯效当成病根**，v1.1.44 把 `AMCU.cpp` 原样退回 v1.1.41
+（唯一确认能打印的组合），另外补两处真正讲得通的改动。
+
+### 改动一：`send_uart()` 补上 DE 的 3us / 2us（物理层唯一没对齐的差异）
+
+参考工程 `esp32s3-485/main/comm_485.c` 的注释原话是
+「DE 的时序是这条总线最容易翻车的地方」：
+
+```c
+gpio_set_level(BOARD_PIN_485_DE, 1);
+esp_rom_delay_us(3);                       // 等收发器换向
+uart_write_bytes(...);
+uart_wait_tx_done(...);
+esp_rom_delay_us(2);                       // 释放总线
+gpio_set_level(BOARD_PIN_485_DE, 0);
+```
+
+本工程原来少了这两个微秒级等待：DE 一拉高就立刻写 FIFO，而收发器从
+"收"切到"发"要几百 ns~1us，这段时间总线电平不确定，**首字节 `0x3D`
+的起始位可能被削掉** → 打印机 CRC 错 → 整帧丢弃 → 该查询无应答 → `40A3`。
+这类错误在我们自己的统计里**完全看不见**（我们发出去的字节是对的），
+正好解释了「`crc_err` / `overflow` / `qdrop` 全 0 却仍然报通信异常」。
+
+代价：每帧多 5us（一帧本身 ~0.3ms，占 1.6%）。
+
+### 改动二：修掉"总线静默门控"写错的地方
+
+v1.1.40 的 `COMPAT_RX_BATCH`（bit4）门控用的是 `s_485_last_rx_ms`，
+它**只在整帧收完时更新** —— 一帧在传的过程中门控是开着的，等于没有门控。
+所以「bit4 试了也失败」这个结论是不成立的：**是门控本身写错了，不是思路错**。
+
+现在新增 `s_485_last_byte_ms`（每收一个字节就更新），门控改成
+「4ms 内收到过任意字节就不开口」。
+
+### 改动三：新增应答延迟统计 `ams.lat`（这是最缺的那块数据）
+
+`qdrop` 只统计 Cxx/Dxx 两类。长包查询（`0x402` 序列号 / `0x103` 版本 /
+`0x06` 握手 / `0x21A` / `0x211`）走的是"越界 clamp 到 0 继续应答"，
+**永远不会被计入 qdrop**。所以「qdrop 全 0」根本不能证明「每问都答了」，
+这一点误导了 v1.1.35 ~ v1.1.43 好几版。
+
+新增：每帧记录收齐时刻（`s_rx_q_ts[]`），在处理时算
+「收到问 → 开始回」的延迟，统计最大值和 >5ms / >20ms / >100ms 的次数，
+输出到 `/status` 的 `ams.lat`：
+
+```json
+"lat":{"max_ms":3,"over5":0,"over20":0,"over100":0}
+```
+
+判读：
+
+- `max_ms < 10`：应答及时，40A3 不是迟到引起的
+- `max_ms` 几十~几百 ms：主循环卡顿，对照 `ams.link.loop_max_gap_ms`
+- `over100` 持续增长：就是它（同步写 flash / ADC2 在读 GPIO11~13 / WiFi 抢占）
+
+### 判读表
+
+```
+qdrop 全 0 + lat.max_ms 很小 + 仍报 40A3
+    → 我们答了、也答得快，但打印机没收到/收错了
+    → 只能是物理层（DE 时序 / 收发器 / 终端电阻 / 共地 / A-B 极性）
+
+lat.over100 在涨
+    → 应答迟到。查 nvs.max_ms（同步写 flash 一次 10~50ms）
+      和 loop_max_gap_ms
+```
+
+---
+
 ## v1.1.42 —— 40A3 真因：GPIO42 没脱离 JTAG，连累了 485 的 DE
 
 **2026-11-01**

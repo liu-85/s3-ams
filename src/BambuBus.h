@@ -108,6 +108,19 @@ extern void bambubus_485_stats_reset(void);
  * 正常应该恒为 0。持续增长说明打印机的突发比我们排空得快。 */
 extern uint32_t bambubus_rx_dropped(void);
 
+/* ★ v1.1.44：应答延迟统计（任一指针可传 NULL）
+ *
+ * 这是判断 40A3 最关键的度量：`qdrop` 只统计 Cxx/Dxx，长包查询
+ * （0x402/0x103/0x06/0x21A/0x211）走的是"越界 clamp 到 0 继续应答"，
+ * 从不计入 qdrop —— 所以 qdrop 全 0 并不等于"每问都答了"。
+ *
+ * 判读：
+ *   max_ms < 10ms          → 应答及时，40A3 不是迟到引起的
+ *   max_ms 几十~几百 ms     → 主循环卡顿（同步写 flash / ADC2 / WiFi 抢占）
+ *   over100 持续增长        → 直接就是它，必须去掉同步写 flash */
+extern void bambubus_485_lat_stats(uint32_t *max_ms, uint32_t *over5,
+                                   uint32_t *over20, uint32_t *over100);
+
 /* ★ v1.1.33：打印机「按台号 × 包类型」的查询次数 + 未应答次数。
  *
  * 目的：一次说清"打印机到底会不会来问台 2/3（AMS-C/D）"。
