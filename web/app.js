@@ -536,6 +536,10 @@
         if (typeof d.ams_count === 'number' && d.ams_count > 0) {
             syncAmsCountInput(d.ams_count);
         }
+        /* ---- 485 兼容位（v1.1.39） ---- */
+        if (typeof d.compat === 'number' && d.compat >= 0) {
+            syncCompatInput(d.compat);
+        }
 
         /* ---- 硬件 ---- */
         updateHardware(d.hardware);
@@ -1829,6 +1833,29 @@
         });
     }
 
+    /* ---- 485 兼容位（v1.1.39）----
+     * 默认 0 = 完全退回 v1.1.29 的收发行为。
+     * bit4=批量收帧 bit5=大RX缓冲 bit6=异步存NVS（bit0~3 是加热器，别动） */
+    function syncCompatInput(n) {
+        var el = $('compat_flags');
+        if (el && document.activeElement !== el) {
+            var s = String(n);
+            if (el.value !== s) el.value = s;
+        }
+    }
+
+    function saveCompat() {
+        var v = parseInt(val('compat_flags'), 10);
+        if (isNaN(v) || v < 0 || v > 127) {
+            toast('兼容位请在 0~127 之间', 'bad');
+            return;
+        }
+        post('/compat_set', { flags: v }, function (d) {
+            if (d && typeof d.compat === 'number') syncCompatInput(d.compat);
+            toast((d && d.info) || '已保存', (d && d.ok) ? 'ok' : 'bad');
+        });
+    }
+
     /* =======================================================================
        蠕动参数
        ======================================================================= */
@@ -2600,6 +2627,7 @@
         $('btn_feed_timeout_save').onclick = saveFeedTimeout;
         $('btn_idle_timeout_save').onclick = saveIdleTimeout;
         $('btn_ams_count_save').onclick = saveAmsCount;
+        $('btn_compat_save').onclick = saveCompat;
         $('btn_creep_save').onclick = saveCreep;
         $('btn_assist_toggle').onclick = toggleAssist;
         $('btn_assist_hold').onclick = toggleAssistHold;

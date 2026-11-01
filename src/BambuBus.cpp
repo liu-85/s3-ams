@@ -21,6 +21,21 @@
 #include <Preferences.h>
 #include <driver/uart.h>
 
+/* ==================== 485 兼容开关（位定义） ====================
+ * 必须放在文件最前面 —— BambuBUS_UART_Init() 在 600 多行就用到 bit5，
+ * 宏写在使用点之后会编译不过。
+ * 各位的含义与现场用法见下方 compat_load() 前的长注释。 */
+#define COMPAT_REG_HI    0x01   /* 应答 0x05 里 0x80|台号 那组注册（AMS-HT） */
+#define COMPAT_411       0x02   /* 应答 0x411 烘干加热器查询 */
+#define COMPAT_23C       0x04   /* 应答 0x23C */
+#define COMPAT_237       0x08   /* 应答 0x237 */
+#define COMPAT_RX_BATCH  0x10   /* 每轮排空 RX 队列（v1.1.31 起）；关=每轮一帧（v1.1.29） */
+#define COMPAT_RX_BIGBUF 0x20   /* UART RX 缓冲 2048（v1.1.31 起）；关=默认 256（v1.1.29） */
+#define COMPAT_NVS_ASYNC 0x40   /* 耗材信息后台写 flash（v1.1.31 起）；关=同步写（v1.1.29） */
+#define COMPAT_ALL       0x7F
+#define COMPAT_DEFAULT   0x00   /* 默认全关 = 完全退回 v1.1.29 的收发行为 */
+#define COMPAT_NVS_NS    "s3ams-compat"
+
 // ==================== 原有变量完全保留 ====================
 CRC16 crc_16;
 CRC8 crc_8;
@@ -629,8 +644,17 @@ void BambuBUS_UART_Init(uint32_t baudrate)
      * 打印任务开始时打印机会连发一批帧（8 槽位下发 + 逐个查询），
      * 主循环 2ms 一轮，默认缓冲很容易在两次 poll 之间溢出 → 丢字节 → CRC 错
      * → 该帧的查询没有应答 → `[0500-40A3]`。
-     * 必须在 begin() **之前**设置才生效。 */
-    RS485.setRxBufferSize(2048);
+     * 必须在 begin() **之前**设置才生效。
+     *
+     * ★ v1.1.39：改成受 COMPAT_RX_BIGBUF 控制，默认关 = v1.1.29 的默认 256。
+     * 现场已确认 v1.1.29（256）能打印、v1.1.38（2048）不能，
+     * 所以这一位也要能被排除掉。改完必须重启才生效（begin 只跑一次）。 */
+    if (bambubus_compat_get() & COMPAT_RX_BIGBUF) {
+        RS485.setRxBufferSize(2048);
+        log_i("485 RX 缓冲 = 2048（兼容位 bit5 打开）");
+    } else {
+        log_i("485 RX 缓冲 = 默认 256（兼容位 bit5 关闭，= v1.1.29 行为）");
+    }
     RS485.begin(baudrate, SERIAL_8E1, BambuBus_pin_rx, BambuBus_pin_tx);
     pinMode(BambuBus_pin_de, OUTPUT);
     digitalWrite(BambuBus_pin_de, 0);  // 默认接收
@@ -1033,14 +1057,26 @@ static inline uint16_t swap_bytes(uint16_t val) {
  *   而应答 0x80|n 注册还会凭空造出 4 台 AMS-HT。
  *
  * 所以对这四类**保持静默才是正确语义**（"我没有这个设备/这个功能"），
- * 和 v1.1.20 能正常打印时的行为一致。开关保留只为以后做实验。 */
-#define COMPAT_REG_HI 0x01
-#define COMPAT_411    0x02
-#define COMPAT_23C    0x04
-#define COMPAT_237    0x08
-#define COMPAT_ALL    0x0F
-#define COMPAT_DEFAULT 0x00   /* v1.1.36：默认全关 */
-#define COMPAT_NVS_NS "s3ams-compat"
+ * 和 v1.1.20 能正常打印时的行为一致。开关保留只为以后做实验。
+ *
+ * ★ v1.1.39：把「v1.1.30 之后唯一还和 v1.1.29 不同的三处 485 收发行为」
+ * 也做成开关（bit4~6），默认全关 = **完全退回 v1.1.29 的行为**。
+ *
+ * 背景：现场实测 v1.1.29（存档原厂固件）同设备同线**直接能打印**，
+ * v1.1.38 一发打印任务就 `[0500-40A3] AMS A 通信异常`。
+ * 而逐函数比对已证明两版的**应答内容与应答延迟完全一致**（只有滚动包号不同），
+ * 所以差异只可能出在"什么时候发/什么时候被别的活堵住"这三点上：
+ *
+ *   bit4 COMPAT_RX_BATCH  每轮把 RX 队列排空（v1.1.31 起）vs 每轮只处理一帧（v1.1.29）
+ *                         打开后一帧查询进来会连续回好几包，包间隔≈0；
+ *                         v1.1.29 每轮只回一包，中间隔着 delay(2) 和 AMCU_run。
+ *   bit5 COMPAT_RX_BIGBUF UART RX 环形缓冲 2048（v1.1.31 起）vs Arduino 默认 256（v1.1.29）
+ *   bit6 COMPAT_NVS_ASYNC 耗材信息由 core0 后台任务写 flash（v1.1.31 起）
+ *                         vs 就地同步写（v1.1.29）。
+ *                         后台任务写 flash 时会关掉双核 cache，可能正好卡在一次查询中间。
+ *
+ * 现场用法：默认 0 先确认能打印；能打印后再逐位打开，看是哪一位把打印机惹毛的。
+ * 位定义在文件最前面（BambuBUS_UART_Init 要用到 bit5，必须早定义）。 */
 
 static uint8_t s_compat = COMPAT_DEFAULT;
 static bool    s_compat_loaded = false;
@@ -1051,8 +1087,11 @@ static void compat_load(void)
     s_compat_loaded = true;
     Preferences p;
     if (p.begin(COMPAT_NVS_NS, true)) {
-        /* 键名带版本：v1.1.35 在 "flags" 里存过 15，直接换键避免沿用 */
-        s_compat = p.getUChar("flags2", COMPAT_DEFAULT);
+        /* 键名带版本：v1.1.35 在 "flags" 里存过 15，v1.1.35~38 在 "flags2" 里
+         * 也可能留着 15（调试时打开过加热器应答）。v1.1.39 换 "flags3"，
+         * 保证这一版**从 0 开始**——否则一上电就带着"应答加热器"的旧设置，
+         * 又会弹一屏加热器故障，把问题搅浑。 */
+        s_compat = p.getUChar("flags3", COMPAT_DEFAULT);
         p.end();
     }
     s_compat &= COMPAT_ALL;
@@ -1066,15 +1105,18 @@ void bambubus_compat_set(uint8_t v)
     s_compat = v & COMPAT_ALL;
     Preferences p;
     if (p.begin(COMPAT_NVS_NS, false)) {
-        p.putUChar("flags2", s_compat);
+        p.putUChar("flags3", s_compat);
         p.end();
     }
-    log_i("485 兼容开关 = 0x%02X（reg_hi=%d 411=%d 23C=%d 237=%d）",
+    log_i("485 兼容开关 = 0x%02X（reg_hi=%d 411=%d 23C=%d 237=%d | 批量收帧=%d 大RX缓冲=%d 异步存NVS=%d）",
           (unsigned)s_compat,
           (s_compat & COMPAT_REG_HI) ? 1 : 0,
           (s_compat & COMPAT_411) ? 1 : 0,
           (s_compat & COMPAT_23C) ? 1 : 0,
-          (s_compat & COMPAT_237) ? 1 : 0);
+          (s_compat & COMPAT_237) ? 1 : 0,
+          (s_compat & COMPAT_RX_BATCH) ? 1 : 0,
+          (s_compat & COMPAT_RX_BIGBUF) ? 1 : 0,
+          (s_compat & COMPAT_NVS_ASYNC) ? 1 : 0);
 }
 
 static uint16_t s_q[QK_UNITS][QK_NUM];
@@ -2110,14 +2152,18 @@ int BambuBus_run()
         stu = -1;
     }
 
-    /* ★ v1.1.31：把 RX 队列排空再返回。
+    /* ★ v1.1.39：是否每轮把队列排空，受 COMPAT_RX_BATCH（bit4）控制。
      *
-     * 原来这里是 `if (BambuBus_have_data)` 只处理**一帧**，而打印机在打印
-     * 任务开始时会连发多帧 —— 同一次 poll 里收到的第二帧会把第一帧覆盖掉，
-     * 那一帧的查询就永远没有应答（→ `[0500-40A3] AMS A 通信异常`）。
-     * 现在队列里有多少处理多少，最多 RX_QUEUE_DEPTH 帧（队列本身就只有这么深）。 */
+     * 默认关 = 每轮只处理**一帧**（= v1.1.29 的行为）：
+     *   打印机连发时后面的帧会留在队列里等下一轮，两包应答之间自然隔开
+     *   delay(2) + AMCU_run 的时间，总线有一段空闲。
+     * 打开 = 一次排空（v1.1.31~v1.1.38 的行为）：
+     *   突发时连回好几包，包间隔≈0。现场怀疑正是这个把打印机惹毛的，
+     *   所以做成开关，刷一次机就能二选一验证。 */
+    const bool batch = (bambubus_compat_get() & COMPAT_RX_BATCH) != 0;
+    const int  max_frames = batch ? RX_QUEUE_DEPTH : 1;
     int processed = 0;
-    while (s_rx_q_count > 0 && processed < RX_QUEUE_DEPTH)
+    while (s_rx_q_count > 0 && processed < max_frames)
     {
         const int data_length = rx_queue_pop(buf_X, sizeof(buf_X));
         if (data_length <= 0) break;
@@ -2175,11 +2221,21 @@ int BambuBus_run()
 
     /* ★ v1.1.31：只置脏标志，**绝不在这里写 flash**
      * （原来这里同步 Bambubus_save()，一次 10~50ms，8 个槽位连发上百毫秒，
-     *   期间 485 完全不应答 —— 见 nvs_save_task 的注释） */
+     *   期间 485 完全不应答 —— 见 nvs_save_task 的注释）
+     *
+     * ★ v1.1.39：改成受 COMPAT_NVS_ASYNC（bit6）控制。
+     * 默认关 = 就地同步写（v1.1.29 的行为）：写 flash 的阻塞点固定在
+     *   "刚处理完一帧、还没回下一帧"这个可控位置；
+     * 打开 = 交给 core0 后台任务（v1.1.31 起）：写 flash 会关双核 cache，
+     *   可能正好卡在一次查询的中间。哪一位惹的祸，现场二选一就能看出来。 */
     if (Bambubus_need_to_save)
     {
         Bambubus_need_to_save = false;
-        s_save_dirty = true;
+        if (bambubus_compat_get() & COMPAT_NVS_ASYNC) {
+            s_save_dirty = true;
+        } else {
+            Bambubus_save();   /* 同步写（= v1.1.29 行为） */
+        }
     }
 
     return stu;

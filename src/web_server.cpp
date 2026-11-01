@@ -258,7 +258,7 @@ void web_log_install_hook(void)
 }
 
 /* App 版本 */
-static const char *APP_VERSION = "1.1.38-s3ams";
+static const char *APP_VERSION = "1.1.39-s3ams";
 
 /* 单 IO 双微动：每路一个 ADC 脚（开始位/停止位共用同一脚，电阻编码） */
 static const int BOARD_SENSOR_PINS[BOARD_CHANNEL_COUNT] = BOARD_PIN_SENSOR_ARRAY;
@@ -1677,16 +1677,17 @@ static void handle_compat_set(void)
         server.send(400, "application/json", "{\"ok\":false,\"err\":\"缺少 flags\"}");
         return;
     }
-    if (v < 0 || v > 15) {
+    if (v < 0 || v > 127) {
         server.send(200, "application/json",
-            "{\"ok\":false,\"info\":\"flags 需在 0~15 之间\"}");
+            "{\"ok\":false,\"info\":\"flags 需在 0~127 之间\"}");
         return;
     }
     bambubus_compat_set((uint8_t)v);
-    char msg[200];
+    char msg[260];
     snprintf(msg, sizeof(msg),
              "{\"ok\":true,\"compat\":%d,\"info\":\"兼容开关已改为 0x%02X"
-             "（bit0=0x80注册 bit1=0x411 bit2=0x23C bit3=0x237）\"}",
+             "（bit0=0x80注册 bit1=0x411 bit2=0x23C bit3=0x237 "
+             "bit4=批量收帧 bit5=大RX缓冲 bit6=异步存NVS）\"}",
              (int)bambubus_compat_get(), (unsigned)bambubus_compat_get());
     server.send(200, "application/json", msg);
 }

@@ -458,6 +458,22 @@
             AMS-C / AMS-D 卡片。<br>
             <b>遇到 40A3 就改成 4 试一次</b>，改完立即生效、不用重启。
           </div>
+          <div class="row" style="margin-top:10px">
+            <input type="number" id="compat_flags" min="0" max="127" step="1" value="0">
+            <span style="align-self:center" class="dim">兼容位 0~127</span>
+            <button class="primary" style="flex:1" id="btn_compat_save">保存兼容位</button>
+          </div>
+          <div class="tip">
+            <b>485 兼容位（v1.1.39）</b>：默认 <b>0</b> = 完全退回 v1.1.29 的收发行为。
+            <div class="hr"></div>
+            现场已确认 v1.1.29 原厂固件能打印、v1.1.38 不能，而两版的
+            <b>应答内容逐字节一致</b>，所以差异只可能在"什么时候发"上。逐位打开即可定位：
+            <br><code>+16</code>（bit4）每轮把收帧队列排空 —— 突发时连回好几包，包间隔≈0
+            <br><code>+32</code>（bit5）UART 接收缓冲 2048 字节（<b>改完要重启</b>）
+            <br><code>+64</code>（bit6）耗材信息交给后台任务写 flash
+            <br>bit0~3 是加热器相关（0x80 注册 / 0x411 / 0x23C / 0x237），
+            <b>必须保持关闭</b> —— 打开会让打印机报一屏「加热器故障」。
+          </div>
           <div class="tip">
             <b>上面是速度，下面是保险</b>：微动触发补料时的电机 PWM，默认 <b>100%</b>。
             改完立即生效并写入 NVS，重启不丢。
