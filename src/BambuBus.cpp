@@ -1020,21 +1020,29 @@ static inline uint16_t swap_bytes(uint16_t val) {
 #define QK_UNITS 4
 
 /* ★ v1.1.35：兼容开关。见 BambuBus.h 注释。
- * 现场实测（打印机空闲，25 秒窗口）：
- *   0x411  271 帧  →  我们回了 0 帧
- *   0x23C   70 帧  →  我们回了 0 帧
- *   0x237   22 帧  →  我们回了 0 帧
- *   0x05 注册 172 帧 → 我们只回 89 帧，其余 83 帧是 `0x80|台号`，被当越界丢掉
- * 合计 **每秒约 3.7 次"问了不回"**，`qdrop` 以 3.65/s 稳定增长。
- * 这正是 40A3（AMS 通信异常）的持续来源，先全部回上，再用开关做 A/B。 */
+ *
+ * ⚠️ v1.1.36 重要更正：**默认值必须是 0（全关）**。
+ *
+ * v1.1.35 曾把这四条全开，结果打印机报出一整屏：
+ *   「AMS-HT A/B/C/D 加热器短路 / 异常发热 / 温度传感器离线」
+ *   「AMS A/B/C/D 加热器1短路 / 加热器2故障」
+ * 真相：
+ *   · `0x05` 里 `0x80|n` 那一组 = **AMS-HT**（带烘干加热器的型号）的注册探测
+ *   · `0x411` / `0x23C` / `0x237` = **烘干加热器状态查询**
+ *   本板没有加热器，回一包全 0 的镜像包，打印机就理解成"加热器故障"，
+ *   而应答 0x80|n 注册还会凭空造出 4 台 AMS-HT。
+ *
+ * 所以对这四类**保持静默才是正确语义**（"我没有这个设备/这个功能"），
+ * 和 v1.1.20 能正常打印时的行为一致。开关保留只为以后做实验。 */
 #define COMPAT_REG_HI 0x01
 #define COMPAT_411    0x02
 #define COMPAT_23C    0x04
 #define COMPAT_237    0x08
 #define COMPAT_ALL    0x0F
+#define COMPAT_DEFAULT 0x00   /* v1.1.36：默认全关 */
 #define COMPAT_NVS_NS "s3ams-compat"
 
-static uint8_t s_compat = COMPAT_ALL;
+static uint8_t s_compat = COMPAT_DEFAULT;
 static bool    s_compat_loaded = false;
 
 static void compat_load(void)
@@ -1043,7 +1051,8 @@ static void compat_load(void)
     s_compat_loaded = true;
     Preferences p;
     if (p.begin(COMPAT_NVS_NS, true)) {
-        s_compat = p.getUChar("flags", COMPAT_ALL);
+        /* 键名带版本：v1.1.35 在 "flags" 里存过 15，直接换键避免沿用 */
+        s_compat = p.getUChar("flags2", COMPAT_DEFAULT);
         p.end();
     }
     s_compat &= COMPAT_ALL;
@@ -1057,7 +1066,7 @@ void bambubus_compat_set(uint8_t v)
     s_compat = v & COMPAT_ALL;
     Preferences p;
     if (p.begin(COMPAT_NVS_NS, false)) {
-        p.putUChar("flags", s_compat);
+        p.putUChar("flags2", s_compat);
         p.end();
     }
     log_i("485 兼容开关 = 0x%02X（reg_hi=%d 411=%d 23C=%d 237=%d）",
@@ -1424,7 +1433,8 @@ void send_for_Fxx(unsigned char *buf, int length)
         q_count(ams_num, hi_flag ? QK_05HI : QK_05);
         if (ams_num >= AMS_COUNT) { q_drop(hi_flag ? QK_05HI : QK_05); return; }
         if (hi_flag && !(bambubus_compat_get() & COMPAT_REG_HI)) {
-            q_drop(QK_05HI);
+            /* v1.1.36：`0x80|n` = AMS-HT 的注册探测。我们没有 AMS-HT，
+             * **静默才是正确语义**，不算"丢包"（qdrop 只统计该回没回的）。 */
             return;
         }
 
@@ -1538,7 +1548,18 @@ static void send_for_ext_long(uint16_t type, uint8_t flag, int kind)
     uint8_t AMS_id = (printer_data_long.data_length > 0) ? printer_data_long.datas[0] : 0;
     q_count(ams_unit_of(AMS_id), kind);
 
-    if (!(bambubus_compat_get() & flag)) { q_drop(kind); return; }
+    if (!(bambubus_compat_get() & flag)) {
+        /* v1.1.36：这三类是**烘干加热器状态查询**。本板没有加热器，
+         * 回包反而会让打印机报"加热器短路/过热"，所以默认静默。
+         * 静默是正确语义，不计入 qdrop（qdrop 只统计该回没回的）。 */
+        static uint32_t s_heat_last_ms = 0;
+        if (millis() - s_heat_last_ms > 10000) {
+            s_heat_last_ms = millis();
+            log_i("485 收到加热器查询 0x%03X（本板无加热器，按协议静默）",
+                  (unsigned)type);
+        }
+        return;
+    }
 
     static uint8_t echo[64];
     uint16_t n = printer_data_long.data_length;

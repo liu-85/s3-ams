@@ -125,12 +125,17 @@ extern void bambubus_query_stats(uint16_t out_unit[4][BAMBUBUS_QK_NUM],
                                  uint16_t out_drop[BAMBUBUS_QK_NUM]);
 extern void bambubus_query_stats_reset(void);
 
-/* ★ v1.1.35：兼容开关（NVS 持久化，HTTP /compat_set 可改，默认全开）
+/* ★ v1.1.35：兼容开关（NVS 持久化，HTTP /compat_set 可改）
  *   bit0 = 应答 0x05 里 `0x80|台号` 那一组注册查询
  *   bit1 = 应答 0x411 长包
  *   bit2 = 应答 0x23C 长包
  *   bit3 = 应答 0x237 长包
- * 关掉某一位就退回 v1.1.34 的"静默"行为，用于 A/B 对照。 */
+ *
+ * ⚠️ v1.1.36：**默认值改为 0（全关）**。v1.1.35 全开时打印机报出
+ * 「AMS-HT A/B/C/D 加热器短路/过热」「AMS A/B/C/D 加热器故障」一整屏 ——
+ * 因为 `0x80|n` 是 **AMS-HT**（带烘干加热器）的地址，`0x411/0x23C/0x237`
+ * 是**加热器状态查询**，本板没有加热器，回全 0 就等于报故障。
+ * 对这四类保持静默才是正确语义（和 v1.1.20 能正常打印时一致）。 */
 extern uint8_t bambubus_compat_get(void);
 extern void bambubus_compat_set(uint8_t v);
 
